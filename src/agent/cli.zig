@@ -73,6 +73,17 @@ fn maybePrintAllProvidersFailedHint(
     );
 }
 
+fn maybePrintLastProviderApiError(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+) !void {
+    const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
+    if (detail) |msg| {
+        defer allocator.free(msg);
+        try w.print("Last provider error: {s}\n", .{msg});
+    }
+}
+
 const ParsedAgentArgs = struct {
     message_arg: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -307,6 +318,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 return;
             }
             if (err == error.AllProvidersFailed) {
+                try maybePrintLastProviderApiError(allocator, w);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
                 try w.flush();
             }
@@ -422,6 +434,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
             } else if (err == error.AllProvidersFailed) {
                 try w.print("Error: {}\n", .{err});
+                try maybePrintLastProviderApiError(allocator, w);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
             } else {
                 try w.print("Error: {}\n", .{err});

@@ -601,7 +601,13 @@ pub const GeminiProvider = struct {
 
         // Check for error first
         if (error_classify.classifyKnownApiError(root_obj)) |kind| {
-            return error_classify.kindToError(kind);
+            const mapped_err = error_classify.kindToError(kind);
+            var summary_buf: [1024]u8 = undefined;
+            const summary = error_classify.summarizeKnownApiError(root_obj, &summary_buf) orelse @errorName(mapped_err);
+            const sanitized = root.sanitizeApiError(allocator, summary) catch null;
+            defer if (sanitized) |s| allocator.free(s);
+            root.setLastApiErrorDetail("gemini", sanitized orelse summary);
+            return mapped_err;
         }
 
         var usage = root.TokenUsage{};
@@ -1238,7 +1244,12 @@ test "parseResponse error response" {
     const body =
         \\{"error":{"message":"Invalid API key"}}
     ;
+    root.clearLastApiErrorDetail();
     try std.testing.expectError(error.ApiError, GeminiProvider.parseResponse(std.testing.allocator, body));
+    const detail = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "gemini:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "message=Invalid API key") != null);
 }
 
 test "parseResponse classifies rate-limit errors" {

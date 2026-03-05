@@ -404,6 +404,7 @@ pub const ReliableProvider = struct {
     ) anyerror![]const u8 {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         _ = temperature;
+        root.clearLastApiErrorDetail();
 
         const models = try self.modelChain(allocator, model);
         defer allocator.free(models);
@@ -446,6 +447,7 @@ pub const ReliableProvider = struct {
     ) anyerror!ChatResponse {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
         _ = temperature;
+        root.clearLastApiErrorDetail();
 
         const models = try self.modelChain(allocator, model);
         defer allocator.free(models);
