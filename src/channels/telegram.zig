@@ -6,6 +6,7 @@ const platform = @import("../platform.zig");
 const config_types = @import("../config_types.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const streaming = @import("../streaming.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.telegram);
@@ -953,7 +954,7 @@ pub const TelegramChannel = struct {
             .chat_id = key_copy,
         };
 
-        task.thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 }, typingLoop, .{task});
+        task.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, typingLoop, .{task});
         errdefer {
             task.stop_requested.store(true, .release);
             if (task.thread) |t| t.join();
