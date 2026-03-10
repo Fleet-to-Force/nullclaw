@@ -449,9 +449,21 @@ pub const SessionManager = struct {
                 // Clear stale auto-saved memories
                 store.clearAutoSaved(session_key) catch {};
             } else if (!std.mem.startsWith(u8, trimmed, "/")) {
-                // Persist user + assistant messages (skip slash commands)
+                // Persist user + assistant history (skip slash commands).
+                // Use the assistant history entry rather than the final rendered
+                // reply so restored sessions match live history without
+                // /usage footers, reasoning blocks, or compaction banners.
+                const persisted_assistant = blk: {
+                    var idx = session.agent.history.items.len;
+                    while (idx > 0) {
+                        idx -= 1;
+                        const msg = session.agent.history.items[idx];
+                        if (msg.role == .assistant) break :blk msg.content;
+                    }
+                    break :blk response;
+                };
                 store.saveMessage(session_key, "user", content) catch {};
-                store.saveMessage(session_key, "assistant", response) catch {};
+                store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
             }
         }
 
@@ -1287,6 +1299,52 @@ test "restored session reconstructs token count from persisted assistant replies
     var expected_line_buf: [64]u8 = undefined;
     const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
     try testing.expect(std.mem.indexOf(u8, status.?, expected_line) != null);
+}
+
+test "restored session token reconstruction ignores usage footer decorations" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-usage";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.usage_mode = .tokens;
+
+    const reply = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "[usage] total_tokens=") != null);
+
+    const entries = try sqlite_mem.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings("assistant reply", entries[1].content);
+
+    const expected_tokens = estimateTextTokens("assistant reply");
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
 }
 
 test "processMessage different keys — independent sessions" {
