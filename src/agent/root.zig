@@ -370,6 +370,15 @@ pub const Agent = struct {
         }
     };
 
+    /// Append a history message that owns its content.
+    /// On append failure, the message is deinitialized to avoid leaks.
+    fn appendOwnedHistoryMessage(self: *Agent, msg: OwnedMessage) !void {
+        self.history.append(self.allocator, msg) catch |err| {
+            msg.deinit(self.allocator);
+            return err;
+        };
+    }
+
     /// Initialize agent from a loaded Config.
     pub fn fromConfig(
         allocator: std.mem.Allocator,
@@ -1592,12 +1601,9 @@ pub const Agent = struct {
             try memory_loader.enrichMessageWithRuntime(self.allocator, mem, self.mem_rt, effective_user_message, self.memory_session_id)
         else
             try self.allocator.dupe(u8, effective_user_message);
-        errdefer self.allocator.free(enriched);
 
-        try self.history.append(self.allocator, .{
-            .role = .user,
-            .content = enriched,
-        });
+        // Keep the user message retained even if provider/tool steps fail.
+        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = enriched });
 
         // ── Response cache check ──
         if (self.response_cache) |rc| {
@@ -2003,16 +2009,10 @@ pub const Agent = struct {
                     iteration + 1 < self.max_tool_iterations and
                     shouldForceActionFollowThrough(display_text))
                 {
-                    try self.history.append(self.allocator, .{
-                        .role = .assistant,
-                        .content = try self.allocator.dupe(u8, display_text),
-                    });
-                    try self.history.append(self.allocator, .{
-                        .role = .user,
-                        .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
-                            "Do it in this turn by issuing the appropriate tool call(s). " ++
-                            "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt."),
-                    });
+                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.allocator.dupe(u8, display_text) });
+                    try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: You just promised to take action now (for example: \"I'll try/check now\"). " ++
+                        "Do it in this turn by issuing the appropriate tool call(s). " ++
+                        "If no tool can perform it, respond with a clear limitation now and do not promise another future attempt.") });
                     self.trimHistory();
                     self.freeResponseFields(&response);
                     forced_follow_through_count += 1;
@@ -2109,12 +2109,9 @@ pub const Agent = struct {
                 free_assistant_history = false;
                 break :blk assistant_history_content;
             } else try self.allocator.dupe(u8, assistant_history_content);
-            errdefer self.allocator.free(assistant_content);
 
-            try self.history.append(self.allocator, .{
-                .role = .assistant,
-                .content = assistant_content,
-            });
+            // Once appended, history owns the buffer.
+            try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = assistant_content });
 
             // Execute each tool call
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
@@ -4096,6 +4093,73 @@ test "turn /reset with argument stays slash-only command" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Session cleared.") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4o-mini") != null);
     try std.testing.expectEqualStrings("gpt-4o-mini", agent.model_name);
+}
+
+test "turn retains user message on provider error" {
+    const FailProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ProviderFailed;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "fail-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = FailProvider.chatWithSystem,
+        .chat = FailProvider.chat,
+        .supportsNativeTools = FailProvider.supportsNativeTools,
+        .getName = FailProvider.getName,
+        .deinit = FailProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrFromInt(1), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .has_system_prompt = true,
+    };
+    defer agent.deinit();
+
+    // Seed a system prompt so turn() does not rebuild it (which can load
+    // user config and introduce non-deterministic side effects in tests).
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "sys"),
+    });
+
+    try std.testing.expectError(error.ProviderFailed, agent.turn("hello"));
+    try std.testing.expectEqual(@as(usize, 2), agent.historyLen());
+    try std.testing.expectEqualStrings("hello", agent.history.items[1].content);
+
+    // Should not double-free when clearing history after a failed turn.
+    agent.clearHistory();
+    try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
 }
 
 test "slash /help returns help text" {
