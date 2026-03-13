@@ -323,7 +323,13 @@ pub fn allTools(
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
+    ft.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
@@ -574,6 +580,8 @@ pub fn subagentTools(
         .workspace_dir = workspace_dir,
         .allowed_paths = opts.allowed_paths,
         .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
     };
     try list.append(allocator, ft.tool());
 
@@ -843,6 +851,48 @@ test "all tools wires http and web_search config into tool instances" {
     try std.testing.expect(saw_fetch);
 }
 
+test "all tools wire bootstrap provider into file_read for sqlite backends" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var lru = memory_mod.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(std.testing.allocator, lru.memory(), ws_path);
+    const provider = bp_impl.provider();
+    try provider.store("USER.md", "name: Igor");
+
+    const tools = try allTools(std.testing.allocator, ws_path, .{
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = provider,
+        .backend_name = "sqlite",
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var checked = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
+        const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expect(ft.bootstrap_provider != null);
+        try std.testing.expectEqualStrings("sqlite", ft.backend_name);
+
+        const parsed = try parseTestArgs("{\"path\": \"USER.md\"}");
+        defer parsed.deinit();
+        const result = try t.execute(std.testing.allocator, parsed.value.object);
+        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+        defer if (result.error_msg) |e| std.testing.allocator.free(e);
+
+        try std.testing.expect(result.success);
+        try std.testing.expectEqualStrings("name: Igor", result.output);
+        checked = true;
+        break;
+    }
+
+    try std.testing.expect(checked);
+}
+
 test "all tools wires subagent manager into spawn tool" {
     const Config = @import("../config.zig").Config;
     const subagent_mod = @import("../subagent.zig");
@@ -924,6 +974,39 @@ test "subagent tools use configured shell and file limits" {
     try std.testing.expect(saw_file_edit);
     try std.testing.expect(saw_file_read_hashed);
     try std.testing.expect(saw_file_edit_hashed);
+}
+
+test "subagent tools wire bootstrap provider into file_read for sqlite backends" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+
+    var lru = memory_mod.InMemoryLruMemory.init(std.testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(std.testing.allocator, lru.memory(), ws_path);
+    const provider = bp_impl.provider();
+    try provider.store("SOUL.md", "## Soul");
+
+    const tools = try subagentTools(std.testing.allocator, ws_path, .{
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = provider,
+        .backend_name = "sqlite",
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var checked = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
+        const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expect(ft.bootstrap_provider != null);
+        try std.testing.expectEqualStrings("sqlite", ft.backend_name);
+        checked = true;
+        break;
+    }
+
+    try std.testing.expect(checked);
 }
 
 test "subagent tools wire http allowlist and response limit" {
