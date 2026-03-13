@@ -1,4 +1,5 @@
 const std = @import("std");
+const search_base_url = @import("search_base_url.zig");
 
 /// Default context token budget used by agent compaction/context management.
 /// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
@@ -193,6 +194,13 @@ pub const AgentConfig = struct {
     /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
     /// See ToolFilterGroup for semantics.
     tool_filter_groups: []const ToolFilterGroup = &.{},
+    /// List of models that do not support image/vision input.
+    /// When image markers are detected and the model is in this list,
+    /// the agent will skip processing images instead of returning an error.
+    vision_disabled_models: []const []const u8 = &.{},
+    /// When true, automatically adds the current model to vision_disabled_models
+    /// upon receiving a "model does not support vision" error.
+    auto_disable_vision_on_error: bool = true,
 };
 
 pub const ToolsConfig = struct {
@@ -200,6 +208,27 @@ pub const ToolsConfig = struct {
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
     web_fetch_max_chars: u32 = 100_000,
+    /// Environment variables whose values are platform path-list strings.
+    /// Each path component is validated against workspace + allowed_paths
+    /// using the same sandbox rules as file access (system blocklist,
+    /// realpath canonicalization). Only vars where ALL path components
+    /// resolve within allowed areas are passed to shell child processes.
+    ///
+    /// Example: ["LD_LIBRARY_PATH", "PYTHONHOME", "NODE_PATH"]
+    path_env_vars: []const []const u8 = &.{},
+};
+
+pub const ModelRouteCostClass = enum {
+    free,
+    cheap,
+    standard,
+    premium,
+};
+
+pub const ModelRouteQuotaClass = enum {
+    unlimited,
+    normal,
+    constrained,
 };
 
 pub const ModelRouteConfig = struct {
@@ -207,6 +236,8 @@ pub const ModelRouteConfig = struct {
     provider: []const u8,
     model: []const u8,
     api_key: ?[]const u8 = null,
+    cost_class: ModelRouteCostClass = .standard,
+    quota_class: ModelRouteQuotaClass = .normal,
 };
 
 pub const HeartbeatConfig = struct {
@@ -229,6 +260,19 @@ pub const TelegramInteractiveConfig = struct {
     remove_on_click: bool = true,
 };
 
+pub const TelegramReactionEmojisConfig = struct {
+    accepted: []const u8 = "👀",
+    running: []const u8 = "⚡",
+    done: []const u8 = "👍",
+    failed: []const u8 = "💔",
+};
+
+pub const TelegramCommandsMenuMode = enum {
+    off,
+    flat,
+    scoped,
+};
+
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
@@ -242,6 +286,21 @@ pub const TelegramConfig = struct {
     interactive: TelegramInteractiveConfig = .{},
     /// When true, only respond to messages that @mention the bot (in groups).
     require_mention: bool = false,
+    /// Stream partial responses to users via sendMessageDraft before the final message.
+    streaming: bool = true,
+    /// Show task lifecycle on the triggering user message via Telegram reactions.
+    status_reactions: bool = false,
+    /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.
+    reaction_emojis: TelegramReactionEmojisConfig = .{},
+    /// Enable Telegram-specific binding commands such as /bind.
+    binding_commands_enabled: bool = true,
+    /// Enable Telegram-specific topic management commands such as /topic.
+    topic_commands_enabled: bool = true,
+    /// Enable Telegram-specific topic/session map command such as /topics.
+    topic_map_command_enabled: bool = true,
+    /// Publish Telegram slash-command menu:
+    /// off = clear it, flat = one global list, scoped = separate private/group menus.
+    commands_menu_mode: TelegramCommandsMenuMode = .flat,
 };
 
 pub const DiscordConfig = struct {
@@ -259,6 +318,14 @@ pub const SlackReceiveMode = enum {
     http,
 };
 
+pub const SlackReplyToMode = enum {
+    /// Only thread when the triggering message is already a thread reply
+    /// (thread_ts present and differs from ts). Default.
+    off,
+    /// Always reply in a thread, using thread_ts if present or message ts otherwise.
+    all,
+};
+
 pub const SlackConfig = struct {
     account_id: []const u8 = "default",
     mode: SlackReceiveMode = .socket,
@@ -270,6 +337,7 @@ pub const SlackConfig = struct {
     allow_from: []const []const u8 = &.{},
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
+    reply_to_mode: SlackReplyToMode = .off,
 };
 
 pub const WebhookConfig = struct {
@@ -358,6 +426,8 @@ pub const DingTalkConfig = struct {
     client_id: []const u8,
     client_secret: []const u8,
     allow_from: []const []const u8 = &.{},
+    ai_card_template_id: ?[]const u8 = null,
+    ai_card_streaming_key: ?[]const u8 = null,
 };
 
 pub const SignalConfig = struct {
@@ -775,6 +845,7 @@ pub const MemoryConfig = struct {
     postgres: MemoryPostgresConfig = .{},
     redis: MemoryRedisConfig = .{},
     api: MemoryApiConfig = .{},
+    clickhouse: MemoryClickHouseConfig = .{},
     retrieval_stages: MemoryRetrievalStagesConfig = .{},
     summarizer: MemorySummarizerConfig = .{},
 
@@ -990,6 +1061,17 @@ pub const MemoryApiConfig = struct {
     namespace: []const u8 = "",
 };
 
+pub const MemoryClickHouseConfig = struct {
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 8123,
+    database: []const u8 = "default",
+    table: []const u8 = "memories",
+    user: []const u8 = "",
+    password: []const u8 = "",
+    /// Plain HTTP is accepted only for loopback hosts; remote endpoints must use HTTPS.
+    use_https: bool = false,
+};
+
 pub const MemoryRetrievalStagesConfig = struct {
     query_expansion_enabled: bool = false,
     adaptive_retrieval_enabled: bool = false,
@@ -1024,6 +1106,16 @@ pub const GatewayConfig = struct {
     webhook_rate_limit_per_minute: u32 = 60,
     idempotency_ttl_secs: u64 = 300,
     paired_tokens: []const []const u8 = &.{},
+};
+
+// ── A2A (Agent-to-Agent) protocol config ────────────────────────
+
+pub const A2aConfig = struct {
+    enabled: bool = false,
+    name: []const u8 = "NullClaw",
+    description: []const u8 = "AI assistant",
+    url: []const u8 = "",
+    version: []const u8 = "1.0.0",
 };
 
 // ── Composio config ─────────────────────────────────────────────
@@ -1074,8 +1166,11 @@ pub const HttpRequestConfig = struct {
     proxy: ?[]const u8 = null,
     /// Optional SearXNG instance URL used by web_search as a fallback when
     /// BRAVE_API_KEY is not available.
+    /// HTTPS is allowed for any host. Plain HTTP is allowed only for local or
+    /// private hosts such as localhost, .local names, or private IP ranges.
     /// Examples:
     ///   - "https://searx.example.com"
+    ///   - "http://localhost:8888"
     ///   - "https://searx.example.com/search"
     search_base_url: ?[]const u8 = null,
     /// Search provider for web_search.
@@ -1088,31 +1183,11 @@ pub const HttpRequestConfig = struct {
     /// Validate optional SearXNG base URL accepted by web_search.
     /// Allowed forms:
     ///   - https://host
-    ///   - https://host/
     ///   - https://host/search
-    ///   - https://host/search/
+    ///   - http://localhost[:port]
+    ///   - http://localhost[:port]/search
     pub fn isValidSearchBaseUrl(raw: []const u8) bool {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (!std.mem.startsWith(u8, trimmed, "https://")) return false;
-        if (std.mem.indexOfAny(u8, trimmed, "?#") != null) return false;
-
-        const no_scheme = trimmed["https://".len..];
-        if (no_scheme.len == 0 or no_scheme[0] == '/') return false;
-
-        const slash_pos = std.mem.indexOfScalar(u8, no_scheme, '/');
-        const authority = if (slash_pos) |idx| no_scheme[0..idx] else no_scheme;
-        if (authority.len == 0) return false;
-        if (std.mem.indexOfAny(u8, authority, " \t\r\n")) |_| return false;
-
-        if (slash_pos) |idx| {
-            var path = no_scheme[idx..];
-            if (std.mem.eql(u8, path, "/")) return true;
-            while (path.len > 1 and path[path.len - 1] == '/') {
-                path = path[0 .. path.len - 1];
-            }
-            if (!std.mem.eql(u8, path, "/search")) return false;
-        }
-        return true;
+        return search_base_url.isValid(raw);
     }
 
     pub fn isValidSearchProviderName(raw: []const u8) bool {
@@ -1462,11 +1537,22 @@ test "HttpRequestConfig search base URL validation" {
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search/"));
 
-    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/search/"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://192.168.1.10:8888/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.local/search"));
+
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("ftp://searx.example.com"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com/search"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com?x=1"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com#frag"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/custom"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://:8080/search"));
 }
 
 test "HttpRequestConfig search provider validation" {

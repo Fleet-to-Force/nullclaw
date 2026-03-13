@@ -5,8 +5,39 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const AtomicBool = std.atomic.Value(bool);
 
 const log = std.log.scoped(.http_util);
+threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
+const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
+    thread_interrupt_flag = flag;
+}
+
+pub fn currentThreadInterruptFlag() ?*const AtomicBool {
+    return thread_interrupt_flag;
+}
+
+const CancelWatcherCtx = struct {
+    child: *std.process.Child,
+    cancel_flag: *const AtomicBool,
+    done: *AtomicBool,
+};
+
+fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
+    while (!ctx.done.load(.acquire)) {
+        if (ctx.cancel_flag.load(.acquire)) {
+            if (comptime @import("builtin").os.tag == .windows) {
+                std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
+            } else {
+                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
+            }
+            break;
+        }
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+}
 
 pub const HttpResponse = struct {
     status_code: u16,
@@ -123,6 +154,18 @@ fn curlRequestWithProxy(
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+    const cancel_flag = thread_interrupt_flag;
+    var cancel_done = AtomicBool.init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var watcher_ctx: CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    }
+    defer {
+        cancel_done.store(true, .release);
+        if (cancel_watcher) |t| t.join();
+    }
 
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
@@ -130,34 +173,36 @@ fn curlRequestWithProxy(
             child.stdin = null;
             _ = child.kill() catch {};
             _ = child.wait() catch {};
-            return error.CurlWriteError;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
-        return error.CurlWriteError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
-        return error.CurlReadError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
-    const term = child.wait() catch {
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
         allocator.free(stdout);
-        return error.CurlWaitError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
+            log.debug("curl {s} exited with code {d}", .{ method, code });
             allocator.free(stdout);
-            return error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
         },
         else => {
             allocator.free(stdout);
-            return error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
         },
     }
 
@@ -226,6 +271,18 @@ pub fn curlPostWithStatus(
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+    const cancel_flag = thread_interrupt_flag;
+    var cancel_done = AtomicBool.init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var watcher_ctx: CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    }
+    defer {
+        cancel_done.store(true, .release);
+        if (cancel_watcher) |t| t.join();
+    }
 
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
@@ -233,27 +290,30 @@ pub fn curlPostWithStatus(
             child.stdin = null;
             _ = child.kill() catch {};
             _ = child.wait() catch {};
-            return error.CurlWriteError;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
-        return error.CurlWriteError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
-        return error.CurlReadError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
     errdefer allocator.free(stdout);
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
+    };
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
-        else => return error.CurlFailed,
+        .Exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+        else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
     }
 
     const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
@@ -295,6 +355,7 @@ fn curlGetWithProxyAndResolve(
     timeout_secs: []const u8,
     proxy: ?[]const u8,
     resolve_entry: ?[]const u8,
+    max_bytes: usize,
 ) ![]u8 {
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
@@ -338,22 +399,38 @@ fn curlGetWithProxyAndResolve(
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+    const cancel_flag = thread_interrupt_flag;
+    var cancel_done = AtomicBool.init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var watcher_ctx: CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    }
+    defer {
+        cancel_done.store(true, .release);
+        if (cancel_watcher) |t| t.join();
+    }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
+    const stdout = child.stdout.?.readToEndAlloc(allocator, max_bytes) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
-        return error.CurlReadError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
-    const term = child.wait() catch return error.CurlWaitError;
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
+        return error.CurlWaitError;
+    };
     switch (term) {
         .Exited => |code| if (code != 0) {
+            log.debug("curl GET exited with code {d} (timeout={s}s)", .{ code, timeout_secs });
             allocator.free(stdout);
-            return error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
         },
         else => {
             allocator.free(stdout);
-            return error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
         },
     }
 
@@ -371,7 +448,7 @@ pub fn curlGetWithProxy(
     timeout_secs: []const u8,
     proxy: ?[]const u8,
 ) ![]u8 {
-    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null);
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
 /// HTTP GET via curl subprocess with a pinned host mapping.
@@ -384,12 +461,23 @@ pub fn curlGetWithResolve(
     timeout_secs: []const u8,
     resolve_entry: []const u8,
 ) ![]u8 {
-    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry);
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
 /// HTTP GET via curl subprocess (no proxy).
 pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u8, timeout_secs: []const u8) ![]u8 {
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
+}
+
+/// HTTP GET via curl subprocess with a caller-provided response size cap.
+pub fn curlGetMaxBytes(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, null, max_bytes);
 }
 
 /// Read proxy URL from standard environment variables.
@@ -484,16 +572,29 @@ pub fn curlGetSSE(
         std.debug.print("[curlGetSSE] spawn failed: {}\n", .{err});
         return error.CurlFailed;
     };
+    const cancel_flag = thread_interrupt_flag;
+    var cancel_done = AtomicBool.init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var watcher_ctx: CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        watcher_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+    }
+    defer {
+        cancel_done.store(true, .release);
+        if (cancel_watcher) |t| t.join();
+    }
 
     const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
-        return error.CurlReadError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
     };
 
-    const term = child.wait() catch {
+    const term = child.wait() catch |err| {
+        log.err("curl child.wait failed: {}", .{err});
         allocator.free(stdout);
-        return error.CurlWaitError;
+        return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
         .Exited => |code| {
@@ -504,14 +605,14 @@ pub fn curlGetSSE(
                 if (code != 28) {
                     std.debug.print("[curlGetSSE] curl error: code={}\n", .{code});
                     allocator.free(stdout);
-                    return error.CurlFailed;
+                    return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
                 }
                 // Timeout (code 28) - return any data we received
             }
         },
         else => {
             allocator.free(stdout);
-            return error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
         },
     }
 
@@ -555,6 +656,10 @@ test "curlGet with zero headers compiles and is callable" {
 
 test "curlGetWithResolve compiles and is callable" {
     try std.testing.expect(true);
+}
+
+test "curlGetMaxBytes compiles and is callable" {
+    _ = curlGetMaxBytes;
 }
 
 test "normalizeProxyEnvValue trims surrounding whitespace" {

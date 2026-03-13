@@ -9,11 +9,14 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("platform.zig");
+const codex_support = @import("codex_support.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
+const provider_names = @import("provider_names.zig");
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
@@ -81,6 +84,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
     .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
     .{ .key = "openai", .label = "OpenAI (GPT direct)", .default_model = "gpt-5.2", .env_var = "OPENAI_API_KEY" },
+    .{ .key = "azure", .label = "Azure OpenAI (GPT via Azure)", .default_model = "gpt-5.2-chat", .env_var = "AZURE_OPENAI_API_KEY" },
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
     .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
@@ -128,17 +132,13 @@ pub const known_providers = [_]ProviderInfo{
 
     // --- Tier 10: CLI-based providers ---
     .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
-    .{ .key = "codex-cli", .label = "Codex CLI (OpenAI codex, local)", .default_model = "codex-mini-latest", .env_var = "OPENAI_API_KEY" },
+    .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "OPENAI_API_KEY" },
+    .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
 };
 
 /// Canonicalize provider name (handle aliases).
 pub fn canonicalProviderName(name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "grok")) return "xai";
-    if (std.mem.eql(u8, name, "together")) return "together-ai";
-    if (std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return "gemini";
-    if (std.mem.eql(u8, name, "vertex-ai") or std.mem.eql(u8, name, "google-vertex")) return "vertex";
-    if (std.mem.eql(u8, name, "claude-code")) return "claude-cli";
-    return name;
+    return provider_names.canonicalProviderName(name);
 }
 
 fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
@@ -168,6 +168,77 @@ fn isValidCustomProviderUrl(url: []const u8) bool {
     if (url.len == 0) return false;
     if (!(std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://"))) return false;
     return hasVersionedApiSegment(url);
+}
+
+fn isLocalEndpoint(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "http://localhost") or
+        std.mem.startsWith(u8, url, "https://localhost") or
+        std.mem.startsWith(u8, url, "http://127.") or
+        std.mem.startsWith(u8, url, "https://127.") or
+        std.mem.startsWith(u8, url, "http://0.0.0.0") or
+        std.mem.startsWith(u8, url, "https://0.0.0.0") or
+        std.mem.startsWith(u8, url, "http://[::1]") or
+        std.mem.startsWith(u8, url, "https://[::1]");
+}
+
+fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) bool {
+    const canonical = canonicalProviderName(provider);
+    if (std.mem.eql(u8, canonical, "ollama") or
+        std.mem.eql(u8, canonical, "lm-studio") or
+        std.mem.eql(u8, canonical, "lmstudio") or
+        std.mem.eql(u8, canonical, "claude-cli") or
+        std.mem.eql(u8, canonical, "codex-cli") or
+        std.mem.eql(u8, canonical, "openai-codex"))
+    {
+        return false;
+    }
+
+    if (std.mem.startsWith(u8, provider, "custom:")) {
+        const custom_url = if (base_url) |configured| configured else provider["custom:".len..];
+        return !isLocalEndpoint(custom_url);
+    }
+
+    if (base_url) |configured| {
+        return !isLocalEndpoint(configured);
+    }
+
+    return true;
+}
+
+fn printProviderNextSteps(
+    out: *std.Io.Writer,
+    provider: []const u8,
+    env_hint: []const u8,
+    requires_api_key: bool,
+    has_configured_key: bool,
+) !void {
+    const canonical = canonicalProviderName(provider);
+
+    if (requires_api_key and !has_configured_key) {
+        try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
+        try out.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    3. Gateway:           nullclaw gateway\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, canonical, "openai-codex")) {
+        try out.writeAll("    1. Authenticate:  nullclaw auth login openai-codex\n");
+        try out.writeAll("       Alternative:   nullclaw auth login openai-codex --import-codex\n");
+        try out.writeAll("    2. Chat:          nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    3. Gateway:       nullclaw gateway\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, canonical, "codex-cli")) {
+        try out.writeAll("    1. Authenticate:  codex login\n");
+        try out.writeAll("    2. Chat:          nullclaw agent -m \"Hello!\"\n");
+        try out.writeAll("    3. Gateway:       nullclaw gateway\n");
+        return;
+    }
+
+    try out.writeAll("    1. Chat:     nullclaw agent -m \"Hello!\"\n");
+    try out.writeAll("    2. Gateway:  nullclaw gateway\n");
+    try out.writeAll("    3. Status:   nullclaw status\n");
 }
 
 /// Resolve a provider name used in quick setup.
@@ -237,7 +308,8 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
-    if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_cli_fallback;
+    if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
+    if (std.mem.eql(u8, canonical, "openai-codex")) return &codex_support.codex_model_fallbacks;
 
     // For providers without a curated fallback list, return a single-item fallback
     // based on the onboarding default model for that provider.
@@ -321,10 +393,6 @@ const claude_cli_fallback = [_][]const u8{
     "claude-opus-4-6",
 };
 
-const codex_cli_fallback = [_][]const u8{
-    "codex-mini-latest",
-};
-
 const MAX_MODELS = 20;
 
 /// Return a heap-allocated copy of the static fallback list for a provider.
@@ -348,6 +416,11 @@ fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8) ![][]c
 /// Returns at most 20 model IDs. Caller ALWAYS owns the returned slice and strings.
 /// Free with: for (models) |m| allocator.free(m); allocator.free(models);
 pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
+    const canonical = canonicalProviderName(provider);
+    if (std.mem.eql(u8, canonical, "codex-cli") or std.mem.eql(u8, canonical, "openai-codex")) {
+        return codex_support.loadCodexModels(allocator);
+    }
+
     const home = platform.getHomeDir(allocator) catch
         return dupeFallbackModels(allocator, provider);
     defer allocator.free(home);
@@ -370,14 +443,17 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
 pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
     const canonical = canonicalProviderName(provider);
 
+    if (std.mem.eql(u8, canonical, "codex-cli") or std.mem.eql(u8, canonical, "openai-codex")) {
+        return codex_support.loadCodexModels(allocator);
+    }
+
     // Providers with no models-list API
     if (std.mem.eql(u8, canonical, "anthropic") or
         std.mem.eql(u8, canonical, "gemini") or
         std.mem.eql(u8, canonical, "vertex") or
         std.mem.eql(u8, canonical, "deepseek") or
         std.mem.eql(u8, canonical, "ollama") or
-        std.mem.eql(u8, canonical, "claude-cli") or
-        std.mem.eql(u8, canonical, "codex-cli"))
+        std.mem.eql(u8, canonical, "claude-cli"))
     {
         const fallback = fallbackModelsForProvider(canonical);
         var result: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -715,19 +791,14 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     if (cfg.default_model) |m| {
         try stdout.print("  [OK] Model:      {s}\n", .{m});
     }
-    try stdout.print("  [OK] API Key:    {s}\n", .{if (cfg.defaultProviderKey() != null) "set" else "not set (use --api-key or edit config)"});
+    const quick_requires_api_key = providerRequiresApiKeyForSetup(cfg.default_provider, cfg.getProviderBaseUrl(cfg.default_provider));
+    try stdout.print("  [OK] API Key:    {s}\n", .{if (quick_requires_api_key)
+        (if (cfg.defaultProviderKey() != null) "set" else "not set (use --api-key or edit config)")
+    else
+        "not required"});
     try stdout.print("  [OK] Memory:     {s}\n", .{cfg.memory.backend});
     try stdout.writeAll("\n  Next steps:\n");
-    if (cfg.defaultProviderKey() == null) {
-        const env_hint = providerEnvVar(cfg.default_provider);
-        try stdout.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
-        try stdout.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
-        try stdout.writeAll("    3. Gateway:           nullclaw gateway\n");
-    } else {
-        try stdout.writeAll("    1. Chat:     nullclaw agent -m \"Hello!\"\n");
-        try stdout.writeAll("    2. Gateway:  nullclaw gateway\n");
-        try stdout.writeAll("    3. Status:   nullclaw status\n");
-    }
+    try printProviderNextSteps(stdout, cfg.default_provider, providerEnvVar(cfg.default_provider), quick_requires_api_key, cfg.defaultProviderKey() != null);
     try stdout.writeAll("\n");
     try stdout.flush();
 }
@@ -1481,30 +1552,77 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         try out.print("  -> Custom: {s}\n\n", .{custom_url});
     }
 
+    const is_azure_provider = provider_idx < known_providers.len and
+        std.mem.eql(u8, known_providers[provider_idx].key, "azure");
+
+    var provider_base_url: ?[]const u8 = null;
+    if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
+        provider_base_url = cfg.providers[0].base_url;
+    }
+
+    if (is_azure_provider) {
+        var azure_endpoint_buf: [512]u8 = undefined;
+        const default_endpoint = provider_base_url orelse "";
+        if (default_endpoint.len > 0) {
+            try out.print("  Azure OpenAI endpoint [{s}]: ", .{default_endpoint});
+        } else {
+            try out.writeAll("  Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com): ");
+        }
+        const azure_endpoint = prompt(out, &azure_endpoint_buf, "", default_endpoint) orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (azure_endpoint.len == 0) {
+            try out.writeAll("\n  Error: Azure OpenAI endpoint is required\n");
+            try out.flush();
+            return;
+        }
+        provider_base_url = try cfg.allocator.dupe(u8, azure_endpoint);
+        try out.writeAll("  Note: Azure OpenAI uses your model name as the deployment name in URLs.\n");
+        try out.writeAll("  Configure your Azure deployment with the same name as your model (e.g., gpt-5.2-chat).\n");
+    }
+
     // ── Step 2: API key ──
     const env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
-    try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
-    const api_key_input = prompt(out, &input_buf, "", "") orelse {
-        try out.writeAll("\n  Aborted.\n");
-        try out.flush();
-        return;
-    };
-    if (api_key_input.len > 0) {
-        // Store in providers section (preserve base_url if already set for custom provider)
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        var base_url: ?[]const u8 = null;
-        if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
-            base_url = cfg.providers[0].base_url;
-        }
-        entries[0] = .{
-            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-            .api_key = try cfg.allocator.dupe(u8, api_key_input),
-            .base_url = base_url,
+    const requires_api_key = providerRequiresApiKeyForSetup(cfg.default_provider, provider_base_url);
+    if (requires_api_key) {
+        try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
+        const api_key_input = prompt(out, &input_buf, "", "") orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
         };
-        cfg.providers = entries;
-        try out.writeAll("  -> API key set\n\n");
+        if (api_key_input.len > 0) {
+            // Store in providers section (preserve base_url if already set for custom provider)
+            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+            entries[0] = .{
+                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+                .api_key = try cfg.allocator.dupe(u8, api_key_input),
+                .base_url = provider_base_url,
+            };
+            cfg.providers = entries;
+            try out.writeAll("  -> API key set\n\n");
+        } else {
+            if (is_azure_provider) {
+                const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+                entries[0] = .{
+                    .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+                    .base_url = provider_base_url,
+                };
+                cfg.providers = entries;
+            }
+            try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
+        }
     } else {
-        try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
+        try out.writeAll("  Step 2/8: Authentication\n");
+        if (std.mem.eql(u8, cfg.default_provider, "openai-codex")) {
+            try out.writeAll("  -> Uses local OAuth tokens from ~/.nullclaw/auth.json or ~/.codex/auth.json\n\n");
+        } else if (std.mem.eql(u8, cfg.default_provider, "codex-cli")) {
+            try out.writeAll("  -> Uses your local Codex CLI login (`codex login`)\n\n");
+        } else {
+            try out.writeAll("  -> No API key required for this local provider\n\n");
+        }
     }
 
     // ── Step 3: Model (with live fetching) ──
@@ -1717,23 +1835,17 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     if (cfg.default_model) |m| {
         try out.print("  [OK] Model:      {s}\n", .{m});
     }
-    try out.print("  [OK] API Key:    {s}\n", .{if (cfg.defaultProviderKey() != null) "set" else "from environment"});
+    try out.print("  [OK] API Key:    {s}\n", .{if (requires_api_key)
+        (if (cfg.defaultProviderKey() != null) "set" else "from environment")
+    else
+        "not required"});
     try out.print("  [OK] Memory:     {s}\n", .{cfg.memory.backend});
     try out.print("  [OK] Tunnel:     {s}\n", .{cfg.tunnel.provider});
     try out.print("  [OK] Workspace:  {s}\n", .{cfg.workspace_dir});
     try out.print("  [OK] Config:     {s}\n", .{cfg.config_path});
     try out.writeAll("\n  Next steps:\n");
-    if (cfg.defaultProviderKey() == null) {
-        // Recalculate env_hint for the final display
-        const final_env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
-        try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{final_env_hint});
-        try out.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
-        try out.writeAll("    3. Gateway:           nullclaw gateway\n");
-    } else {
-        try out.writeAll("    1. Chat:     nullclaw agent -m \"Hello!\"\n");
-        try out.writeAll("    2. Gateway:  nullclaw gateway\n");
-        try out.writeAll("    3. Status:   nullclaw status\n");
-    }
+    const final_env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
+    try printProviderNextSteps(out, cfg.default_provider, final_env_hint, requires_api_key, cfg.defaultProviderKey() != null);
     try out.writeAll("\n");
     try out.flush();
 }
@@ -2020,7 +2132,7 @@ fn overwriteWorkspaceFile(
     content: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) return true;
@@ -2037,7 +2149,7 @@ fn removeWorkspaceFileIfExists(
     filename: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) {
@@ -2052,7 +2164,7 @@ fn removeWorkspaceFileIfExists(
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
     defer allocator.free(path);
 
     // Only write if file doesn't exist
@@ -2097,7 +2209,7 @@ fn ensureBootstrapLifecycle(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !void {
-    const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
+    const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
     defer allocator.free(bootstrap_path);
 
     var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
@@ -2148,9 +2260,9 @@ fn isLegacyOnboardingCompleted(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !bool {
-    const identity_path = try std.fmt.allocPrint(allocator, "{s}/IDENTITY.md", .{workspace_dir});
+    const identity_path = try std.fs.path.join(allocator, &.{ workspace_dir, "IDENTITY.md" });
     defer allocator.free(identity_path);
-    const user_path = try std.fmt.allocPrint(allocator, "{s}/USER.md", .{workspace_dir});
+    const user_path = try std.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
     defer allocator.free(user_path);
 
     var templates_diverged = false;
@@ -2170,11 +2282,7 @@ fn isLegacyOnboardingCompleted(
 }
 
 fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}/{s}",
-        .{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE },
-    );
+    return std.fs.path.join(allocator, &.{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE });
 }
 
 fn readWorkspaceOnboardingState(
@@ -2309,11 +2417,11 @@ fn pathExistsAbsolute(path: []const u8) bool {
 }
 
 fn hasLegacyUserContentIndicators(allocator: std.mem.Allocator, workspace_dir: []const u8) !bool {
-    const memory_dir_path = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
+    const memory_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, "memory" });
     defer allocator.free(memory_dir_path);
-    const memory_file_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace_dir});
+    const memory_file_path = try std.fs.path.join(allocator, &.{ workspace_dir, "MEMORY.md" });
     defer allocator.free(memory_file_path);
-    const git_dir_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{workspace_dir});
+    const git_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, ".git" });
     defer allocator.free(git_dir_path);
 
     return pathExistsAbsolute(memory_dir_path) or
@@ -2429,14 +2537,19 @@ test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("vertex", canonicalProviderName("vertex-ai"));
     try std.testing.expectEqualStrings("vertex", canonicalProviderName("google-vertex"));
     try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
+    try std.testing.expectEqualStrings("azure", canonicalProviderName("azure-openai"));
+    try std.testing.expectEqualStrings("azure", canonicalProviderName("azure_openai"));
     try std.testing.expectEqualStrings("openai", canonicalProviderName("openai"));
 }
 
 test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("claude-opus-4-6", defaultModelForProvider("anthropic"));
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
+    try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
+    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("codex-cli"));
+    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("openai-codex"));
 }
 
 test "defaultModelForProvider falls back for unknown" {
@@ -2447,6 +2560,7 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", providerEnvVar("openrouter"));
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
     try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
 
@@ -2456,6 +2570,16 @@ test "providerEnvVar grok alias maps to xai" {
 
 test "providerEnvVar unknown falls back" {
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("some-new-provider"));
+}
+
+test "providerRequiresApiKeyForSetup marks local and OAuth providers as keyless" {
+    try std.testing.expect(!providerRequiresApiKeyForSetup("ollama", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("lm-studio", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("claude-cli", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("codex-cli", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("openai-codex", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1"));
+    try std.testing.expect(providerRequiresApiKeyForSetup("openai", null));
 }
 
 test "known_providers has entries" {
@@ -2847,6 +2971,28 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
     try std.testing.expect(state.onboarding_completed_at != null);
 }
 
+test "scaffoldWorkspace handles trailing native separator on Windows paths" {
+    if (builtin.os.tag != .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const workspace_with_sep = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}{s}",
+        .{ base, std.fs.path.sep_str },
+    );
+    defer std.testing.allocator.free(workspace_with_sep);
+
+    try scaffoldWorkspace(std.testing.allocator, workspace_with_sep, &ProjectContext{}, null);
+
+    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    bootstrap_file.close();
+}
+
 // ── Additional onboard tests ────────────────────────────────────
 
 test "canonicalProviderName passthrough for known providers" {
@@ -2972,7 +3118,7 @@ test "known_providers all have non-empty fields" {
         try std.testing.expect(p.key.len > 0);
         try std.testing.expect(p.label.len > 0);
         try std.testing.expect(p.default_model.len > 0);
-        try std.testing.expect(p.env_var.len > 0);
+        try std.testing.expect(p.env_var.len > 0 or !providerRequiresApiKeyForSetup(p.key, null));
     }
 }
 
@@ -3098,7 +3244,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 33);
+    try std.testing.expect(known_providers.len == 35);
     // The wizard would clamp to default (0) for out of range input
 }
 
@@ -3223,7 +3369,11 @@ test "fallbackModelsForProvider returns models for known providers" {
 
     const codex_cli_models = fallbackModelsForProvider("codex-cli");
     try std.testing.expect(codex_cli_models.len >= 1);
-    try std.testing.expectEqualStrings("codex-mini-latest", codex_cli_models[0]);
+    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, codex_cli_models[0]);
+
+    const openai_codex_models = fallbackModelsForProvider("openai-codex");
+    try std.testing.expect(openai_codex_models.len >= 1);
+    try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, openai_codex_models[0]);
 }
 
 test "fallbackModelsForProvider handles aliases" {

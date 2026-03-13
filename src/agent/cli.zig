@@ -21,15 +21,21 @@ const subagent_mod = @import("../subagent.zig");
 const subagent_runner = @import("../subagent_runner.zig");
 const cli_mod = @import("../channels/cli.zig");
 const security = @import("../security/policy.zig");
-const auth_mod = @import("../auth.zig");
+const codex_support = @import("../codex_support.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
+const verbose = @import("../verbose.zig");
 
 const Agent = @import("root.zig").Agent;
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
+    emitted_text: bool = false,
 };
+
+fn shouldPrintTurnResponse(supports_streaming: bool, emitted_text: bool) bool {
+    return !supports_streaming or !emitted_text;
+}
 
 fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
@@ -43,18 +49,14 @@ fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
 /// Streaming callback that forwards provider chunks into unified stream sink events.
 fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    if (!chunk.is_final and chunk.delta.len > 0) {
+        stream_ctx.emitted_text = true;
+    }
     streaming.forwardProviderChunk(stream_ctx.sink, chunk);
 }
 
 fn hasOpenAiCodexCredential(allocator: std.mem.Allocator) bool {
-    const token = auth_mod.loadCredential(allocator, providers.openai_codex.CREDENTIAL_KEY) catch return false;
-    if (token) |tok| {
-        allocator.free(tok.access_token);
-        if (tok.refresh_token) |rt| allocator.free(rt);
-        allocator.free(tok.token_type);
-        return true;
-    }
-    return false;
+    return codex_support.hasOpenAiCodexCredential(allocator);
 }
 
 fn shouldPrintOpenAiCodexHint(default_provider: []const u8, has_codex_credential: bool) bool {
@@ -68,9 +70,20 @@ fn maybePrintAllProvidersFailedHint(
 ) !void {
     if (!shouldPrintOpenAiCodexHint(default_provider, hasOpenAiCodexCredential(allocator))) return;
     try w.print(
-        "Hint: openai-codex is authenticated, but current provider is {s}. Set \"agents.defaults.model.primary\": \"openai-codex/gpt-5.3-codex\" or run with --provider openai-codex --model gpt-5.3-codex.\n",
-        .{default_provider},
+        "Hint: openai-codex is authenticated, but current provider is {s}. Set \"agents.defaults.model.primary\": \"openai-codex/{s}\" or run with --provider openai-codex --model {s}.\n",
+        .{ default_provider, codex_support.DEFAULT_CODEX_MODEL, codex_support.DEFAULT_CODEX_MODEL },
     );
+}
+
+fn maybePrintLastProviderApiError(
+    allocator: std.mem.Allocator,
+    w: *std.Io.Writer,
+) !void {
+    const detail = providers.snapshotLastApiErrorDetail(allocator) catch null;
+    if (detail) |msg| {
+        defer allocator.free(msg);
+        try w.print("Last provider error: {s}\n", .{msg});
+    }
 }
 
 const ParsedAgentArgs = struct {
@@ -79,6 +92,7 @@ const ParsedAgentArgs = struct {
     provider_override: ?[]const u8 = null,
     model_override: ?[]const u8 = null,
     temperature_override: ?f64 = null,
+    verbose: bool = false,
 };
 
 const AgentArgParseResult = union(enum) {
@@ -113,6 +127,8 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             i += 1;
             const temp = std.fmt.parseFloat(f64, args[i]) catch return .{ .invalid_temperature = args[i] };
             parsed.temperature_override = temp;
+        } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
+            parsed.verbose = true;
         }
     }
     return .{ .ok = parsed };
@@ -147,6 +163,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (parsed_args.temperature_override) |temp| {
         cfg.default_temperature = temp;
         cfg.temperature = temp;
+    }
+    if (parsed_args.verbose) {
+        log.warn("Verbose flag detected, enabling verbose logging", .{});
+        verbose.setVerbose(true);
     }
 
     cfg.validate() catch |err| {
@@ -204,7 +224,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .autonomy = cfg.autonomy.level,
         .workspace_dir = cfg.workspace_dir,
         .workspace_only = cfg.autonomy.workspace_only,
-        .allowed_commands = if (cfg.autonomy.allowed_commands.len > 0) cfg.autonomy.allowed_commands else &security.default_allowed_commands,
+        .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
         .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
         .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
         .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
@@ -244,8 +264,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .web_search_provider = cfg.http_request.search_provider,
         .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
         .browser_enabled = cfg.browser.enabled,
+        .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
         .agents = cfg.agents,
+        .configured_providers = cfg.providers,
         .fallback_api_key = resolved_api_key,
         .tools_config = cfg.tools,
         .allowed_paths = cfg.autonomy.allowed_paths,
@@ -282,6 +304,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         agent.session_store = if (mem_rt) |rt| rt.session_store else null;
         agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
         agent.mem_rt = if (mem_rt) |*rt| rt else null;
+        if (parsed_args.provider_override != null or parsed_args.model_override != null) {
+            agent.model_pinned_by_user = true;
+        }
         if (session_id) |sid| {
             agent.memory_session_id = sid;
         }
@@ -300,6 +325,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             agent.stream_ctx = @ptrCast(&stream_ctx);
         }
 
+        stream_ctx.emitted_text = false;
         const response = agent.turn(message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -307,6 +333,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
                 return;
             }
             if (err == error.AllProvidersFailed) {
+                try maybePrintLastProviderApiError(allocator, w);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
                 try w.flush();
             }
@@ -314,10 +341,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        if (supports_streaming) {
-            try w.print("\n", .{});
-        } else {
+        if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("{s}\n", .{response});
+        } else {
+            try w.print("\n", .{});
         }
         try w.flush();
         return;
@@ -376,6 +403,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     agent.session_store = if (mem_rt) |rt| rt.session_store else null;
     agent.response_cache = if (mem_rt) |*rt| rt.response_cache else null;
     agent.mem_rt = if (mem_rt) |*rt| rt else null;
+    if (parsed_args.provider_override != null or parsed_args.model_override != null) {
+        agent.model_pinned_by_user = true;
+    }
     if (session_id) |sid| {
         agent.memory_session_id = sid;
     }
@@ -417,11 +447,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Append to history
         repl_history.append(allocator, allocator.dupe(u8, line) catch continue) catch {};
 
+        stream_ctx.emitted_text = false;
         const response = agent.turn(line) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
             } else if (err == error.AllProvidersFailed) {
                 try w.print("Error: {}\n", .{err});
+                try maybePrintLastProviderApiError(allocator, w);
                 try maybePrintAllProvidersFailedHint(allocator, w, cfg.default_provider);
             } else {
                 try w.print("Error: {}\n", .{err});
@@ -431,10 +463,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         };
         defer allocator.free(response);
 
-        if (supports_streaming) {
-            try w.print("\n\n", .{});
-        } else {
+        if (shouldPrintTurnResponse(supports_streaming, stream_ctx.emitted_text)) {
             try w.print("\n{s}\n\n", .{response});
+        } else {
+            try w.print("\n\n", .{});
         }
         try w.flush();
     }
@@ -456,13 +488,23 @@ test "cliStreamCallback handles empty delta" {
     };
     const chunk = providers.StreamChunk.finalChunk();
     cliStreamCallback(@ptrCast(&ctx), chunk);
+    try std.testing.expect(!ctx.emitted_text);
 }
 
 test "cliStreamCallback text delta chunk" {
+    var sink_ctx: u8 = 0;
+    var ctx = CliStreamCtx{
+        .sink = .{
+            .callback = noopSinkEvent,
+            .ctx = @ptrCast(&sink_ctx),
+        },
+    };
     const chunk = providers.StreamChunk.textDelta("hello");
+    cliStreamCallback(@ptrCast(&ctx), chunk);
     try std.testing.expectEqualStrings("hello", chunk.delta);
     try std.testing.expect(!chunk.is_final);
     try std.testing.expectEqual(@as(u32, 2), chunk.token_count);
+    try std.testing.expect(ctx.emitted_text);
 }
 
 test "parseAgentArgs parses provider and model overrides" {
@@ -484,6 +526,15 @@ test "parseAgentArgs parses provider and model overrides" {
     try std.testing.expectEqualStrings("ollama", parsed.provider_override.?);
     try std.testing.expectEqualStrings("llama3.2:latest", parsed.model_override.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.temperature_override.?, 0.000001);
+}
+
+test "shouldPrintTurnResponse prints fallback when streaming emits no text" {
+    try std.testing.expect(shouldPrintTurnResponse(true, false));
+    try std.testing.expect(shouldPrintTurnResponse(false, false));
+}
+
+test "shouldPrintTurnResponse suppresses duplicate output after streamed text" {
+    try std.testing.expect(!shouldPrintTurnResponse(true, true));
 }
 
 test "parseAgentArgs keeps the last override value" {

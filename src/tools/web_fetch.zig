@@ -19,6 +19,7 @@ const DEFAULT_MAX_CHARS: usize = 50_000;
 /// Web fetch tool — fetches URLs and extracts readable content.
 pub const WebFetchTool = struct {
     default_max_chars: usize = DEFAULT_MAX_CHARS,
+    allowed_domains: []const []const u8 = &.{}, // empty = allow all
 
     pub const tool_name = "web_fetch";
     pub const tool_description = "Fetch a web page and extract its text content. Converts HTML to readable text with markdown formatting.";
@@ -59,6 +60,13 @@ pub const WebFetchTool = struct {
         };
         defer allocator.free(connect_host);
 
+        // Keep security surface aligned with http_request.
+        if (self.allowed_domains.len > 0) {
+            if (!net_security.hostMatchesAllowlist(host, self.allowed_domains)) {
+                return ToolResult.fail("Host is not in http_request.allowed_domains");
+            }
+        }
+
         const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
 
         // Fetch URL via curl subprocess
@@ -87,6 +95,9 @@ pub const WebFetchTool = struct {
             );
         } catch |err| {
             log.err("web_fetch connection failed for {s}: {}", .{ url, err });
+            if (err == error.CurlInterrupted) {
+                return ToolResult.fail("Interrupted by /stop");
+            }
             const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -472,6 +483,26 @@ test "WebFetchTool private IP blocked" {
 test "WebFetchTool loopback decimal alias blocked" {
     var wft = WebFetchTool{};
     const parsed = try root.parseTestArgs("{\"url\":\"http://2130706433/\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
+}
+
+test "WebFetchTool blocked when host is not in allowlist" {
+    const domains = [_][]const u8{"example.com"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"https://google.com\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
+}
+
+test "WebFetchTool local host remains blocked with allowlist configured" {
+    const domains = [_][]const u8{"example.com"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://127.0.0.1/\"}");
     defer parsed.deinit();
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
