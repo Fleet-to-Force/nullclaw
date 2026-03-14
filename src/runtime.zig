@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const build_options = @import("build_options");
 const embedded_wasm3_available = build_options.enable_embedded_wasm3;
@@ -353,8 +354,16 @@ pub const WasmRuntime = struct {
         const invocation = try self.buildInvocation(module_path, fuel, max_mem);
 
         var argv_buf: [7][]const u8 = undefined;
+        var resolved_wasmtime_path: ?[]u8 = null;
+        defer if (resolved_wasmtime_path) |path| allocator.free(path);
+
         const argc = switch (invocation) {
-            .wasmtime => |inv| inv.writeArgv(&argv_buf),
+            .wasmtime => |inv| blk: {
+                resolved_wasmtime_path = try resolveWasmtimePath(allocator);
+                const count = inv.writeArgv(&argv_buf);
+                argv_buf[0] = resolved_wasmtime_path.?;
+                break :blk count;
+            },
             .wasm3 => |inv| inv.writeArgv(&argv_buf),
         };
 
@@ -520,6 +529,87 @@ pub const WasmRuntime = struct {
         return true;
     }
 };
+
+fn resolveWasmtimePath(allocator: std.mem.Allocator) ![]u8 {
+    const path_env = std.process.getEnvVarOwned(allocator, "PATH") catch return error.WasmtimeNotFound;
+    defer allocator.free(path_env);
+
+    const path_extensions = if (builtin.os.tag == .windows)
+        std.process.getEnvVarOwned(allocator, "PATHEXT") catch null
+    else
+        null;
+    defer if (path_extensions) |value| allocator.free(value);
+
+    return resolveExecutableFromSearchPath(allocator, "wasmtime", path_env, path_extensions);
+}
+
+fn resolveExecutableFromPath(allocator: std.mem.Allocator, executable: []const u8, path_env: []const u8) ![]u8 {
+    return resolveExecutableFromSearchPath(allocator, executable, path_env, null);
+}
+
+fn resolveExecutableFromSearchPath(
+    allocator: std.mem.Allocator,
+    executable: []const u8,
+    path_env: []const u8,
+    path_extensions: ?[]const u8,
+) ![]u8 {
+    var parts = std.mem.splitScalar(u8, path_env, std.fs.path.delimiter);
+    while (parts.next()) |part| {
+        if (part.len == 0) continue;
+        if (try resolveExecutableFromDirectory(allocator, part, executable, path_extensions)) |resolved| {
+            return resolved;
+        }
+    }
+    return error.WasmtimeNotFound;
+}
+
+fn resolveExecutableFromDirectory(
+    allocator: std.mem.Allocator,
+    directory: []const u8,
+    executable: []const u8,
+    path_extensions: ?[]const u8,
+) !?[]u8 {
+    const candidate = try std.fs.path.join(allocator, &.{ directory, executable });
+    defer allocator.free(candidate);
+
+    if (try realpathIfExecutable(allocator, candidate)) |resolved| {
+        return resolved;
+    }
+
+    if (path_extensions) |extensions| {
+        var extension_it = std.mem.tokenizeScalar(u8, extensions, std.fs.path.delimiter);
+        while (extension_it.next()) |ext| {
+            if (!supportedWindowsProgramExtension(ext)) continue;
+
+            const candidate_with_ext = try std.fmt.allocPrint(allocator, "{s}{s}", .{ candidate, ext });
+            defer allocator.free(candidate_with_ext);
+
+            if (try realpathIfExecutable(allocator, candidate_with_ext)) |resolved| {
+                return resolved;
+            }
+        }
+    }
+
+    return null;
+}
+
+fn realpathIfExecutable(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const stat = std.fs.cwd().statFile(path) catch return null;
+    if (stat.kind != .file) return null;
+    if (builtin.os.tag != .windows and (stat.mode & 0o111) == 0) return null;
+
+    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+}
+
+fn supportedWindowsProgramExtension(ext: []const u8) bool {
+    inline for (@typeInfo(std.process.Child.WindowsExtension).@"enum".fields) |field| {
+        if (std.ascii.eqlIgnoreCase(ext, "." ++ field.name)) return true;
+    }
+    return false;
+}
 
 // ── CloudflareRuntime ────────────────────────────────────────────────
 
@@ -1088,4 +1178,86 @@ test "wasm integration executes module with wasm3 when available" {
     defer std.testing.allocator.free(result.stderr);
 
     try std.testing.expectEqual(@as(i32, 0), result.exit_code);
+}
+
+test "resolveExecutableFromPath returns absolute executable path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "wasmtime",
+        .data = "#!/bin/sh\nexit 0\n",
+        .flags = .{ .mode = 0o755 },
+    });
+    const tmp_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_abs);
+
+    const resolved = try resolveExecutableFromPath(std.testing.allocator, "wasmtime", tmp_abs);
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expect(std.mem.endsWith(u8, resolved, "wasmtime"));
+}
+
+test "resolveExecutableFromSearchPath skips non-executable entries" {
+    if (builtin.os.tag == .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("first");
+    try tmp.dir.makeDir("second");
+    try tmp.dir.writeFile(.{
+        .sub_path = "first/wasmtime",
+        .data = "#!/bin/sh\nexit 0\n",
+        .flags = .{ .mode = 0o644 },
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "second/wasmtime",
+        .data = "#!/bin/sh\nexit 0\n",
+        .flags = .{ .mode = 0o755 },
+    });
+
+    const first_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "first");
+    defer std.testing.allocator.free(first_abs);
+    const second_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "second");
+    defer std.testing.allocator.free(second_abs);
+
+    const path_env = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}{c}{s}",
+        .{ first_abs, std.fs.path.delimiter, second_abs },
+    );
+    defer std.testing.allocator.free(path_env);
+
+    const resolved = try resolveExecutableFromSearchPath(std.testing.allocator, "wasmtime", path_env, null);
+    defer std.testing.allocator.free(resolved);
+
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ second_abs, "wasmtime" });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
+}
+
+test "resolveExecutableFromSearchPath honors executable extensions" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("bin");
+    try tmp.dir.writeFile(.{
+        .sub_path = "bin/wasmtime.EXE",
+        .data = "#!/bin/sh\nexit 0\n",
+        .flags = .{ .mode = 0o755 },
+    });
+
+    const bin_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "bin");
+    defer std.testing.allocator.free(bin_abs);
+
+    var extensions_buf: [32]u8 = undefined;
+    const path_extensions = try std.fmt.bufPrint(&extensions_buf, ".EXE{c}.BAT", .{std.fs.path.delimiter});
+
+    const resolved = try resolveExecutableFromSearchPath(std.testing.allocator, "wasmtime", bin_abs, path_extensions);
+    defer std.testing.allocator.free(resolved);
+
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ bin_abs, "wasmtime.EXE" });
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, resolved);
 }
