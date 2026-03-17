@@ -1,6 +1,7 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 const provider_names = @import("provider_names.zig");
+const secrets = @import("security/secrets.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
 /// Write a JSON-escaped string (with enclosing quotes) to any writer.
@@ -110,6 +111,15 @@ const SerializedNamedAgentConfig = struct {
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
+};
+
+const SerializedModelRouteConfig = struct {
+    hint: []const u8,
+    provider: []const u8,
+    model: []const u8,
+    api_key: ?[]const u8 = null,
+    cost_class: config_types.ModelRouteCostClass = .standard,
+    quota_class: config_types.ModelRouteQuotaClass = .normal,
 };
 
 fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentConfig) void {
@@ -412,6 +422,39 @@ pub const Config = struct {
         }
     }
 
+    fn secretStore(self: *const Config) secrets.SecretStore {
+        const config_dir = std.fs.path.dirname(self.config_path) orelse ".";
+        return secrets.SecretStore.init(config_dir, self.secrets.encrypt);
+    }
+
+    fn encryptConfigSecret(
+        self: *const Config,
+        store: *const secrets.SecretStore,
+        value: ?[]const u8,
+    ) !?[]u8 {
+        const secret = value orelse return null;
+        return try store.encryptSecret(self.allocator, secret);
+    }
+
+    fn encryptConfigSecretArray(
+        self: *const Config,
+        store: *const secrets.SecretStore,
+        values: []const []const u8,
+    ) ![][]const u8 {
+        var encrypted = try self.allocator.alloc([]const u8, values.len);
+        var count: usize = 0;
+        errdefer {
+            for (encrypted[0..count]) |value| self.allocator.free(value);
+            self.allocator.free(encrypted);
+        }
+
+        for (values, 0..) |value, i| {
+            encrypted[i] = try store.encryptSecret(self.allocator, value);
+            count += 1;
+        }
+        return encrypted;
+    }
+
     fn writeIndentedMultilineJson(w: *std.Io.Writer, json: []const u8, continuation_indent: []const u8) !void {
         var start: usize = 0;
         while (start < json.len) {
@@ -616,7 +659,7 @@ pub const Config = struct {
         try w.print("]", .{});
     }
 
-    fn writeReliabilitySection(self: *const Config, w: *std.Io.Writer) !void {
+    fn writeReliabilitySection(self: *const Config, w: *std.Io.Writer, store: *const secrets.SecretStore) !void {
         try w.print("  \"reliability\": {{\n", .{});
         try w.print("    \"provider_retries\": {d},\n", .{self.reliability.provider_retries});
         try w.print("    \"provider_backoff_ms\": {d},\n", .{self.reliability.provider_backoff_ms});
@@ -630,7 +673,12 @@ pub const Config = struct {
         try w.print(",\n", .{});
 
         try w.print("    \"api_keys\": ", .{});
-        try writeStringArray(w, self.reliability.api_keys);
+        const encrypted_api_keys = try self.encryptConfigSecretArray(store, self.reliability.api_keys);
+        defer {
+            for (encrypted_api_keys) |value| self.allocator.free(value);
+            self.allocator.free(encrypted_api_keys);
+        }
+        try writeStringArray(w, encrypted_api_keys);
         try w.print(",\n", .{});
 
         try w.print("    \"model_fallbacks\": [", .{});
@@ -757,6 +805,7 @@ pub const Config = struct {
     /// Save config as JSON to the config_path.
     pub fn save(self: *const Config) !void {
         const dir = std.fs.path.dirname(self.config_path) orelse return error.InvalidConfigPath;
+        const store = self.secretStore();
 
         // Ensure parent directory exists
         std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
@@ -796,8 +845,10 @@ pub const Config = struct {
                 try w.print("      \"{s}\": {{", .{entry.name});
                 var has_field = false;
                 if (entry.api_key) |key| {
+                    const encrypted_key = try self.encryptConfigSecret(&store, key);
+                    defer if (encrypted_key) |value| self.allocator.free(value);
                     try w.print("\"api_key\": ", .{});
-                    try writePrettyJsonInline(self.allocator, w, key, "");
+                    try writePrettyJsonInline(self.allocator, w, encrypted_key.?, "");
                     has_field = true;
                 }
                 if (entry.base_url) |base| {
@@ -829,7 +880,32 @@ pub const Config = struct {
         }
 
         if (self.model_routes.len > 0) {
-            try w.print("  \"model_routes\": {f},\n", .{std.json.fmt(self.model_routes, .{})});
+            const serialized_routes = try self.allocator.alloc(SerializedModelRouteConfig, self.model_routes.len);
+            defer self.allocator.free(serialized_routes);
+            var route_count: usize = 0;
+            errdefer {
+                for (serialized_routes[0..route_count]) |route| {
+                    if (route.api_key) |value| self.allocator.free(value);
+                }
+            }
+            for (self.model_routes, 0..) |route, i| {
+                const encrypted_key = try self.encryptConfigSecret(&store, route.api_key);
+                serialized_routes[i] = .{
+                    .hint = route.hint,
+                    .provider = route.provider,
+                    .model = route.model,
+                    .api_key = encrypted_key,
+                    .cost_class = route.cost_class,
+                    .quota_class = route.quota_class,
+                };
+                route_count += 1;
+            }
+            defer {
+                for (serialized_routes) |route| {
+                    if (route.api_key) |value| self.allocator.free(value);
+                }
+            }
+            try w.print("  \"model_routes\": {f},\n", .{std.json.fmt(serialized_routes, .{})});
         }
 
         // agents.defaults (model + heartbeat) + agents.list
@@ -869,17 +945,30 @@ pub const Config = struct {
                 if (has_agents) {
                     const serialized_agents = try self.allocator.alloc(SerializedNamedAgentConfig, self.agents.len);
                     defer self.allocator.free(serialized_agents);
+                    var agent_count: usize = 0;
+                    errdefer {
+                        for (serialized_agents[0..agent_count]) |agent_cfg| {
+                            if (agent_cfg.api_key) |value| self.allocator.free(value);
+                        }
+                    }
                     for (self.agents, 0..) |agent_cfg, i| {
+                        const encrypted_key = try self.encryptConfigSecret(&store, agent_cfg.api_key);
                         serialized_agents[i] = .{
                             .name = agent_cfg.name,
                             .provider = agent_cfg.provider,
                             .model = agent_cfg.model,
                             .system_prompt = agent_cfg.system_prompt_path orelse agent_cfg.system_prompt,
                             .workspace_path = agent_cfg.workspace_path,
-                            .api_key = agent_cfg.api_key,
+                            .api_key = encrypted_key,
                             .temperature = agent_cfg.temperature,
                             .max_depth = agent_cfg.max_depth,
                         };
+                        agent_count += 1;
+                    }
+                    defer {
+                        for (serialized_agents) |agent_cfg| {
+                            if (agent_cfg.api_key) |value| self.allocator.free(value);
+                        }
                     }
                     if (wrote_agent_field) {
                         try w.print(",\n", .{});
@@ -953,7 +1042,7 @@ pub const Config = struct {
         }, .{})});
 
         // Reliability
-        try self.writeReliabilitySection(w);
+        try self.writeReliabilitySection(w, &store);
         try w.print("  \"scheduler\": {f},\n", .{std.json.fmt(self.scheduler, .{})});
         try w.print("  \"agent\": {f},\n", .{std.json.fmt(.{
             .compact_context = self.agent.compact_context,
@@ -974,11 +1063,33 @@ pub const Config = struct {
         // Channels
         try self.writeChannelsSection(w);
 
-        try w.print("  \"memory\": {f},\n", .{std.json.fmt(self.memory, .{})});
+        var serialized_memory = self.memory;
+        if (serialized_memory.search.store.qdrant_api_key.len > 0) {
+            serialized_memory.search.store.qdrant_api_key = try store.encryptSecret(self.allocator, serialized_memory.search.store.qdrant_api_key);
+        }
+        defer if (serialized_memory.search.store.qdrant_api_key.ptr != self.memory.search.store.qdrant_api_key.ptr) {
+            self.allocator.free(serialized_memory.search.store.qdrant_api_key);
+        };
+        if (serialized_memory.api.api_key.len > 0) {
+            serialized_memory.api.api_key = try store.encryptSecret(self.allocator, serialized_memory.api.api_key);
+        }
+        defer if (serialized_memory.api.api_key.ptr != self.memory.api.api_key.ptr) {
+            self.allocator.free(serialized_memory.api.api_key);
+        };
+        try w.print("  \"memory\": {f},\n", .{std.json.fmt(serialized_memory, .{})});
         try w.print("  \"gateway\": {f},\n", .{std.json.fmt(self.gateway, .{})});
         try w.print("  \"a2a\": {f},\n", .{std.json.fmt(self.a2a, .{})});
         try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
-        try w.print("  \"composio\": {f},\n", .{std.json.fmt(self.composio, .{})});
+        var serialized_composio = self.composio;
+        if (serialized_composio.api_key) |api_key| {
+            serialized_composio.api_key = try store.encryptSecret(self.allocator, api_key);
+        }
+        defer if (serialized_composio.api_key) |api_key| {
+            if (self.composio.api_key == null or api_key.ptr != self.composio.api_key.?.ptr) {
+                self.allocator.free(api_key);
+            }
+        };
+        try w.print("  \"composio\": {f},\n", .{std.json.fmt(serialized_composio, .{})});
         try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});
         try w.print("  \"browser\": {f},\n", .{std.json.fmt(.{
             .enabled = self.browser.enabled,
@@ -4345,6 +4456,7 @@ test "save escapes provider string fields" {
         .config_path = config_path,
         .allocator = allocator,
     };
+    cfg.secrets.encrypt = false;
     cfg.providers = &.{
         .{
             .name = "openai",
@@ -4371,6 +4483,89 @@ test "save escapes provider string fields" {
     try std.testing.expectEqualStrings("sk-\"quoted\"", openai.get("api_key").?.string);
     try std.testing.expectEqualStrings("https://api.example.com/v1/\"quoted\"", openai.get("base_url").?.string);
     try std.testing.expectEqualStrings("nullclaw \"agent\"", openai.get("user_agent").?.string);
+}
+
+test "save encrypts persisted api keys and parse decrypts them" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "openrouter",
+            .api_key = "sk-or-secret",
+        },
+    };
+    cfg.reliability.api_keys = &.{ "rel-key-a", "rel-key-b" };
+    cfg.model_routes = &.{
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-70b",
+            .api_key = "gsk-secret",
+        },
+    };
+    cfg.agents = &.{
+        .{
+            .name = "helper",
+            .provider = "openrouter",
+            .model = "openai/gpt-4o-mini",
+            .api_key = "agent-secret",
+        },
+    };
+    cfg.memory.search.store.qdrant_api_key = "qdrant-secret";
+    cfg.memory.api.api_key = "memory-secret";
+    cfg.composio.api_key = "comp-secret";
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    const secret_values = [_][]const u8{
+        "sk-or-secret",
+        "rel-key-a",
+        "rel-key-b",
+        "gsk-secret",
+        "agent-secret",
+        "qdrant-secret",
+        "memory-secret",
+        "comp-secret",
+    };
+    for (secret_values) |secret| {
+        try std.testing.expect(std.mem.indexOf(u8, content, secret) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"api_key\": \"enc2:") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqualStrings("sk-or-secret", loaded.getProviderKey("openrouter").?);
+    try std.testing.expectEqualStrings("rel-key-a", loaded.reliability.api_keys[0]);
+    try std.testing.expectEqualStrings("rel-key-b", loaded.reliability.api_keys[1]);
+    try std.testing.expectEqualStrings("gsk-secret", loaded.model_routes[0].api_key.?);
+    try std.testing.expectEqualStrings("agent-secret", loaded.agents[0].api_key.?);
+    try std.testing.expectEqualStrings("qdrant-secret", loaded.memory.search.store.qdrant_api_key);
+    try std.testing.expectEqualStrings("memory-secret", loaded.memory.api.api_key);
+    try std.testing.expectEqualStrings("comp-secret", loaded.composio.api_key.?);
 }
 
 test "json parse tools.media.audio section" {

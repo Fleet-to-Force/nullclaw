@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
+const secrets = @import("security/secrets.zig");
 
 const log = std.log.scoped(.config);
 
@@ -22,10 +23,36 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
     return try list.toOwnedSlice(allocator);
 }
 
-fn parseApiKeyField(allocator: std.mem.Allocator, value: std.json.Value) !?[]const u8 {
+fn decryptSecretField(allocator: std.mem.Allocator, config_path: []const u8, value: []const u8) ![]u8 {
+    const config_dir = std.fs.path.dirname(config_path) orelse ".";
+    const store = secrets.SecretStore.init(config_dir, true);
+    return try store.decryptSecret(allocator, value);
+}
+
+fn decryptSecretArray(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    arr: std.json.Array,
+) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+
+    try list.ensureTotalCapacity(allocator, @intCast(arr.items.len));
+    for (arr.items) |item| {
+        if (item == .string) {
+            try list.append(allocator, try decryptSecretField(allocator, config_path, item.string));
+        }
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn parseApiKeyField(cfg: *const Config, value: std.json.Value) !?[]const u8 {
     return switch (value) {
-        .string => |s| try allocator.dupe(u8, s),
-        .object, .array => try std.json.Stringify.valueAlloc(allocator, value, .{}),
+        .string => |s| try decryptSecretField(cfg.allocator, cfg.config_path, s),
+        .object, .array => try std.json.Stringify.valueAlloc(cfg.allocator, value, .{}),
         else => null,
     };
 }
@@ -86,6 +113,7 @@ fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
 
 fn parseNamedAgentObject(
     allocator: std.mem.Allocator,
+    config_path: []const u8,
     agent_name: []const u8,
     item: std.json.Value,
 ) !?types.NamedAgentConfig {
@@ -167,7 +195,7 @@ fn parseNamedAgentObject(
         }
     }
     if (item.object.get("api_key")) |ak| {
-        if (ak == .string) agent_cfg.api_key = try allocator.dupe(u8, ak.string);
+        if (ak == .string) agent_cfg.api_key = try decryptSecretField(allocator, config_path, ak.string);
     }
     if (item.object.get("workspace_path")) |wp| {
         if (wp == .string) agent_cfg.workspace_path = try allocator.dupe(u8, wp.string);
@@ -678,7 +706,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         errdefer if (route.api_key) |api_key| self.allocator.free(api_key);
 
                         if (item.object.get("api_key")) |ak| {
-                            if (ak == .string) route.api_key = try self.allocator.dupe(u8, ak.string);
+                            if (ak == .string) route.api_key = try decryptSecretField(self.allocator, self.config_path, ak.string);
                         }
                         if (item.object.get("cost_class")) |cost_class| {
                             if (cost_class == .string) {
@@ -778,7 +806,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (item == .object) {
                             const name_val = item.object.get("id") orelse item.object.get("name") orelse continue;
                             if (name_val != .string) continue;
-                            var agent_cfg = try parseNamedAgentObject(self.allocator, name_val.string, item) orelse continue;
+                            var agent_cfg = try parseNamedAgentObject(self.allocator, self.config_path, name_val.string, item) orelse continue;
                             errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
                             try list.append(self.allocator, agent_cfg);
                         }
@@ -799,7 +827,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 while (it.next()) |entry| {
                     const key = entry.key_ptr.*;
                     if (std.mem.eql(u8, key, "defaults") or std.mem.eql(u8, key, "list")) continue;
-                    var agent_cfg = try parseNamedAgentObject(self.allocator, key, entry.value_ptr.*) orelse continue;
+                    var agent_cfg = try parseNamedAgentObject(self.allocator, self.config_path, key, entry.value_ptr.*) orelse continue;
                     errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
                     try named_agent_list.append(self.allocator, agent_cfg);
                 }
@@ -1054,7 +1082,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v == .array) self.reliability.fallback_providers = try parseStringArray(self.allocator, v.array);
             }
             if (rel.object.get("api_keys")) |v| {
-                if (v == .array) self.reliability.api_keys = try parseStringArray(self.allocator, v.array);
+                if (v == .array) self.reliability.api_keys = try decryptSecretArray(self.allocator, self.config_path, v.array);
             }
             if (rel.object.get("model_fallbacks")) |v| {
                 if (v == .array) {
@@ -1336,7 +1364,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                 self.memory.search.store.qdrant_collection = try self.allocator.dupe(u8, v.string);
                             };
                             if (store.get("qdrant_api_key")) |v| if (v == .string) {
-                                self.memory.search.store.qdrant_api_key = try self.allocator.dupe(u8, v.string);
+                                self.memory.search.store.qdrant_api_key = try decryptSecretField(self.allocator, self.config_path, v.string);
                             };
                             if (store.get("pgvector_table")) |v| if (v == .string) {
                                 self.memory.search.store.pgvector_table = try self.allocator.dupe(u8, v.string);
@@ -1726,7 +1754,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         self.memory.api.url = try self.allocator.dupe(u8, v.string);
                     };
                     if (api.get("api_key")) |v| if (v == .string) {
-                        self.memory.api.api_key = try self.allocator.dupe(u8, v.string);
+                        self.memory.api.api_key = try decryptSecretField(self.allocator, self.config_path, v.string);
                     };
                     if (api.get("timeout_ms")) |v| if (v == .integer) {
                         self.memory.api.timeout_ms = @intCast(v.integer);
@@ -1886,7 +1914,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v == .bool) self.composio.enabled = v.bool;
             }
             if (comp.object.get("api_key")) |v| {
-                if (v == .string) self.composio.api_key = try self.allocator.dupe(u8, v.string);
+                if (v == .string) self.composio.api_key = try decryptSecretField(self.allocator, self.config_path, v.string);
             }
             if (comp.object.get("entity_id")) |v| {
                 if (v == .string) self.composio.entity_id = try self.allocator.dupe(u8, v.string);
@@ -2153,7 +2181,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             .name = try self.allocator.dupe(u8, prov_name),
                         };
                         if (val.object.get("api_key")) |ak| {
-                            pe.api_key = try parseApiKeyField(self.allocator, ak);
+                            pe.api_key = try parseApiKeyField(self, ak);
                         }
                         if (val.object.get("base_url")) |ab| {
                             if (ab == .string) pe.base_url = try self.allocator.dupe(u8, ab.string);
