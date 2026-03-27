@@ -372,7 +372,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         if (ctx.trace_id) |tid| {
             obs.setTraceId(tid);
         }
-        
+
         const name_to_report = ctx.agent_name orelse "default";
         const subagent_start_event = observability.ObserverEvent{ .subagent_start = .{
             .agent_name = name_to_report,

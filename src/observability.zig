@@ -127,7 +127,9 @@ pub const NoopObserver = struct {
     fn noopName(_: *anyopaque) []const u8 {
         return "noop";
     }
-    fn noopGetTraceId(_: *anyopaque) ?[32]u8 { return null; }
+    fn noopGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
     fn noopSetTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 
@@ -201,7 +203,9 @@ pub const LogObserver = struct {
     fn logName(_: *anyopaque) []const u8 {
         return "log";
     }
-    fn logGetTraceId(_: *anyopaque) ?[32]u8 { return null; }
+    fn logGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
     fn logSetTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 
@@ -272,7 +276,9 @@ pub const VerboseObserver = struct {
     fn verboseName(_: *anyopaque) []const u8 {
         return "verbose";
     }
-    fn verboseGetTraceId(_: *anyopaque) ?[32]u8 { return null; }
+    fn verboseGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
     fn verboseSetTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 
@@ -460,8 +466,10 @@ pub const FileObserver = struct {
     fn fileName(_: *anyopaque) []const u8 {
         return "file";
     }
-    
-    fn fileGetTraceId(_: *anyopaque) ?[32]u8 { return null; }
+
+    fn fileGetTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
     fn fileSetTraceId(_: *anyopaque, _: [32]u8) void {}
 };
 

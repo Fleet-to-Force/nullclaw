@@ -249,7 +249,9 @@ const GatewayThreadObserver = struct {
 
     fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
     fn flush(_: *anyopaque) void {}
-    fn getTraceId(_: *anyopaque) ?[32]u8 { return null; }
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
     fn setTraceId(_: *anyopaque, _: [32]u8) void {}
     fn name(_: *anyopaque) []const u8 {
         return "gateway_thread";
