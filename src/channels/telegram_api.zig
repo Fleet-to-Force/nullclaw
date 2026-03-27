@@ -129,6 +129,48 @@ pub const Client = struct {
         self.allocator.free(resp);
     }
 
+    pub fn editMessageText(self: Client, allocator: std.mem.Allocator, chat_id: []const u8, message_id: i64, text: []const u8, reply_markup_json: ?[]const u8) ![]u8 {
+        const body = try buildEditMessageTextBody(allocator, chat_id, message_id, text, reply_markup_json, null);
+        defer allocator.free(body);
+        return self.post(allocator, "editMessageText", body, "30");
+    }
+
+    pub fn editMessageTextHtml(self: Client, allocator: std.mem.Allocator, chat_id: []const u8, message_id: i64, text: []const u8, reply_markup_json: ?[]const u8) ![]u8 {
+        const body = try buildEditMessageTextBody(allocator, chat_id, message_id, text, reply_markup_json, "HTML");
+        defer allocator.free(body);
+        return self.post(allocator, "editMessageText", body, "30");
+    }
+
+    fn buildEditMessageTextBody(
+        allocator: std.mem.Allocator,
+        chat_id: []const u8,
+        message_id: i64,
+        text: []const u8,
+        reply_markup_json: ?[]const u8,
+        parse_mode: ?[]const u8,
+    ) ![]u8 {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer body.deinit(allocator);
+
+        try body.appendSlice(allocator, "{\"chat_id\":");
+        try body.appendSlice(allocator, chat_id);
+
+        var msg_id_buf: [32]u8 = undefined;
+        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+        try body.appendSlice(allocator, ",\"message_id\":");
+        try body.appendSlice(allocator, msg_id_str);
+        try body.appendSlice(allocator, ",\"text\":");
+        try root.json_util.appendJsonString(&body, allocator, text);
+        if (parse_mode) |mode| {
+            try body.appendSlice(allocator, ",\"parse_mode\":");
+            try root.json_util.appendJsonString(&body, allocator, mode);
+        }
+        try appendRawReplyMarkup(&body, allocator, reply_markup_json);
+        try body.appendSlice(allocator, "}");
+
+        return body.toOwnedSlice(allocator);
+    }
+
     pub fn setMessageReaction(self: Client, chat_id: []const u8, message_id: i64, emoji: ?[]const u8) !void {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(self.allocator);
@@ -486,4 +528,34 @@ test "telegram api parseForumTopicMeta extracts message thread id" {
         "{\"ok\":true,\"result\":{\"message_thread_id\":77}}",
     ) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(i64, 77), meta.message_thread_id);
+}
+
+test "telegram api buildEditMessageTextBody includes html parse mode when requested" {
+    const body = try Client.buildEditMessageTextBody(
+        std.testing.allocator,
+        "12345",
+        42,
+        "<blockquote>trace</blockquote>",
+        null,
+        "HTML",
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\":\"HTML\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"message_id\":42") != null);
+}
+
+test "telegram api buildEditMessageTextBody omits parse mode for plain edits" {
+    const body = try Client.buildEditMessageTextBody(
+        std.testing.allocator,
+        "12345",
+        42,
+        "plain text",
+        null,
+        null,
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"parse_mode\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"text\":\"plain text\"") != null);
 }
