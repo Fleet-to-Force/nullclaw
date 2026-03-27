@@ -1799,6 +1799,7 @@ pub const Agent = struct {
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+            const include_reasoning = self.reasoning_mode != .off;
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
             const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
@@ -1827,6 +1828,7 @@ pub const Agent = struct {
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
+                        .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
@@ -1863,6 +1865,7 @@ pub const Agent = struct {
                                 .tools = null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -1881,6 +1884,7 @@ pub const Agent = struct {
                 };
                 response = ChatResponse{
                     .content = stream_result.content,
+                    .reasoning_content = stream_result.reasoning_content,
                     .tool_calls = &.{},
                     .usage = stream_result.usage,
                     .model = stream_result.model,
@@ -1899,6 +1903,7 @@ pub const Agent = struct {
                         .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
+                        .include_reasoning = include_reasoning,
                     },
                     turn_model_name,
                     self.temperature,
@@ -1934,6 +1939,7 @@ pub const Agent = struct {
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -1972,6 +1978,7 @@ pub const Agent = struct {
                                 .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
+                                .include_reasoning = include_reasoning,
                             },
                             turn_model_name,
                             self.temperature,
@@ -2004,6 +2011,7 @@ pub const Agent = struct {
                             .tools = if (native_tools_enabled) turn_tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
+                            .include_reasoning = include_reasoning,
                         },
                         turn_model_name,
                         self.temperature,
@@ -2033,6 +2041,7 @@ pub const Agent = struct {
                                     .tools = if (native_tools_enabled) turn_tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
+                                    .include_reasoning = include_reasoning,
                                 },
                                 turn_model_name,
                                 self.temperature,
@@ -2949,8 +2958,10 @@ pub const Agent = struct {
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
+        const reasoning_returned = response.reasoning_content != null and response.reasoning_content.?.len > 0;
+        const reasoning_requested = self.reasoning_mode != .off;
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} reasoning_mode={s} reasoning_effort={s} reasoning_requested={} reasoning_returned={} usage={f} content={f}{s}",
             .{
                 session_hash,
                 iteration,
@@ -2959,11 +2970,32 @@ pub const Agent = struct {
                 self.effectiveModel(response),
                 content.len,
                 response.tool_calls.len,
+                self.reasoning_mode.toSlice(),
+                self.reasoning_effort orelse "off",
+                reasoning_requested,
+                reasoning_returned,
                 std.json.fmt(response.usage, .{}),
                 std.json.fmt(preview.slice, .{}),
                 if (preview.truncated) " [log preview truncated]" else "",
             },
         );
+
+        // NOTE: Logging-only path. No direct unit test added because verifying structured
+        // log emission here would require a log sink harness for Agent runtime logging.
+        if (reasoning_requested and !reasoning_returned) {
+            log.info(
+                "llm response reasoning missing session=0x{x} iter={d} attempt={d} provider={s} model={s} reasoning_mode={s} reasoning_effort={s}",
+                .{
+                    session_hash,
+                    iteration,
+                    attempt,
+                    self.effectiveProvider(response),
+                    self.effectiveModel(response),
+                    self.reasoning_mode.toSlice(),
+                    self.reasoning_effort orelse "off",
+                },
+            );
+        }
 
         if (response.reasoning_content) |reasoning| {
             const r_preview = llmLogPreview(reasoning);
