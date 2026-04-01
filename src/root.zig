@@ -67,6 +67,7 @@ pub const runtime = @import("runtime.zig");
 pub const mcp = @import("mcp.zig");
 pub const subagent = @import("subagent.zig");
 pub const subagent_runner = @import("subagent_runner.zig");
+pub const agent_runner = @import("agent_runner.zig");
 
 // Phase 4c: Auth
 pub const auth = @import("auth.zig");

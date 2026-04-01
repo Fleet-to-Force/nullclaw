@@ -823,6 +823,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             if (hb.object.get("interval_minutes")) |v| {
                                 if (v == .integer) self.heartbeat.interval_minutes = @intCast(v.integer);
                             }
+                            if (hb.object.get("prompt")) |v| {
+                                if (v == .string) self.heartbeat.prompt = v.string;
+                            }
+                            if (hb.object.get("model")) |v| {
+                                if (v == .string) self.heartbeat.model = v.string;
+                            }
+                            if (hb.object.get("timeout_secs")) |v| {
+                                if (v == .integer) self.heartbeat.timeout_secs = @intCast(v.integer);
+                            }
+                            if (hb.object.get("delivery_mode")) |v| {
+                                if (v == .string) self.heartbeat.delivery_mode = v.string;
+                            }
+                            if (hb.object.get("delivery_channel")) |v| {
+                                if (v == .string) self.heartbeat.delivery_channel = v.string;
+                            }
+                            if (hb.object.get("delivery_to")) |v| {
+                                if (v == .string) self.heartbeat.delivery_to = v.string;
+                            }
+                            if (hb.object.get("delivery_account_id")) |v| {
+                                if (v == .string) self.heartbeat.delivery_account_id = v.string;
+                            }
                         }
                     }
                 }
