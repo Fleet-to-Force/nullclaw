@@ -1,6 +1,7 @@
 const std = @import("std");
 const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
+const model_refs = @import("model_refs.zig");
 const provider_names = @import("provider_names.zig");
 const secrets = @import("security/secrets.zig");
 pub const config_types = @import("config_types.zig");
@@ -28,6 +29,42 @@ fn writeJsonStr(w: anytype, s: []const u8) !void {
         }
     }
     try w.writeByte('"');
+}
+
+pub const PrimaryModelRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
+
+fn hasVersionedApiSegment(url: []const u8) bool {
+    const proto_start = std.mem.indexOf(u8, url, "://") orelse return false;
+    var i: usize = proto_start + 3;
+    while (i + 2 < url.len) : (i += 1) {
+        if (url[i] != '/' or url[i + 1] != 'v') continue;
+        var j = i + 2;
+        var has_digit = false;
+        while (j < url.len and std.ascii.isDigit(url[j])) : (j += 1) {
+            has_digit = true;
+        }
+        if (!has_digit) continue;
+        if (j == url.len or (j < url.len and url[j] == '/')) return true;
+    }
+    return false;
+}
+
+pub fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
+    const split = model_refs.splitProviderModel(primary) orelse return null;
+    return .{
+        .provider = split.provider orelse return null,
+        .model = split.model,
+    };
+}
+
+pub fn shouldSerializeDefaultModelProviderField(provider: []const u8) bool {
+    if (!std.mem.startsWith(u8, provider, "custom:")) return false;
+    const custom_target = provider["custom:".len..];
+    if (std.mem.indexOf(u8, custom_target, "://") == null) return false;
+    return !hasVersionedApiSegment(custom_target);
 }
 
 // ── Re-export all types so downstream `@import("config.zig").Foo` still works ──
@@ -972,7 +1009,19 @@ pub const Config = struct {
                     wrote_agent_field = true;
                 }
                 if (self.default_model) |model| {
-                    try w.print("      \"model\": {{\"primary\": \"{s}/{s}\"}}", .{ self.default_provider, model });
+                    if (shouldSerializeDefaultModelProviderField(self.default_provider)) {
+                        try w.print("      \"model\": {{\"provider\": ", .{});
+                        try writeJsonStr(w, self.default_provider);
+                        try w.print(", \"primary\": ", .{});
+                        try writeJsonStr(w, model);
+                        try w.print("}}", .{});
+                    } else {
+                        const primary = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.default_provider, model });
+                        defer self.allocator.free(primary);
+                        try w.print("      \"model\": {{\"primary\": ", .{});
+                        try writeJsonStr(w, primary);
+                        try w.print("}}", .{});
+                    }
                     if (has_heartbeat) try w.print(",", .{});
                     try w.print("\n", .{});
                 }
@@ -3931,6 +3980,19 @@ test "parse agents.defaults.model.primary custom provider supports versioned pat
     try std.testing.expectEqualStrings("minimaxai/minimax-m2.1", cfg.default_model.?);
 }
 
+test "parse agents.defaults.model supports explicit provider field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agents":{"defaults":{"model":{"provider":"custom:https://example.com/api","primary":"meta-llama/Llama-4-70B-Instruct"}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("custom:https://example.com/api", cfg.default_provider);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", cfg.default_model.?);
+}
+
 test "parse legacy default_provider with model-only primary preserves model" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4011,6 +4073,47 @@ test "save and load roundtrip" {
     try std.testing.expectEqual(@as(usize, 2), cfg2.agent.vision_disabled_models.len);
     try std.testing.expectEqualStrings("router/text-only", cfg2.agent.vision_disabled_models[0]);
     try std.testing.expect(!cfg2.agent.auto_disable_vision_on_error);
+}
+
+test "save and load roundtrip preserves non-versioned custom default provider" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.default_provider = try allocator.dupe(u8, "custom:https://example.com/api");
+    cfg.default_model = try allocator.dupe(u8, "meta-llama/Llama-4-70B-Instruct");
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 1024 * 64);
+
+    // Regression: onboard now accepts non-versioned custom URLs, so save/load
+    // must preserve them without collapsing model path segments into the provider.
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"provider\": \"custom:https://example.com/api\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"primary\": \"meta-llama/Llama-4-70B-Instruct\"") != null);
+
+    var cfg2 = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    try cfg2.parseJson(content);
+
+    try std.testing.expectEqualStrings("custom:https://example.com/api", cfg2.default_provider);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", cfg2.default_model.?);
 }
 
 test "save preserves file-backed system_prompt path" {

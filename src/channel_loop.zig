@@ -1009,7 +1009,16 @@ fn telegramUpdateOffsetPath(allocator: std.mem.Allocator, config: *const Config,
     const file_name = try std.fmt.allocPrint(allocator, "update-offset-{s}.json", .{normalized_account_id});
     defer allocator.free(file_name);
 
-    return std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    const relative_path = try std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    defer allocator.free(relative_path);
+
+    if (std.fs.path.isAbsolute(relative_path)) {
+        return std.fs.path.resolve(allocator, &.{relative_path});
+    }
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, relative_path });
 }
 
 /// Load persisted Telegram update offset. Returns null when missing/invalid/stale.
@@ -2539,6 +2548,36 @@ test "telegram update offset store roundtrip" {
     try saveTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token", 777);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 777), restored);
+}
+
+test "telegram update offset path resolves relative config path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const relative_base = try std.fs.path.relative(allocator, cwd, base);
+    defer allocator.free(relative_base);
+    const config_path = try std.fs.path.join(allocator, &.{ relative_base, "config.json" });
+    defer allocator.free(config_path);
+
+    const cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+
+    const resolved = try telegramUpdateOffsetPath(allocator, &cfg, "default");
+    defer allocator.free(resolved);
+    const expected = try std.fs.path.join(allocator, &.{ base, "state", "telegram", "update-offset-default.json" });
+    defer allocator.free(expected);
+
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expectEqualStrings(expected, resolved);
 }
 
 test "detailedProviderErrorForDisplay surfaces sanitized provider detail" {

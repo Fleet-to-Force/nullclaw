@@ -2578,6 +2578,14 @@ pub const Agent = struct {
         call: ParsedToolCall,
         result: ToolExecutionResult,
     ) void {
+        // Only cache successful results, unless it's a native tool call with an ID.
+        // For ID-based calls, we must preserve the result (even if failed) to support
+        // exact replays requested by the provider.
+        // Signature-based calls (XML) that failed are not cached so they can be
+        // re-tried if a subsequent tool in the same turn fixes the environment.
+        const has_id = call.tool_call_id != null and call.tool_call_id.?.len > 0;
+        if (!result.success and !has_id) return;
+
         const fingerprint = toolCallDedupFingerprint(call);
         if (seen_tool_call_results.contains(fingerprint)) return;
 
@@ -7209,6 +7217,27 @@ test "rememberToolCallResultInTurn preserves failed result for replayed tool_cal
     const cached_replay = Agent.cachedToolCallResultInTurn(&seen, replayed_call).?;
     try std.testing.expect(!cached_replay.success);
     try std.testing.expectEqualStrings("Rate limit exceeded", cached_replay.output);
+}
+
+test "rememberToolCallResultInTurn skips failed signature-only calls" {
+    const allocator = std.testing.allocator;
+    var seen: std.AutoHashMapUnmanaged(u64, Agent.CachedToolCallResult) = .empty;
+    defer Agent.deinitSeenToolCallResults(allocator, &seen);
+
+    const failed_call = ParsedToolCall{
+        .name = "file_read",
+        .arguments_json = "{\"path\":\"missing.txt\"}",
+        .tool_call_id = null,
+    };
+
+    Agent.rememberToolCallResultInTurn(allocator, &seen, failed_call, .{
+        .name = failed_call.name,
+        .output = "FileNotFound",
+        .success = false,
+        .tool_call_id = null,
+    });
+
+    try std.testing.expect(Agent.cachedToolCallResultInTurn(&seen, failed_call) == null);
 }
 
 test "Agent turn skips replayed tool_call_id across iterations" {

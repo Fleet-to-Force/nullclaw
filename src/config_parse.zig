@@ -11,6 +11,8 @@ const log = std.log.scoped(.config);
 // no comptime-initialization cycle.
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
+const PrimaryModelRef = config_mod.PrimaryModelRef;
+const splitPrimaryModelRef = config_mod.splitPrimaryModelRef;
 
 /// Parse a JSON array of strings into an allocated slice.
 pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]const []const u8 {
@@ -58,11 +60,6 @@ fn parseApiKeyField(cfg: *const Config, value: std.json.Value) !?[]const u8 {
     };
 }
 
-const PrimaryModelRef = struct {
-    provider: []const u8,
-    model: []const u8,
-};
-
 fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAgentConfig) void {
     allocator.free(agent_cfg.name);
     allocator.free(agent_cfg.provider);
@@ -73,12 +70,30 @@ fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAge
     if (agent_cfg.api_key) |api_key| allocator.free(api_key);
 }
 
-fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
-    const split = model_refs.splitProviderModel(primary) orelse return null;
-    return .{
-        .provider = split.provider orelse return null,
-        .model = split.model,
-    };
+fn parsePrimaryModelObject(
+    legacy_default_provider_detected: bool,
+    explicit_provider_names: []const []const u8,
+    model_obj: std.json.ObjectMap,
+) ?PrimaryModelRef {
+    const primary_val = model_obj.get("primary") orelse return null;
+
+    if (model_obj.get("provider")) |provider_val| {
+        if (provider_val != .string or primary_val != .string) return null;
+        return .{
+            .provider = if (legacy_default_provider_detected) "" else provider_val.string,
+            .model = primary_val.string,
+        };
+    }
+
+    if (primary_val != .string) return null;
+    if (splitPrimaryModelRefWithProviders(primary_val.string, explicit_provider_names)) |parsed_ref| return parsed_ref;
+    if (legacy_default_provider_detected) {
+        return .{
+            .provider = "",
+            .model = primary_val.string,
+        };
+    }
+    return null;
 }
 
 fn splitPrimaryModelRefWithProviders(primary: []const u8, provider_names: []const []const u8) ?PrimaryModelRef {
@@ -811,31 +826,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     // Agents section: agents.defaults.model.primary (provider/model) + agents.defaults.heartbeat + agents.list[]
     if (root.get("agents")) |agents_val| {
         if (agents_val == .object) {
-            // agents.defaults.model.primary (provider/model) → self.default_provider + self.default_model
+            // agents.defaults.model.primary (provider/model) or
+            // agents.defaults.model.{provider,primary} → self.default_provider + self.default_model
             // agents.defaults.heartbeat → self.heartbeat
             if (agents_val.object.get("defaults")) |defaults| {
                 if (defaults == .object) {
                     if (defaults.object.get("model")) |mdl| {
                         if (mdl == .object) {
-                            if (mdl.object.get("primary")) |v| {
-                                if (v == .string) {
-                                    // Always try to parse primary field - it may contain full provider/model info
-                                    // or just the model part (when legacy default_provider exists)
-                                    if (splitPrimaryModelRefWithProviders(v.string, explicit_provider_names)) |parsed_ref| {
-                                        self.default_model = try self.allocator.dupe(u8, parsed_ref.model);
-                                        // Only update provider if not already set from legacy field
-                                        if (!self.legacy_default_provider_detected) {
-                                            self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
-                                        }
-                                    } else if (self.legacy_default_provider_detected) {
-                                        // Legacy top-level default_provider + model-only primary.
-                                        self.default_model = try self.allocator.dupe(u8, v.string);
-                                    } else if (!self.legacy_default_provider_detected) {
-                                        // Only fail if neither legacy nor new format provides valid data
-                                        self.default_provider = "";
-                                        self.default_model = null;
-                                    }
+                            if (parsePrimaryModelObject(
+                                self.legacy_default_provider_detected,
+                                explicit_provider_names,
+                                mdl.object,
+                            )) |parsed_ref| {
+                                self.default_model = try self.allocator.dupe(u8, parsed_ref.model);
+                                // Only update provider if not already set from legacy field.
+                                if (!self.legacy_default_provider_detected) {
+                                    self.default_provider = try self.allocator.dupe(u8, parsed_ref.provider);
                                 }
+                            } else if (!self.legacy_default_provider_detected) {
+                                // Only fail if neither legacy nor new format provides valid data.
+                                self.default_provider = "";
+                                self.default_model = null;
                             }
                         }
                     }

@@ -229,8 +229,22 @@ fn findNextMergeCandidateIndex(messages: []const root.ChannelMessage, start: usi
         if (!sameSenderAndChat(current, next)) break;
         const next_message_id = next.message_id orelse break;
         if (isSlashCommandMessage(next.content)) break;
+
+        // Never merge synthetic messages from interactions (like button clicks)
+        // or messages with identical IDs (reused bot message IDs).
+        if (current.is_interaction or next.is_interaction or next_message_id == current_message_id) break;
+
         const split_like = isLikelySplitTextChunk(current) or isLikelySplitTextChunk(next);
-        if (next_message_id == current_message_id + 1 or split_like) return idx;
+        // Only merge if consecutive.
+        if (next_message_id == current_message_id + 1) {
+            // Merge if split-like OR just regular text messages (to avoid turn fragmentation).
+            return idx;
+        } else if (split_like) {
+            // Non-consecutive but one is very long? Still risky but kept for
+            // compatibility with very large split chains where some IDs might be
+            // skipped or filtered.
+            return idx;
+        }
         break;
     }
     return null;
@@ -292,6 +306,68 @@ pub fn mergeConsecutiveMessages(
         var extra = messages.orderedRemove(found_idx);
         extra.deinit(allocator);
     }
+}
+
+test "telegram ingress mergeConsecutiveMessages does not merge synthetic interactions" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    // User message (ID 100)
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Do check?", 100);
+    // Synthetic interaction message from button click (reusing assistant's ID 101)
+    // Even though 101 == 100 + 1, it represents a separate interaction and should not be merged.
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = try alloc.dupe(u8, "Yes, please"),
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 101,
+        .is_interaction = true,
+    });
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+    try std.testing.expectEqualStrings("Do check?", messages.items[0].content);
+    try std.testing.expectEqualStrings("Yes, please", messages.items[1].content);
+}
+
+test "telegram ingress mergeConsecutiveMessages does not merge identical IDs" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "First", 100);
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "Second", 100);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 2), messages.items.len);
+}
+
+test "telegram ingress mergeConsecutiveMessages still merges split text" {
+    const alloc = std.testing.allocator;
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer deinitOwnedTestMessages(alloc, &messages);
+
+    const split_like = try alloc.alloc(u8, TEXT_SPLIT_LIKELY_MIN_LEN);
+    @memset(split_like, 'x');
+
+    try messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user1"),
+        .sender = try alloc.dupe(u8, "chat1"),
+        .content = split_like,
+        .channel = "telegram",
+        .timestamp = 0,
+        .message_id = 100,
+    });
+    try appendOwnedTestMessage(alloc, &messages, "user1", "chat1", "tail", 101);
+
+    mergeConsecutiveMessages(alloc, &messages);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
 }
 
 fn appendOwnedTestMessage(

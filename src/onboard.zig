@@ -155,26 +155,12 @@ fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
     return null;
 }
 
-fn hasVersionedApiSegment(url: []const u8) bool {
-    const proto_start = std.mem.indexOf(u8, url, "://") orelse return false;
-    var i: usize = proto_start + 3;
-    while (i + 2 < url.len) : (i += 1) {
-        if (url[i] != '/' or url[i + 1] != 'v') continue;
-        var j = i + 2;
-        var has_digit = false;
-        while (j < url.len and std.ascii.isDigit(url[j])) : (j += 1) {
-            has_digit = true;
-        }
-        if (!has_digit) continue;
-        if (j == url.len or (j < url.len and url[j] == '/')) return true;
-    }
-    return false;
-}
-
 fn isValidCustomProviderUrl(url: []const u8) bool {
     if (url.len == 0) return false;
-    if (!(std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://"))) return false;
-    return hasVersionedApiSegment(url);
+    // We allow any http/https URL. While OpenAI-compatible endpoints usually
+    // contain /v1, some gateways (like Bifrost or custom proxies) might not
+    // expose it in the base URL or use a different structure.
+    return std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://");
 }
 
 fn isLocalEndpoint(url: []const u8) bool {
@@ -3759,9 +3745,13 @@ test "resolveProviderForQuickSetup supports custom: versioned endpoint beyond v1
     try std.testing.expectEqualStrings("custom:https://example.com/openai/v2", custom.key);
 }
 
+test "resolveProviderForQuickSetup supports non-versioned custom: prefix" {
+    const custom = resolveProviderForQuickSetup("custom:https://example.com/api") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/api", custom.key);
+}
+
 test "resolveProviderForQuickSetup rejects invalid custom endpoint format" {
     try std.testing.expect(resolveProviderForQuickSetup("custom:") == null);
-    try std.testing.expect(resolveProviderForQuickSetup("custom:https://example.com/api") == null);
     try std.testing.expect(resolveProviderForQuickSetup("custom:example.com/v1") == null);
 }
 
