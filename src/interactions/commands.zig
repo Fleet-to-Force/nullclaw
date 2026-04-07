@@ -28,7 +28,9 @@ const primary_telegram_commands = [_]TelegramCommand{
     .{ .command = "usage", .description = "Set usage footer mode" },
     .{ .command = "tts", .description = "Set TTS mode" },
     .{ .command = "memory", .description = "Memory tools and diagnostics" },
-    .{ .command = "skill", .description = "List skills" },
+    .{ .command = "skills", .description = "Browse and arm skills" },
+    .{ .command = "skill", .description = "Activate skill or run task" },
+    .{ .command = "iskill", .description = "Activate interactive skill" },
     .{ .command = "doctor", .description = "Memory diagnostics quick check" },
     .{ .command = "tasks", .description = "List background tasks" },
     .{ .command = "agents", .description = "Show active agents" },
@@ -91,6 +93,8 @@ test "telegram command catalog appends grouped commands" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"menu\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"config\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"skills\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"iskill\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"bind\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"topic\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"command\":\"topics\"") != null);

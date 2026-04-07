@@ -2,11 +2,12 @@ const std = @import("std");
 
 pub const START_TAG = "<nc_choices>";
 pub const END_TAG = "</nc_choices>";
-pub const MAX_OPTIONS: usize = 6;
+pub const MAX_OPTIONS: usize = 12;
 pub const MIN_OPTIONS: usize = 2;
 pub const MAX_ID_LEN: usize = 24;
 pub const MAX_LABEL_LEN: usize = 64;
 pub const MAX_SUBMIT_TEXT_LEN: usize = 256;
+pub const MAX_COLUMNS: u8 = 4;
 pub const CALLBACK_PREFIX = "nc1:";
 
 pub const ChoiceCallbackData = struct {
@@ -29,6 +30,8 @@ pub const ChoiceOption = struct {
 pub const ChoicesDirective = struct {
     version: u8 = 1,
     options: []ChoiceOption,
+    columns: u8 = 1,
+    remove_on_click: bool = true,
 
     pub fn deinit(self: *const ChoicesDirective, allocator: std.mem.Allocator) void {
         for (self.options) |opt| opt.deinit(allocator);
@@ -199,6 +202,22 @@ fn parseChoicesDirective(allocator: std.mem.Allocator, json_payload: []const u8)
     const items = options_val.array.items;
     if (items.len < MIN_OPTIONS or items.len > MAX_OPTIONS) return null;
 
+    const columns: u8 = blk: {
+        const columns_val = parsed.value.object.get("columns") orelse break :blk 1;
+        const raw = switch (columns_val) {
+            .integer => |value| value,
+            else => return null,
+        };
+        if (raw < 1 or raw > MAX_COLUMNS) return null;
+        break :blk @intCast(raw);
+    };
+
+    const remove_on_click = blk: {
+        const remove_val = parsed.value.object.get("remove_on_click") orelse break :blk true;
+        if (remove_val != .bool) return null;
+        break :blk remove_val.bool;
+    };
+
     var opts: std.ArrayListUnmanaged(ChoiceOption) = .empty;
     var completed = false;
     defer if (!completed) {
@@ -249,6 +268,8 @@ fn parseChoicesDirective(allocator: std.mem.Allocator, json_payload: []const u8)
     return .{
         .version = 1,
         .options = try opts.toOwnedSlice(allocator),
+        .columns = columns,
+        .remove_on_click = remove_on_click,
     };
 }
 
@@ -276,6 +297,21 @@ test "choices parse valid directive and strip block" {
     try std.testing.expectEqualStrings("Da", parsed.choices.?.options[0].label);
     try std.testing.expectEqualStrings("Da, sdelal", parsed.choices.?.options[0].submit_text);
     try std.testing.expectEqualStrings("Net", parsed.choices.?.options[1].submit_text); // fallback to label
+    try std.testing.expectEqual(@as(u8, 1), parsed.choices.?.columns);
+    try std.testing.expect(parsed.choices.?.remove_on_click);
+}
+
+test "choices parse accepts layout metadata" {
+    const allocator = std.testing.allocator;
+    var parsed = try parseAssistantChoices(
+        allocator,
+        "Pick\n<nc_choices>{\"v\":1,\"columns\":3,\"remove_on_click\":false,\"options\":[{\"id\":\"a\",\"label\":\"A\"},{\"id\":\"b\",\"label\":\"B\"}]}</nc_choices>",
+    );
+    defer parsed.deinit(allocator);
+
+    try std.testing.expect(parsed.choices != null);
+    try std.testing.expectEqual(@as(u8, 3), parsed.choices.?.columns);
+    try std.testing.expect(!parsed.choices.?.remove_on_click);
 }
 
 test "choices parse invalid json returns no choices and strips block when visible text remains" {
@@ -324,7 +360,13 @@ test "choices parse rejects too many options" {
         "{\"id\":\"d\",\"label\":\"D\"}," ++
         "{\"id\":\"e\",\"label\":\"E\"}," ++
         "{\"id\":\"f\",\"label\":\"F\"}," ++
-        "{\"id\":\"g\",\"label\":\"G\"}" ++
+        "{\"id\":\"g\",\"label\":\"G\"}," ++
+        "{\"id\":\"h\",\"label\":\"H\"}," ++
+        "{\"id\":\"i\",\"label\":\"I\"}," ++
+        "{\"id\":\"j\",\"label\":\"J\"}," ++
+        "{\"id\":\"k\",\"label\":\"K\"}," ++
+        "{\"id\":\"l\",\"label\":\"L\"}," ++
+        "{\"id\":\"m\",\"label\":\"M\"}" ++
         "]}</nc_choices>";
     var parsed = try parseAssistantChoices(allocator, text);
     defer parsed.deinit(allocator);

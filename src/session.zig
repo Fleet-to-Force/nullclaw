@@ -1593,6 +1593,48 @@ pub const SessionManager = struct {
         return self.processMessageStreaming(session_key, content, conversation_context, null);
     }
 
+    /// Handle a slash command against the live session without invoking the LLM turn loop.
+    /// Used for transport-driven local UIs such as Telegram callback menus.
+    pub fn handleLocalSlashCommand(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+    ) !?[]const u8 {
+        const session = try self.getOrCreate(session_key);
+
+        session.mutex.lock();
+        defer session.mutex.unlock();
+        session.turn_running.store(true, .release);
+        defer {
+            session.turn_running.store(false, .release);
+            session.agent.clearInterruptRequest();
+        }
+
+        session.agent.conversation_context = conversation_context;
+        defer session.agent.conversation_context = null;
+        setTurnToolContext(session.agent.tools, session_key, conversation_context);
+
+        const maybe_response = try session.agent.handleSlashCommand(content);
+        if (maybe_response == null) return null;
+
+        session.turn_count += 1;
+        session.last_active = std.time.timestamp();
+
+        if (session.agent.session_store) |store| {
+            const turn_input = agent_mod.commands.planTurnInput(content);
+            if (turn_input.clear_session) {
+                store.clearMessages(session_key) catch {};
+                store.clearAutoSaved(session_key) catch {};
+            }
+            if (agent_mod.commands.persistedRuntimeCommand(content)) |runtime_command| {
+                store.saveMessage(session_key, RUNTIME_COMMAND_ROLE, runtime_command) catch {};
+            }
+        }
+
+        return maybe_response;
+    }
+
     /// Process a message within a session context and optionally forward text deltas.
     /// Deltas are only emitted when provider streaming is active.
     pub fn processMessageStreaming(
@@ -2917,6 +2959,60 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
     const session = try sm.getOrCreate("agent:helper-bot:telegram:direct:42");
     try expectPathEndsWith(session.agent.workspace_dir, "agents/helper-workspace");
     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+}
+
+test "handleLocalSlashCommand activates interactive skill session" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    try tmp.dir.makePath("skills/news-digest");
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:main:telegram:group:-100123:thread:7";
+    const response = (try sm.handleLocalSlashCommand(session_key, "/iskill news-digest", .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer_id = "-100123:thread:7",
+        .group_id = "-100123",
+        .is_group = true,
+    })).?;
+    defer testing.allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "Active skill set to `news-digest`") != null);
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(session.agent.active_skill_name != null);
+    try testing.expectEqualStrings("news-digest", session.agent.active_skill_name.?);
+    try testing.expect(session.agent.active_skill_interactive);
 }
 
 test "claim gate blocks unverified peer when dm_scope is main" {

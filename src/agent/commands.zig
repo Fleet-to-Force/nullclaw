@@ -17,6 +17,7 @@ const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
+const interaction_choices = @import("../interactions/choices.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -123,7 +124,7 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "elevated") or isSlashName(cmd, "elev")) return .elevated;
     if (isSlashName(cmd, "bash")) return .bash;
     if (isSlashName(cmd, "poll")) return .poll;
-    if (isSlashName(cmd, "skill")) return .skill;
+    if (isSlashName(cmd, "skill") or isSlashName(cmd, "skills") or isSlashName(cmd, "iskill")) return .skill;
     if (isSlashName(cmd, "doctor")) return .doctor;
     if (isSlashName(cmd, "memory")) return .memory;
     return .unknown;
@@ -176,6 +177,7 @@ pub fn persistedRuntimeCommand(message: []const u8) ?[]const u8 {
             if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) break :blk null;
             break :blk message;
         },
+        .skill => skillRuntimeCommand(message, cmd),
         .session => blk: {
             if (!std.ascii.eqlIgnoreCase(first, "ttl")) break :blk null;
             const tail = splitFirstToken(arg).tail;
@@ -189,6 +191,35 @@ pub fn persistedRuntimeCommand(message: []const u8) ?[]const u8 {
         },
         else => null,
     };
+}
+
+fn skillRuntimeCommand(message: []const u8, cmd: SlashCommand) ?[]const u8 {
+    if (isSlashName(cmd, "skills")) return null;
+
+    const parsed = splitFirstToken(cmd.arg);
+    const head = parsed.head;
+    const tail = std.mem.trim(u8, parsed.tail, " \t");
+    if (head.len == 0) return null;
+
+    if (std.ascii.eqlIgnoreCase(head, "status") or
+        std.ascii.eqlIgnoreCase(head, "list") or
+        std.ascii.eqlIgnoreCase(head, "reload") or
+        std.ascii.eqlIgnoreCase(head, "refresh"))
+    {
+        return null;
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "clear") or std.ascii.eqlIgnoreCase(head, "off")) {
+        return message;
+    }
+
+    if (isSlashName(cmd, "iskill")) {
+        if (tail.len != 0) return null;
+        return message;
+    }
+
+    if (tail.len == 0) return message;
+    return null;
 }
 
 fn firstToken(arg: []const u8) []const u8 {
@@ -1459,6 +1490,34 @@ const DirectSkillCommandMatch = struct {
     user_input: []const u8,
 };
 
+const SkillLaunchMode = enum {
+    one_shot,
+    session_active,
+};
+
+const SkillMenuCommandChoice = struct {
+    label: []const u8,
+    submit_text: []const u8,
+};
+
+const SkillAffixKind = enum {
+    prefix,
+    suffix,
+};
+
+const SkillAffixEntry = struct {
+    token: []const u8,
+    count: usize,
+};
+
+const SkillLetterGroup = struct {
+    label: []const u8,
+    command: []const u8,
+};
+
+const SKILL_MENU_PAGE_SIZE: usize = 10;
+const SKILL_MENU_COLUMNS: u8 = 3;
+
 fn registerDirectSkillCommandMatch(
     match: *?DirectSkillCommandMatch,
     skill: *const skills_mod.Skill,
@@ -1475,7 +1534,952 @@ fn registerDirectSkillCommandMatch(
     return true;
 }
 
-fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_input: []const u8) ![]const u8 {
+fn clearActiveSkillSession(self: anytype) void {
+    if (!@hasField(@TypeOf(self.*), "active_skill_name")) return;
+
+    if (self.active_skill_name_owned and self.active_skill_name != null) self.allocator.free(self.active_skill_name.?);
+    if (self.active_skill_description_owned and self.active_skill_description != null) self.allocator.free(self.active_skill_description.?);
+    if (self.active_skill_instructions_owned and self.active_skill_instructions != null) self.allocator.free(self.active_skill_instructions.?);
+    if (self.active_skill_path_owned and self.active_skill_path != null) self.allocator.free(self.active_skill_path.?);
+
+    self.active_skill_name = null;
+    self.active_skill_name_owned = false;
+    self.active_skill_description = null;
+    self.active_skill_description_owned = false;
+    self.active_skill_instructions = null;
+    self.active_skill_instructions_owned = false;
+    self.active_skill_path = null;
+    self.active_skill_path_owned = false;
+    self.active_skill_interactive = false;
+}
+
+fn setActiveSkillSession(self: anytype, skill: *const skills_mod.Skill, interactive: bool) !void {
+    const owned_name = try self.allocator.dupe(u8, skill.name);
+    errdefer self.allocator.free(owned_name);
+
+    const owned_description = if (skill.description.len > 0)
+        try self.allocator.dupe(u8, skill.description)
+    else
+        null;
+    errdefer if (owned_description) |value| self.allocator.free(value);
+
+    const owned_instructions = if (skill.instructions.len > 0)
+        try self.allocator.dupe(u8, skill.instructions)
+    else
+        null;
+    errdefer if (owned_instructions) |value| self.allocator.free(value);
+
+    const owned_path = if (skill.path.len > 0)
+        try self.allocator.dupe(u8, skill.path)
+    else
+        null;
+    errdefer if (owned_path) |value| self.allocator.free(value);
+
+    clearActiveSkillSession(self);
+    self.active_skill_name = owned_name;
+    self.active_skill_name_owned = true;
+    self.active_skill_description = owned_description;
+    self.active_skill_description_owned = owned_description != null;
+    self.active_skill_instructions = owned_instructions;
+    self.active_skill_instructions_owned = owned_instructions != null;
+    self.active_skill_path = owned_path;
+    self.active_skill_path_owned = owned_path != null;
+    self.active_skill_interactive = interactive;
+}
+
+fn activeSkillModeLabel(interactive: bool) []const u8 {
+    return if (interactive) "interactive" else "non-interactive";
+}
+
+fn appendSkillLaunchContextBody(
+    self: anytype,
+    writer: anytype,
+    skill_name: []const u8,
+    skill_description: ?[]const u8,
+    skill_path: ?[]const u8,
+    interactive: bool,
+    launch_mode: SkillLaunchMode,
+) !void {
+    try writer.writeAll("- Launcher: nullclaw\n");
+    try writer.print("- Launch mode: {s}\n", .{switch (launch_mode) {
+        .one_shot => "one-off request",
+        .session_active => "session-bound",
+    }});
+    try writer.print("- Skill: {s}\n", .{skill_name});
+    if (skill_description) |value| {
+        if (value.len > 0) try writer.print("- Skill description: {s}\n", .{value});
+    }
+    if (skill_path) |value| {
+        if (value.len > 0) try writer.print("- Skill directory: {s}\n", .{value});
+    }
+    if (@hasField(@TypeOf(self.*), "workspace_dir")) {
+        try writer.print("- Agent workspace: {s}\n", .{self.workspace_dir});
+    }
+    try writer.print("- Interaction mode: {s}\n", .{activeSkillModeLabel(interactive)});
+
+    if (@hasField(@TypeOf(self.*), "conversation_context")) {
+        if (self.conversation_context) |ctx| {
+            if (ctx.channel) |value| try writer.print("- Channel: {s}\n", .{value});
+            if (ctx.account_id) |value| try writer.print("- Account ID: {s}\n", .{value});
+            if (ctx.peer_id) |value| try writer.print("- Peer ID: {s}\n", .{value});
+            if (ctx.group_id) |value| try writer.print("- Group ID: {s}\n", .{value});
+            if (ctx.is_group) |is_group| {
+                try writer.print("- Chat type: {s}\n", .{if (is_group) "group" else "direct"});
+            }
+        }
+    }
+
+    try writer.writeAll("\nOperational rules:\n");
+    try writer.writeAll("- This skill is running inside the current nullclaw agent session, not as a standalone CLI process.\n");
+    if (interactive) {
+        try writer.writeAll("- Interactive mode is ON. On Telegram and other supported channels, prefer `<nc_choices>...</nc_choices>` instead of `AskUserQuestion` or `mcp_question`.\n");
+    } else {
+        try writer.writeAll("- Interactive mode is OFF. Avoid clarification loops; choose sane defaults unless missing data truly blocks progress.\n");
+    }
+    if (launch_mode == .session_active) {
+        try writer.writeAll("- This skill remains active for later messages in the current session until `/skill clear` is used.\n");
+    }
+}
+
+fn buildSkillInvocationPrompt(
+    self: anytype,
+    skill: *const skills_mod.Skill,
+    user_input: []const u8,
+    interactive: bool,
+) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+
+    try writer.print("Apply the skill `{s}`.\n\n", .{skill.name});
+    try writer.writeAll("## Skill Launch Context\n\n");
+    try appendSkillLaunchContextBody(
+        self,
+        writer,
+        skill.name,
+        if (skill.description.len > 0) skill.description else null,
+        if (skill.path.len > 0) skill.path else null,
+        interactive,
+        .one_shot,
+    );
+    if (skill.instructions.len > 0) {
+        try writer.writeAll("\n\n## Skill Instructions\n\n");
+        try writer.writeAll(skill.instructions);
+    }
+    try writer.writeAll("\n\n## Task\n\n");
+    try writer.writeAll(user_input);
+    return try out.toOwnedSlice(self.allocator);
+}
+
+pub fn buildActiveSkillPromptSection(self: anytype) !?[]const u8 {
+    if (!@hasField(@TypeOf(self.*), "active_skill_name")) return null;
+    const skill_name = self.active_skill_name orelse return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+
+    try writer.writeAll("## Active Skill Session\n\n");
+    try writer.writeAll("An operator armed a session-scoped skill for this conversation. Treat subsequent user messages as work for that skill unless they explicitly clear or replace it.\n\n");
+    try appendSkillLaunchContextBody(
+        self,
+        writer,
+        skill_name,
+        self.active_skill_description,
+        self.active_skill_path,
+        self.active_skill_interactive,
+        .session_active,
+    );
+    if (self.active_skill_instructions) |instructions| {
+        if (instructions.len > 0) {
+            try writer.writeAll("\n\n## Active Skill Instructions\n\n");
+            try writer.writeAll(instructions);
+        }
+    }
+
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn shouldRenderSkillChoices(self: anytype) bool {
+    if (!@hasField(@TypeOf(self.*), "conversation_context")) return false;
+    const ctx = self.conversation_context orelse return false;
+    const channel = ctx.channel orelse return false;
+    return std.ascii.eqlIgnoreCase(channel, "telegram");
+}
+
+fn appendJsonString(writer: anytype, value: []const u8) !void {
+    try writer.print("{f}", .{std.json.fmt(value, .{})});
+}
+
+fn appendSkillCommandChoices(
+    self: anytype,
+    writer: anytype,
+    choices: []const SkillMenuCommandChoice,
+    columns: u8,
+) !void {
+    _ = self;
+    if (choices.len < interaction_choices.MIN_OPTIONS or choices.len > interaction_choices.MAX_OPTIONS) return;
+    const safe_columns: u8 = @max(@as(u8, 1), @min(columns, interaction_choices.MAX_COLUMNS));
+
+    try writer.writeAll("\n");
+    try writer.writeAll(interaction_choices.START_TAG);
+    try writer.print("{{\"v\":1,\"columns\":{d},\"options\":[", .{safe_columns});
+
+    var first = true;
+    for (choices, 0..) |choice, idx| {
+        if (!first) try writer.writeAll(",");
+        first = false;
+
+        var id_buf: [16]u8 = undefined;
+        const option_id = try std.fmt.bufPrint(&id_buf, "s{d}", .{idx + 1});
+        const label = if (choice.label.len > interaction_choices.MAX_LABEL_LEN)
+            choice.label[0..interaction_choices.MAX_LABEL_LEN]
+        else
+            choice.label;
+
+        try writer.writeAll("{\"id\":");
+        try appendJsonString(writer, option_id);
+        try writer.writeAll(",\"label\":");
+        try appendJsonString(writer, label);
+        try writer.writeAll(",\"submit_text\":");
+        try appendJsonString(writer, choice.submit_text);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+    try writer.writeAll(interaction_choices.END_TAG);
+}
+
+fn appendSkillActionChoices(
+    self: anytype,
+    writer: anytype,
+    include_clear: bool,
+) !void {
+    if (!shouldRenderSkillChoices(self)) return;
+
+    const choices = if (include_clear)
+        [_]SkillMenuCommandChoice{
+            .{ .label = "Skills", .submit_text = "/skills" },
+            .{ .label = "Clear skill", .submit_text = "/skill clear" },
+        }
+    else
+        [_]SkillMenuCommandChoice{
+            .{ .label = "Skills", .submit_text = "/skills" },
+            .{ .label = "Skill status", .submit_text = "/skill status" },
+        };
+    try appendSkillCommandChoices(self, writer, &choices, 2);
+}
+
+fn countAvailableSkills(skills: []const skills_mod.Skill) usize {
+    var count: usize = 0;
+    for (skills) |skill| {
+        if (skill.available) count += 1;
+    }
+    return count;
+}
+
+fn unavailableSkillCount(skills: []const skills_mod.Skill) usize {
+    var count: usize = 0;
+    for (skills) |skill| {
+        if (!skill.available) count += 1;
+    }
+    return count;
+}
+
+fn parseSkillMenuPageIndex(arg: []const u8) usize {
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len == 0) return 0;
+    const parsed = std.fmt.parseInt(usize, trimmed, 10) catch return 0;
+    if (parsed == 0) return 0;
+    return parsed - 1;
+}
+
+fn collectSortedSkillRefs(
+    allocator: std.mem.Allocator,
+    skills: []const skills_mod.Skill,
+    available_only: bool,
+) ![]*const skills_mod.Skill {
+    var refs: std.ArrayList(*const skills_mod.Skill) = .empty;
+    errdefer refs.deinit(allocator);
+
+    for (skills) |*skill| {
+        if (available_only and !skill.available) continue;
+        try refs.append(allocator, skill);
+    }
+
+    std.mem.sort(*const skills_mod.Skill, refs.items, {}, struct {
+        fn lessThan(_: void, left: *const skills_mod.Skill, right: *const skills_mod.Skill) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.lessThan);
+
+    return try refs.toOwnedSlice(allocator);
+}
+
+fn skillPrefixToken(name: []const u8) ?[]const u8 {
+    const sep = std.mem.indexOfScalar(u8, name, '-') orelse return null;
+    if (sep == 0 or sep + 1 >= name.len) return null;
+    return name[0..sep];
+}
+
+fn skillSuffixToken(name: []const u8) ?[]const u8 {
+    const sep = std.mem.lastIndexOfScalar(u8, name, '-') orelse return null;
+    if (sep == 0 or sep + 1 >= name.len) return null;
+    return name[sep + 1 ..];
+}
+
+fn skillBaseName(name: []const u8) []const u8 {
+    const sep = std.mem.indexOfScalar(u8, name, '-') orelse return name;
+    if (sep + 1 >= name.len) return name;
+    return name[sep + 1 ..];
+}
+
+fn firstSkillBrowseLetter(name: []const u8) ?u8 {
+    for (name) |ch| {
+        if (std.ascii.isAlphabetic(ch)) return std.ascii.toLower(ch);
+    }
+    return null;
+}
+
+fn skillMatchesLetter(skill: *const skills_mod.Skill, letter: u8) bool {
+    if (firstSkillBrowseLetter(skill.name)) |value| {
+        if (value == letter) return true;
+    }
+
+    const prefix = skillPrefixToken(skill.name) orelse return false;
+    _ = prefix;
+    if (firstSkillBrowseLetter(skillBaseName(skill.name))) |value| {
+        return value == letter;
+    }
+    return false;
+}
+
+fn parseSkillLetterGroup(group: []const u8) ?SkillLetterGroup {
+    if (std.ascii.eqlIgnoreCase(group, "a-f")) return .{ .label = "A-F", .command = "/skills letters a-f" };
+    if (std.ascii.eqlIgnoreCase(group, "g-l")) return .{ .label = "G-L", .command = "/skills letters g-l" };
+    if (std.ascii.eqlIgnoreCase(group, "m-r")) return .{ .label = "M-R", .command = "/skills letters m-r" };
+    if (std.ascii.eqlIgnoreCase(group, "s-z")) return .{ .label = "S-Z", .command = "/skills letters s-z" };
+    return null;
+}
+
+fn skillLetterInGroup(letter: u8, group: []const u8) bool {
+    const normalized = std.ascii.toLower(letter);
+    if (normalized < 'a' or normalized > 'z') return false;
+    if (std.ascii.eqlIgnoreCase(group, "a-f")) return normalized >= 'a' and normalized <= 'f';
+    if (std.ascii.eqlIgnoreCase(group, "g-l")) return normalized >= 'g' and normalized <= 'l';
+    if (std.ascii.eqlIgnoreCase(group, "m-r")) return normalized >= 'm' and normalized <= 'r';
+    if (std.ascii.eqlIgnoreCase(group, "s-z")) return normalized >= 's' and normalized <= 'z';
+    return false;
+}
+
+fn skillLetterGroupCommand(letter: u8) []const u8 {
+    const normalized = std.ascii.toLower(letter);
+    return if (normalized >= 'a' and normalized <= 'f')
+        "/skills letters a-f"
+    else if (normalized >= 'g' and normalized <= 'l')
+        "/skills letters g-l"
+    else if (normalized >= 'm' and normalized <= 'r')
+        "/skills letters m-r"
+    else
+        "/skills letters s-z";
+}
+
+fn collectSkillAffixEntries(
+    allocator: std.mem.Allocator,
+    refs: []const *const skills_mod.Skill,
+    kind: SkillAffixKind,
+) ![]SkillAffixEntry {
+    var counts = std.StringHashMap(usize).init(allocator);
+    defer counts.deinit();
+
+    for (refs) |skill| {
+        const token = switch (kind) {
+            .prefix => skillPrefixToken(skill.name),
+            .suffix => skillSuffixToken(skill.name),
+        } orelse continue;
+
+        const gop = try counts.getOrPut(token);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+    }
+
+    const entries = try allocator.alloc(SkillAffixEntry, counts.count());
+    errdefer allocator.free(entries);
+
+    var idx: usize = 0;
+    var it = counts.iterator();
+    while (it.next()) |entry| : (idx += 1) {
+        entries[idx] = .{
+            .token = entry.key_ptr.*,
+            .count = entry.value_ptr.*,
+        };
+    }
+
+    std.mem.sort(SkillAffixEntry, entries, {}, struct {
+        fn lessThan(_: void, left: SkillAffixEntry, right: SkillAffixEntry) bool {
+            return std.mem.lessThan(u8, left.token, right.token);
+        }
+    }.lessThan);
+
+    return entries;
+}
+
+fn collectSkillRefsByLetter(
+    allocator: std.mem.Allocator,
+    refs: []const *const skills_mod.Skill,
+    letter: u8,
+) ![]*const skills_mod.Skill {
+    var filtered: std.ArrayList(*const skills_mod.Skill) = .empty;
+    errdefer filtered.deinit(allocator);
+
+    const normalized = std.ascii.toLower(letter);
+    for (refs) |skill| {
+        if (skillMatchesLetter(skill, normalized)) try filtered.append(allocator, skill);
+    }
+    return try filtered.toOwnedSlice(allocator);
+}
+
+fn collectSkillRefsByAffix(
+    allocator: std.mem.Allocator,
+    refs: []const *const skills_mod.Skill,
+    kind: SkillAffixKind,
+    token: []const u8,
+) ![]*const skills_mod.Skill {
+    var filtered: std.ArrayList(*const skills_mod.Skill) = .empty;
+    errdefer filtered.deinit(allocator);
+
+    for (refs) |skill| {
+        const candidate = switch (kind) {
+            .prefix => skillPrefixToken(skill.name),
+            .suffix => skillSuffixToken(skill.name),
+        } orelse continue;
+        if (!std.ascii.eqlIgnoreCase(candidate, token)) continue;
+        try filtered.append(allocator, skill);
+    }
+    return try filtered.toOwnedSlice(allocator);
+}
+
+fn formatSkillBrowserRoot(self: anytype, skills: []const skills_mod.Skill) ![]const u8 {
+    if (!shouldRenderSkillChoices(self)) {
+        return try formatSkillListText(self, skills);
+    }
+    if (skills.len == 0) {
+        return try formatSkillInactiveReply(self, "No skills found in workspace.");
+    }
+
+    const available_total = countAvailableSkills(skills);
+    if (available_total == 0) {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "No available skills found in workspace. Unavailable skills: {d}.",
+            .{unavailableSkillCount(skills)},
+        );
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+
+    try writer.print("Skill browser: {d} available skill(s).\n", .{available_total});
+    if (@hasField(@TypeOf(self.*), "active_skill_name")) {
+        if (self.active_skill_name) |name| {
+            try writer.print("Current active skill: {s} ({s}).\n", .{
+                name,
+                activeSkillModeLabel(self.active_skill_interactive),
+            });
+        }
+    }
+    const hidden_unavailable = unavailableSkillCount(skills);
+    if (hidden_unavailable > 0) {
+        try writer.print("Unavailable skills hidden: {d}.\n", .{hidden_unavailable});
+    }
+    try writer.writeAll("Choose a letter range, prefix, suffix, or open the full sorted list. Letter filters match both the raw skill name and the base name after the first prefix.");
+
+    var choices = [_]SkillMenuCommandChoice{
+        .{ .label = "A-F", .submit_text = "/skills letters a-f" },
+        .{ .label = "G-L", .submit_text = "/skills letters g-l" },
+        .{ .label = "M-R", .submit_text = "/skills letters m-r" },
+        .{ .label = "S-Z", .submit_text = "/skills letters s-z" },
+        .{ .label = "Prefixes", .submit_text = "/skills prefixes" },
+        .{ .label = "Suffixes", .submit_text = "/skills suffixes" },
+        .{ .label = "All skills", .submit_text = "/skills all" },
+        .{ .label = "Skill status", .submit_text = "/skill status" },
+    };
+    try appendSkillCommandChoices(self, writer, &choices, SKILL_MENU_COLUMNS);
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillListText(self: anytype, skills: []const skills_mod.Skill) ![]const u8 {
+    if (skills.len == 0) {
+        return try formatSkillInactiveReply(self, "No skills found in workspace.");
+    }
+
+    const refs = try collectSortedSkillRefs(self.allocator, skills, false);
+    defer self.allocator.free(refs);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+
+    try writer.writeAll("Available skills:\n");
+    for (refs) |skill| {
+        try writer.print("  - {s}", .{skill.name});
+        if (skill.description.len > 0) try writer.print(": {s}", .{skill.description});
+        if (!skill.available) try writer.print(" (unavailable: {s})", .{skill.missing_deps});
+        if (@hasField(@TypeOf(self.*), "active_skill_name") and self.active_skill_name != null and
+            std.mem.eql(u8, self.active_skill_name.?, skill.name))
+        {
+            try writer.print(" [active: {s}]", .{activeSkillModeLabel(self.active_skill_interactive)});
+        }
+        try writer.writeAll("\n");
+    }
+
+    if (@hasField(@TypeOf(self.*), "active_skill_name")) {
+        if (self.active_skill_name) |name| {
+            try writer.print("\nCurrent active skill: {s} ({s})\n", .{
+                name,
+                activeSkillModeLabel(self.active_skill_interactive),
+            });
+        }
+    }
+
+    try writer.writeAll("\nUse `/skill <name>` to arm a non-interactive session skill, `/iskill <name>` for an interactive session skill, or `/skill <name> <task>` for a one-off skill task.");
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillRefListPage(
+    self: anytype,
+    title: []const u8,
+    refs: []const *const skills_mod.Skill,
+    page_index: usize,
+    next_prefix: []const u8,
+    back_submit: []const u8,
+) ![]const u8 {
+    if (refs.len == 0) {
+        return try formatSkillInactiveReply(self, "No matching skills found.");
+    }
+
+    if (!shouldRenderSkillChoices(self)) {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const writer = out.writer(self.allocator);
+        try writer.print("{s}:\n", .{title});
+        for (refs) |skill| {
+            try writer.print("  - {s}", .{skill.name});
+            if (skill.description.len > 0) try writer.print(": {s}", .{skill.description});
+            try writer.writeAll("\n");
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    const safe_page_index = @min(page_index, (refs.len - 1) / SKILL_MENU_PAGE_SIZE);
+    const start = safe_page_index * SKILL_MENU_PAGE_SIZE;
+    const end = @min(start + SKILL_MENU_PAGE_SIZE, refs.len);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+
+    try writer.print("{s}: showing {d}-{d} of {d}.\n", .{
+        title,
+        start + 1,
+        end,
+        refs.len,
+    });
+    try writer.writeAll("Tap a skill to activate it in interactive mode. Use /skill <name> for non-interactive mode.");
+
+    var choices_buf: [interaction_choices.MAX_OPTIONS]SkillMenuCommandChoice = undefined;
+    var choices_len: usize = 0;
+
+    for (refs[start..end]) |skill| {
+        const submit_text = try std.fmt.allocPrint(self.allocator, "/iskill {s}", .{skill.name});
+        errdefer self.allocator.free(submit_text);
+        choices_buf[choices_len] = .{
+            .label = skill.name,
+            .submit_text = submit_text,
+        };
+        choices_len += 1;
+    }
+
+    if (end < refs.len and choices_len < interaction_choices.MAX_OPTIONS) {
+        const next_submit = try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ next_prefix, safe_page_index + 2 });
+        errdefer self.allocator.free(next_submit);
+        choices_buf[choices_len] = .{
+            .label = "More",
+            .submit_text = next_submit,
+        };
+        choices_len += 1;
+    }
+
+    if (choices_len < interaction_choices.MAX_OPTIONS) {
+        choices_buf[choices_len] = .{
+            .label = "Back",
+            .submit_text = back_submit,
+        };
+        choices_len += 1;
+    }
+
+    defer {
+        for (choices_buf[0 .. end - start]) |choice| {
+            self.allocator.free(choice.submit_text);
+        }
+        if (end < refs.len) {
+            self.allocator.free(choices_buf[end - start].submit_text);
+        }
+    }
+
+    try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillLetterGroupMenu(
+    self: anytype,
+    refs: []const *const skills_mod.Skill,
+    group: []const u8,
+) ![]const u8 {
+    const parsed_group = parseSkillLetterGroup(group) orelse return try formatSkillInactiveReply(self, "Unknown letter range.");
+
+    if (!shouldRenderSkillChoices(self)) {
+        return try self.allocator.dupe(u8, "Letter menus are optimized for Telegram. Use /skills there to browse interactively.");
+    }
+
+    var present: [26]bool = [_]bool{false} ** 26;
+    for (refs) |skill| {
+        if (firstSkillBrowseLetter(skill.name)) |letter| {
+            if (skillLetterInGroup(letter, group)) present[letter - 'a'] = true;
+        }
+        if (firstSkillBrowseLetter(skillBaseName(skill.name))) |letter| {
+            if (skillLetterInGroup(letter, group)) present[letter - 'a'] = true;
+        }
+    }
+
+    var choices_buf: [interaction_choices.MAX_OPTIONS]SkillMenuCommandChoice = undefined;
+    var choices_len: usize = 0;
+    for (present, 0..) |is_present, idx| {
+        if (!is_present) continue;
+        const letter = @as(u8, @intCast(idx)) + 'a';
+        const submit_text = try std.fmt.allocPrint(self.allocator, "/skills letter {c}", .{letter});
+        errdefer self.allocator.free(submit_text);
+        const label = try std.fmt.allocPrint(self.allocator, "{c}", .{std.ascii.toUpper(letter)});
+        errdefer self.allocator.free(label);
+        choices_buf[choices_len] = .{
+            .label = label,
+            .submit_text = submit_text,
+        };
+        choices_len += 1;
+    }
+
+    if (choices_len == 0) {
+        return try formatSkillInactiveReply(self, "No matching letters found for this range.");
+    }
+
+    choices_buf[choices_len] = .{
+        .label = "Back",
+        .submit_text = "/skills",
+    };
+    choices_len += 1;
+
+    defer {
+        for (choices_buf[0..choices_len]) |choice| {
+            if (choice.label.len == 1 and std.ascii.isAlphabetic(choice.label[0])) self.allocator.free(choice.label);
+            if (std.mem.startsWith(u8, choice.submit_text, "/skills ")) self.allocator.free(choice.submit_text);
+        }
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+    try writer.print("Letter range {s}. Choose a starting letter.\n", .{parsed_group.label});
+    try writer.writeAll("Matches include both the raw skill name and the base name after the first prefix.");
+    try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillAffixMenu(
+    self: anytype,
+    refs: []const *const skills_mod.Skill,
+    kind: SkillAffixKind,
+    page_index: usize,
+) ![]const u8 {
+    const entries = try collectSkillAffixEntries(self.allocator, refs, kind);
+    defer self.allocator.free(entries);
+
+    if (entries.len == 0) {
+        return try formatSkillInactiveReply(self, "No skill prefixes or suffixes found.");
+    }
+
+    if (!shouldRenderSkillChoices(self)) {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        const writer = out.writer(self.allocator);
+        try writer.print("{s}:\n", .{if (kind == .prefix) "Skill prefixes" else "Skill suffixes"});
+        for (entries) |entry| {
+            if (kind == .prefix) {
+                try writer.print("  - {s}- ({d})\n", .{ entry.token, entry.count });
+            } else {
+                try writer.print("  - -{s} ({d})\n", .{ entry.token, entry.count });
+            }
+        }
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    const safe_page_index = @min(page_index, (entries.len - 1) / SKILL_MENU_PAGE_SIZE);
+    const start = safe_page_index * SKILL_MENU_PAGE_SIZE;
+    const end = @min(start + SKILL_MENU_PAGE_SIZE, entries.len);
+    const next_prefix = if (kind == .prefix) "/skills prefixes" else "/skills suffixes";
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+    try writer.print("{s}: showing {d}-{d} of {d}.\n", .{
+        if (kind == .prefix) "Skill prefixes" else "Skill suffixes",
+        start + 1,
+        end,
+        entries.len,
+    });
+    try writer.writeAll("Choose an affix to narrow the skill list.");
+
+    var choices_buf: [interaction_choices.MAX_OPTIONS]SkillMenuCommandChoice = undefined;
+    var choices_len: usize = 0;
+
+    for (entries[start..end]) |entry| {
+        const submit_text = switch (kind) {
+            .prefix => try std.fmt.allocPrint(self.allocator, "/skills prefix {s}", .{entry.token}),
+            .suffix => try std.fmt.allocPrint(self.allocator, "/skills suffix {s}", .{entry.token}),
+        };
+        errdefer self.allocator.free(submit_text);
+        const label = switch (kind) {
+            .prefix => try std.fmt.allocPrint(self.allocator, "{s}- ({d})", .{ entry.token, entry.count }),
+            .suffix => try std.fmt.allocPrint(self.allocator, "-{s} ({d})", .{ entry.token, entry.count }),
+        };
+        errdefer self.allocator.free(label);
+        choices_buf[choices_len] = .{
+            .label = label,
+            .submit_text = submit_text,
+        };
+        choices_len += 1;
+    }
+
+    if (end < entries.len and choices_len < interaction_choices.MAX_OPTIONS) {
+        const next_submit = try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ next_prefix, safe_page_index + 2 });
+        errdefer self.allocator.free(next_submit);
+        choices_buf[choices_len] = .{
+            .label = "More",
+            .submit_text = next_submit,
+        };
+        choices_len += 1;
+    }
+
+    choices_buf[choices_len] = .{
+        .label = "Back",
+        .submit_text = "/skills",
+    };
+    choices_len += 1;
+
+    defer {
+        for (choices_buf[0..choices_len]) |choice| {
+            if (std.mem.startsWith(u8, choice.label, "-") or std.mem.indexOfScalar(u8, choice.label, '(') != null) self.allocator.free(choice.label);
+            if (std.mem.startsWith(u8, choice.submit_text, "/skills ")) self.allocator.free(choice.submit_text);
+        }
+    }
+
+    try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillList(self: anytype, skills: []const skills_mod.Skill, arg: []const u8) ![]const u8 {
+    if (skills.len == 0) {
+        return try formatSkillInactiveReply(self, "No skills found in workspace.");
+    }
+
+    const available_total = countAvailableSkills(skills);
+    if (available_total == 0) {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "No available skills found in workspace. Unavailable skills: {d}.",
+            .{unavailableSkillCount(skills)},
+        );
+    }
+
+    const available_refs = try collectSortedSkillRefs(self.allocator, skills, true);
+    defer self.allocator.free(available_refs);
+
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len == 0) {
+        return try formatSkillBrowserRoot(self, skills);
+    }
+
+    if (parsePositiveUsize(trimmed)) |page_num| {
+        return try formatSkillRefListPage(self, "All skills", available_refs, page_num - 1, "/skills all", "/skills");
+    }
+
+    const parsed = splitFirstToken(trimmed);
+    const head = parsed.head;
+    const tail = std.mem.trim(u8, parsed.tail, " \t");
+
+    if (std.ascii.eqlIgnoreCase(head, "all")) {
+        return try formatSkillRefListPage(self, "All skills", available_refs, parseSkillMenuPageIndex(tail), "/skills all", "/skills");
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "letters")) {
+        return try formatSkillLetterGroupMenu(self, available_refs, tail);
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "letter")) {
+        const letter_arg = splitFirstToken(tail);
+        if (letter_arg.head.len != 1 or !std.ascii.isAlphabetic(letter_arg.head[0])) {
+            return try formatSkillInactiveReply(self, "Usage: /skills letter <a-z>");
+        }
+        const letter = std.ascii.toLower(letter_arg.head[0]);
+        const filtered = try collectSkillRefsByLetter(self.allocator, available_refs, letter);
+        defer self.allocator.free(filtered);
+
+        const title = try std.fmt.allocPrint(self.allocator, "Skills for letter {c}", .{std.ascii.toUpper(letter)});
+        defer self.allocator.free(title);
+        const next_prefix = try std.fmt.allocPrint(self.allocator, "/skills letter {c}", .{letter});
+        defer self.allocator.free(next_prefix);
+
+        return try formatSkillRefListPage(
+            self,
+            title,
+            filtered,
+            parseSkillMenuPageIndex(letter_arg.tail),
+            next_prefix,
+            skillLetterGroupCommand(letter),
+        );
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "prefixes")) {
+        return try formatSkillAffixMenu(self, available_refs, .prefix, parseSkillMenuPageIndex(tail));
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "suffixes")) {
+        return try formatSkillAffixMenu(self, available_refs, .suffix, parseSkillMenuPageIndex(tail));
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "prefix") or std.ascii.eqlIgnoreCase(head, "suffix")) {
+        const token_arg = splitFirstToken(tail);
+        if (token_arg.head.len == 0) {
+            return try formatSkillInactiveReply(
+                self,
+                if (std.ascii.eqlIgnoreCase(head, "prefix")) "Usage: /skills prefix <name>" else "Usage: /skills suffix <name>",
+            );
+        }
+
+        const kind: SkillAffixKind = if (std.ascii.eqlIgnoreCase(head, "prefix")) .prefix else .suffix;
+        const filtered = try collectSkillRefsByAffix(self.allocator, available_refs, kind, token_arg.head);
+        defer self.allocator.free(filtered);
+
+        const title = switch (kind) {
+            .prefix => try std.fmt.allocPrint(self.allocator, "Skills with prefix {s}-", .{token_arg.head}),
+            .suffix => try std.fmt.allocPrint(self.allocator, "Skills with suffix -{s}", .{token_arg.head}),
+        };
+        defer self.allocator.free(title);
+
+        const next_prefix = switch (kind) {
+            .prefix => try std.fmt.allocPrint(self.allocator, "/skills prefix {s}", .{token_arg.head}),
+            .suffix => try std.fmt.allocPrint(self.allocator, "/skills suffix {s}", .{token_arg.head}),
+        };
+        defer self.allocator.free(next_prefix);
+        const back_submit = if (kind == .prefix)
+            try self.allocator.dupe(u8, "/skills prefixes")
+        else
+            try self.allocator.dupe(u8, "/skills suffixes");
+        defer self.allocator.free(back_submit);
+
+        return try formatSkillRefListPage(
+            self,
+            title,
+            filtered,
+            parseSkillMenuPageIndex(token_arg.tail),
+            next_prefix,
+            back_submit,
+        );
+    }
+
+    return try formatSkillBrowserRoot(self, skills);
+}
+
+fn formatSkillActivatedReply(
+    self: anytype,
+    skill: *const skills_mod.Skill,
+    interactive: bool,
+) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+
+    try writer.print("Active skill set to `{s}` ({s}).\n", .{
+        skill.name,
+        activeSkillModeLabel(interactive),
+    });
+    if (skill.path.len > 0) {
+        try writer.print("Skill directory: {s}\n", .{skill.path});
+    }
+    try writer.writeAll("Send your next message to continue in this skill. Use /skill clear to leave it.");
+    try appendSkillActionChoices(self, writer, true);
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillInactiveReply(self: anytype, text: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+
+    try writer.writeAll(text);
+    try appendSkillActionChoices(self, writer, false);
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillUnknownReply(self: anytype, name: []const u8) ![]const u8 {
+    const text = try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{name});
+    defer self.allocator.free(text);
+    return try formatSkillInactiveReply(self, text);
+}
+
+fn formatSkillAmbiguousReply(self: anytype, name: []const u8) ![]const u8 {
+    const text = try formatAmbiguousSkillName(self, name);
+    defer self.allocator.free(text);
+    return try formatSkillInactiveReply(self, text);
+}
+
+fn formatActiveSkillStatus(self: anytype) ![]const u8 {
+    if (!@hasField(@TypeOf(self.*), "active_skill_name") or self.active_skill_name == null) {
+        return try formatSkillInactiveReply(self, "No active skill session. Use /skills to browse or /skill <name> to activate one.");
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    const writer = out.writer(self.allocator);
+
+    try writer.print("Active skill: {s}\n", .{self.active_skill_name.?});
+    try writer.print("Mode: {s}\n", .{activeSkillModeLabel(self.active_skill_interactive)});
+    if (self.active_skill_description) |value| {
+        if (value.len > 0) try writer.print("Description: {s}\n", .{value});
+    }
+    if (self.active_skill_path) |value| {
+        if (value.len > 0) try writer.print("Skill directory: {s}\n", .{value});
+    }
+    if (@hasField(@TypeOf(self.*), "conversation_context")) {
+        if (self.conversation_context) |ctx| {
+            if (ctx.channel) |value| try writer.print("Channel: {s}\n", .{value});
+            if (ctx.account_id) |value| try writer.print("Account: {s}\n", .{value});
+            if (ctx.peer_id) |value| try writer.print("Peer: {s}\n", .{value});
+        }
+    }
+    try writer.writeAll("Use /skill clear to leave this skill session.");
+    try appendSkillActionChoices(self, writer, true);
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn executeSkillInvocation(
+    self: anytype,
+    skill: *const skills_mod.Skill,
+    user_input: []const u8,
+    interactive: bool,
+) ![]const u8 {
     if (!skill.available) {
         return try std.fmt.allocPrint(
             self.allocator,
@@ -1499,18 +2503,7 @@ fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_in
         );
     }
 
-    const composed = if (skill.instructions.len > 0)
-        try std.fmt.allocPrint(
-            self.allocator,
-            "Apply the skill `{s}`.\n\nSkill instructions:\n{s}\n\nTask:\n{s}",
-            .{ skill.name, skill.instructions, user_input },
-        )
-    else
-        try std.fmt.allocPrint(
-            self.allocator,
-            "Apply the skill `{s}`.\n\nTask:\n{s}",
-            .{ skill.name, user_input },
-        );
+    const composed = try buildSkillInvocationPrompt(self, skill, user_input, interactive);
     defer self.allocator.free(composed);
 
     if (findSubagentManager(self) != null) {
@@ -1565,7 +2558,7 @@ fn tryHandleDirectSkillCommand(self: anytype, cmd: SlashCommand) !?[]const u8 {
     }
 
     if (resolved) |match| {
-        return try executeSkillInvocation(self, match.skill, match.user_input);
+        return try executeSkillInvocation(self, match.skill, match.user_input, false);
     }
     return null;
 }
@@ -1784,6 +2777,7 @@ fn findShellTool(self: anytype) ?Tool {
 fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
+    clearActiveSkillSession(self);
     if (@hasField(@TypeOf(self.*), "total_tokens")) {
         self.total_tokens = 0;
     }
@@ -1984,12 +2978,21 @@ fn formatStatus(self: anytype) ![]const u8 {
     const send_label = if (show_emojis) "📤 Send" else "Send";
     const ttl_label = if (show_emojis) "⏰ Session TTL" else "Session TTL";
     const tasks_label = if (show_emojis) "🧵 Tasks" else "Tasks";
+    const skill_label = if (show_emojis) "🪄 Skill" else "Skill";
 
     try w.print("{s}NullClaw {s}\n", .{ title_prefix, version.string });
     if (@hasField(@TypeOf(self.*), "profile_name")) {
         try w.print("Agent profile: {s}\n", .{self.profile_name orelse "default"});
     }
     try w.print("{s}: {s}\n", .{ model_label, self.model_name });
+    if (@hasField(@TypeOf(self.*), "active_skill_name") and self.active_skill_name != null) {
+        try w.print(
+            "{s}: {s} ({s})\n",
+            .{ skill_label, self.active_skill_name.?, activeSkillModeLabel(self.active_skill_interactive) },
+        );
+    } else {
+        try w.print("{s}: off\n", .{skill_label});
+    }
     try w.print("{s}: {d} messages\n", .{ history_label, self.history.items.len });
     try w.print("{s}: {d}\n", .{ tokens_label, self.total_tokens });
     try w.print("{s}: {d} available\n", .{ tools_label, self.tools.len });
@@ -3613,13 +4616,36 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
     );
 }
 
-fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
+fn handleSkillCommand(self: anytype, command_name: []const u8, arg: []const u8) ![]const u8 {
     const parsed = splitFirstToken(arg);
     const action_or_name = parsed.head;
+    const interactive_session = std.ascii.eqlIgnoreCase(command_name, "iskill");
+
+    if (std.ascii.eqlIgnoreCase(command_name, "skills")) {
+        const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
+        };
+        defer skills_mod.freeSkills(self.allocator, skills);
+        return try formatSkillList(self, skills, arg);
+    }
 
     if (std.ascii.eqlIgnoreCase(action_or_name, "reload") or std.ascii.eqlIgnoreCase(action_or_name, "refresh")) {
         if (std.mem.trim(u8, parsed.tail, " \t").len > 0) {
             return try self.allocator.dupe(u8, "Usage: /skill reload");
+        }
+        if (@hasField(@TypeOf(self.*), "active_skill_name")) {
+            if (self.active_skill_name) |active_name| {
+                const interactive = self.active_skill_interactive;
+                const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch |err| {
+                    return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
+                };
+                defer skills_mod.freeSkills(self.allocator, skills);
+
+                switch (findSkillByNameNormalized(skills, active_name)) {
+                    .unique => |skill| try setActiveSkillSession(self, skill, interactive),
+                    else => clearActiveSkillSession(self),
+                }
+            }
         }
         invalidateSystemPromptCache(self);
         return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
@@ -3631,26 +4657,34 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
     defer skills_mod.freeSkills(self.allocator, skills);
 
     if (action_or_name.len == 0 or std.ascii.eqlIgnoreCase(action_or_name, "list")) {
-        if (skills.len == 0) {
-            return try self.allocator.dupe(u8, "No skills found in workspace.");
+        return try formatSkillList(self, skills, parsed.tail);
+    }
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "status")) {
+        return try formatActiveSkillStatus(self);
+    }
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "clear") or std.ascii.eqlIgnoreCase(action_or_name, "off")) {
+        if (!@hasField(@TypeOf(self.*), "active_skill_name") or self.active_skill_name == null) {
+            return try formatSkillInactiveReply(self, "No active skill session.");
         }
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
-        try w.writeAll("Available skills:\n");
-        for (skills) |skill| {
-            try w.print("  - {s}", .{skill.name});
-            if (skill.description.len > 0) try w.print(": {s}", .{skill.description});
-            if (!skill.available) try w.print(" (unavailable: {s})", .{skill.missing_deps});
-            try w.writeAll("\n");
-        }
-        return try out.toOwnedSlice(self.allocator);
+        clearActiveSkillSession(self);
+        invalidateSystemPromptCache(self);
+        return try formatSkillInactiveReply(self, "Active skill session cleared.");
     }
 
     switch (findSkillByNameNormalized(skills, action_or_name)) {
-        .unique => |skill| return try executeSkillInvocation(self, skill, std.mem.trim(u8, parsed.tail, " \t")),
-        .ambiguous => return try formatAmbiguousSkillName(self, action_or_name),
-        .not_found => return try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{action_or_name}),
+        .unique => |skill| {
+            const remaining = std.mem.trim(u8, parsed.tail, " \t");
+            if (remaining.len == 0) {
+                try setActiveSkillSession(self, skill, interactive_session);
+                invalidateSystemPromptCache(self);
+                return try formatSkillActivatedReply(self, skill, interactive_session);
+            }
+            return try executeSkillInvocation(self, skill, remaining, interactive_session);
+        },
+        .ambiguous => return try formatSkillAmbiguousReply(self, action_or_name),
+        .not_found => return try formatSkillUnknownReply(self, action_or_name),
     }
 }
 
@@ -3883,7 +4917,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .elevated => return try handleElevatedCommand(self, cmd.arg),
         .bash => return try handleBashCommand(self, cmd.arg),
         .poll => return try handlePollCommand(self),
-        .skill => return try handleSkillCommand(self, cmd.arg),
+        .skill => return try handleSkillCommand(self, cmd.name, cmd.arg),
         .doctor => return try handleDoctorCommand(self),
         .memory => return try handleMemoryCommand(self, cmd.arg),
         .unknown => {

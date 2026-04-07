@@ -70,6 +70,9 @@ pub const ChannelMessage = struct {
     first_name: ?[]const u8 = null,
     /// Whether the message came from a group chat.
     is_group: bool = false,
+    /// True when the inbound event originated from an interaction callback
+    /// (for example, a Telegram inline keyboard button press).
+    is_interaction_callback: bool = false,
     /// Sender UUID (Signal-specific: when user has privacy mode enabled).
     sender_uuid: ?[]const u8 = null,
     /// Group ID (Signal-specific: for group chats).

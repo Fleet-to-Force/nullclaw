@@ -168,7 +168,8 @@ fn logAgentProcessingError(
 
 fn defaultAgentErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        error.CurlTimeout => "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
         error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
         error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
         error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -719,6 +720,71 @@ fn sendTelegramStartGreeting(
     tg_ptr.sendMessageWithReply(sender, greeting, reply_to_id) catch |err| {
         log.err("failed to send /start reply: {}", .{err});
     };
+}
+
+fn handleTelegramInteractiveCallback(
+    allocator: std.mem.Allocator,
+    runtime: *ChannelRuntime,
+    tg_ptr: *telegram.TelegramChannel,
+    session_key: []const u8,
+    content: []const u8,
+    sender: []const u8,
+    message_id: i64,
+    is_group: bool,
+    message_sender_id: []const u8,
+) bool {
+    const conversation_context = buildConversationContext(.{
+        .channel = "telegram",
+        .account_id = tg_ptr.account_id,
+        .peer_id = sender,
+        .is_group = is_group,
+        .group_id = if (is_group) sender else null,
+    });
+
+    var response_owned = false;
+    const response = blk: {
+        if (control_plane.parseSlashCommand(content) != null) {
+            const maybe_local = runtime.session_mgr.handleLocalSlashCommand(session_key, content, conversation_context) catch |err| {
+                log.err("failed to handle telegram callback slash command locally: {}", .{err});
+                response_owned = true;
+                break :blk allocator.dupe(u8, "Failed to update interactive menu.") catch return true;
+            };
+            if (maybe_local) |reply| {
+                response_owned = true;
+                break :blk reply;
+            }
+            return false;
+        }
+
+        const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+            log.err("failed to process telegram callback interaction: {}", .{err});
+            const err_msg = switch (err) {
+                error.CurlTimeout => "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
+                error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+                error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+                error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
+                error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+                error.OutOfMemory => "Out of memory.",
+                else => "An error occurred. Try again or /new for a fresh session.",
+            };
+            response_owned = true;
+            break :blk allocator.dupe(u8, err_msg) catch return true;
+        };
+        response_owned = true;
+        break :blk model_reply;
+    };
+    defer if (response_owned) allocator.free(response);
+
+    if (shouldSuppressGroupReply(is_group, response)) return true;
+
+    tg_ptr.editAssistantMessage(sender, message_sender_id, is_group, message_id, response) catch |err| {
+        log.warn("failed to edit telegram callback response in place: {}", .{err});
+        tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, response, message_id) catch |send_err| {
+            log.err("failed to send telegram callback fallback reply: {}", .{send_err});
+        };
+        return true;
+    };
+    return true;
 }
 
 fn handleTelegramBuiltinCommand(
@@ -1420,6 +1486,38 @@ pub fn runTelegramLoop(
             // Reply-to logic
             const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
+
+            if (msg.is_interaction_callback and msg.message_id != null) {
+                const session_key = resolveTelegramSessionKey(
+                    allocator,
+                    &runtime.session_mgr,
+                    config,
+                    tg_ptr.account_id,
+                    msg.sender,
+                    msg.is_group,
+                ) catch |err| {
+                    log.err("failed to resolve telegram session key for interactive skill menu: {}", .{err});
+                    tg_ptr.sendMessageWithReply(msg.sender, "Failed to resolve session for this skill menu.", reply_to_id) catch |send_err| {
+                        log.err("failed to send telegram skill-menu session error reply: {}", .{send_err});
+                    };
+                    continue;
+                };
+                defer allocator.free(session_key);
+
+                if (handleTelegramInteractiveCallback(
+                    allocator,
+                    runtime,
+                    tg_ptr,
+                    session_key,
+                    msg.content,
+                    msg.sender,
+                    msg.message_id.?,
+                    msg.is_group,
+                    msg.id,
+                )) {
+                    continue;
+                }
+            }
 
             if (handleTelegramBuiltinCommand(
                 allocator,

@@ -129,6 +129,33 @@ pub const Client = struct {
         self.allocator.free(resp);
     }
 
+    pub fn editMessageText(
+        self: Client,
+        chat_id: []const u8,
+        message_id: i64,
+        text: []const u8,
+        reply_markup_json: ?[]const u8,
+    ) !void {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+
+        try body.appendSlice(self.allocator, "{\"chat_id\":");
+        try body.appendSlice(self.allocator, chat_id);
+
+        var msg_id_buf: [32]u8 = undefined;
+        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+        try body.appendSlice(self.allocator, ",\"message_id\":");
+        try body.appendSlice(self.allocator, msg_id_str);
+        try body.appendSlice(self.allocator, ",\"text\":");
+        try root.json_util.appendJsonString(&body, self.allocator, text);
+        try appendRawReplyMarkup(&body, self.allocator, reply_markup_json);
+        try body.appendSlice(self.allocator, "}");
+
+        const resp = try self.post(self.allocator, "editMessageText", body.items, "10");
+        defer self.allocator.free(resp);
+        if (responseHasTelegramError(resp)) return error.TelegramApiError;
+    }
+
     pub fn setMessageReaction(self: Client, chat_id: []const u8, message_id: i64, emoji: ?[]const u8) !void {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(self.allocator);

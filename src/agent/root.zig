@@ -343,6 +343,16 @@ pub const Agent = struct {
     interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Conversation context for the current turn.
     conversation_context: ?prompt.ConversationContext = null,
+    /// Session-scoped active skill applied to subsequent user messages until cleared.
+    active_skill_name: ?[]const u8 = null,
+    active_skill_name_owned: bool = false,
+    active_skill_description: ?[]const u8 = null,
+    active_skill_description_owned: bool = false,
+    active_skill_instructions: ?[]const u8 = null,
+    active_skill_instructions_owned: bool = false,
+    active_skill_path: ?[]const u8 = null,
+    active_skill_path_owned: bool = false,
+    active_skill_interactive: bool = false,
 
     /// Conversation history — owned, growable list.
     history: std.ArrayListUnmanaged(OwnedMessage) = .empty,
@@ -526,6 +536,10 @@ pub const Agent = struct {
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
         if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
         if (self.dock_target_owned and self.dock_target != null) self.allocator.free(self.dock_target.?);
+        if (self.active_skill_name_owned and self.active_skill_name != null) self.allocator.free(self.active_skill_name.?);
+        if (self.active_skill_description_owned and self.active_skill_description != null) self.allocator.free(self.active_skill_description.?);
+        if (self.active_skill_instructions_owned and self.active_skill_instructions != null) self.allocator.free(self.active_skill_instructions.?);
+        if (self.active_skill_path_owned and self.active_skill_path != null) self.allocator.free(self.active_skill_path.?);
         self.tool_state_mu.lock();
         if (self.active_tool_name) |name| self.allocator.free(name);
         self.active_tool_name = null;
@@ -1681,21 +1695,38 @@ pub const Agent = struct {
                 .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
                 .observer = self.observer,
             });
-            const final_system = if (self.profile_system_prompt) |profile_prompt|
-                if (profile_prompt.len > 0) blk: {
-                    defer self.allocator.free(full_system);
-                    break :blk try std.fmt.allocPrint(
-                        self.allocator,
-                        "## Agent Profile\n\nProfile: {s}\n\n{s}\n\n{s}",
+            const active_skill_section = try commands.buildActiveSkillPromptSection(self);
+            defer if (active_skill_section) |section| self.allocator.free(section);
+
+            const final_system = blk: {
+                const has_profile_prompt = self.profile_system_prompt != null and self.profile_system_prompt.?.len > 0;
+                if (!has_profile_prompt and active_skill_section == null) break :blk full_system;
+
+                defer self.allocator.free(full_system);
+
+                var composed: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer composed.deinit(self.allocator);
+                const w = composed.writer(self.allocator);
+
+                if (has_profile_prompt) {
+                    try w.print(
+                        "## Agent Profile\n\nProfile: {s}\n\n{s}",
                         .{
                             self.profile_name orelse "custom",
-                            profile_prompt,
-                            full_system,
+                            self.profile_system_prompt.?,
                         },
                     );
-                } else full_system
-            else
-                full_system;
+                }
+
+                if (active_skill_section) |section| {
+                    if (composed.items.len > 0) try w.writeAll("\n\n");
+                    try w.writeAll(section);
+                }
+
+                if (composed.items.len > 0) try w.writeAll("\n\n");
+                try w.writeAll(full_system);
+                break :blk try composed.toOwnedSlice(self.allocator);
+            };
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
@@ -6658,6 +6689,7 @@ test "slash additional commands are handled" {
         "/subagents",
         "/config reload",
         "/config get model",
+        "/skills",
         "/skill reload",
         "/skill list",
     };
@@ -6936,6 +6968,248 @@ test "direct slash skill command reports ambiguity between exact and composite m
     defer allocator.free(response);
 
     try std.testing.expect(std.mem.indexOf(u8, response, "Ambiguous skill name") != null);
+}
+
+test "slash /skill activates session skill and /skill clear removes it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/news-digest");
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+
+    const activate = (try agent.handleSlashCommand("/skill news-digest")).?;
+    defer allocator.free(activate);
+    try std.testing.expect(std.mem.indexOf(u8, activate, "Active skill set to `news-digest`") != null);
+    try std.testing.expectEqualStrings("news-digest", agent.active_skill_name.?);
+    try std.testing.expect(!agent.active_skill_interactive);
+
+    const status = (try agent.handleSlashCommand("/skill status")).?;
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Active skill: news-digest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Mode: non-interactive") != null);
+
+    const clear = (try agent.handleSlashCommand("/skill clear")).?;
+    defer allocator.free(clear);
+    try std.testing.expect(std.mem.indexOf(u8, clear, "cleared") != null);
+    try std.testing.expect(agent.active_skill_name == null);
+}
+
+test "slash /skills renders telegram choice buttons" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/news-digest");
+    try tmp.dir.makePath("skills/commit");
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+    {
+        const f = try tmp.dir.createFile("skills/commit/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "commit",
+            \\  "description": "Write commit message",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/commit/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Create a commit message.");
+    }
+    try tmp.dir.makePath("skills/gv-homework-util");
+    {
+        const f = try tmp.dir.createFile("skills/gv-homework-util/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "gv-homework-util",
+            \\  "description": "Homework helper",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/gv-homework-util/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Help with homework.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+    agent.conversation_context = .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer_id = "-100123:thread:7",
+        .group_id = "-100123",
+        .is_group = true,
+    };
+
+    const response = (try agent.handleSlashCommand("/skills")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Skill browser: 3 available") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "<nc_choices>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "\"columns\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/skills letters a-f") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "/skills prefixes") != null);
+}
+
+test "slash /skills exposes letter and prefix browsers for hyphenated skills" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/gv-homework-util");
+    try tmp.dir.makePath("skills/mb3-critic");
+    {
+        const f = try tmp.dir.createFile("skills/gv-homework-util/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "gv-homework-util",
+            \\  "description": "Homework helper",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/gv-homework-util/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Help with homework.");
+    }
+    {
+        const f = try tmp.dir.createFile("skills/mb3-critic/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "mb3-critic",
+            \\  "description": "Critic skill",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/mb3-critic/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Critique plans.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+    agent.conversation_context = .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer_id = "-100123:thread:7",
+        .group_id = "-100123",
+        .is_group = true,
+    };
+
+    const letters = (try agent.handleSlashCommand("/skills letters g-l")).?;
+    defer allocator.free(letters);
+    try std.testing.expect(std.mem.indexOf(u8, letters, "/skills letter g") != null);
+    try std.testing.expect(std.mem.indexOf(u8, letters, "/skills letter h") != null);
+
+    const prefixes = (try agent.handleSlashCommand("/skills prefixes")).?;
+    defer allocator.free(prefixes);
+    try std.testing.expect(std.mem.indexOf(u8, prefixes, "/skills prefix gv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prefixes, "/skills prefix mb3") != null);
+}
+
+test "active skill session is injected into system prompt" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("skills/news-digest");
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        defer f.close();
+        try f.writeAll(
+            \\{
+            \\  "name": "news-digest",
+            \\  "description": "Build a digest",
+            \\  "version": "1.0.0",
+            \\  "author": "test"
+            \\}
+        );
+    }
+    {
+        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        defer f.close();
+        try f.writeAll("Collect news and format digest.");
+    }
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(agent.workspace_dir);
+    agent.conversation_context = .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer_id = "-100123:thread:7",
+        .group_id = "-100123",
+        .is_group = true,
+    };
+
+    const activate = (try agent.handleSlashCommand("/iskill news-digest")).?;
+    defer allocator.free(activate);
+
+    const reply = try agent.turn("Collect today's AI news");
+    defer allocator.free(reply);
+    try std.testing.expectEqual(@as(usize, 3), agent.history.items.len);
+    try std.testing.expectEqual(providers.Role.system, agent.history.items[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "## Active Skill Session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Skill: news-digest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Interaction mode: interactive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Peer ID: -100123:thread:7") != null);
 }
 
 test "slash /skill reload invalidates prompt caches" {

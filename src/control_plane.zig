@@ -43,11 +43,14 @@ pub const HELP_TEXT =
     \\Tasks and agents:
     \\  /subagents, /tasks, /agents, /poll, /focus, /unfocus, /kill, /steer, /tell
     \\  /bind <agent|clear|status>
+    \\  /skills
+    \\  /skill <list|reload|status|clear|name [task]>
+    \\  /iskill <name>
     \\
     \\Access and integrations:
     \\  /allowlist, /approve, /context
     \\  /dock-telegram, /dock-discord, /dock-slack
-    \\  /activation, /send, /elevated, /bash, /skill
+    \\  /activation, /send, /elevated, /bash
     \\
     \\Telegram forums (if enabled):
     \\  /topic <name>, /topics, /topic-map
@@ -183,7 +186,9 @@ test "telegram bot command payload includes grouped menu commands" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"menu\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"allowlist\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"memory\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"skills\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"skill\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"iskill\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"doctor\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"tasks\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"command\":\"bind\"") != null);
