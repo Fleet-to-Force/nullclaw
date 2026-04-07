@@ -518,6 +518,78 @@ pub const LarkChannel = struct {
         return error.LarkApiError;
     }
 
+    fn deinitTypingPlaceholders(self: *LarkChannel) void {
+        self.typing_mutex.lock();
+        var placeholders = self.typing_placeholders;
+        self.typing_placeholders = .empty;
+        self.typing_mutex.unlock();
+
+        var it = placeholders.iterator();
+        while (it.next()) |entry| {
+            self.deleteTrackedMessage(entry.value_ptr.*) catch {};
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        placeholders.deinit(self.allocator);
+    }
+
+    fn buildMessageCollectionUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
+        return fbs.getWritten();
+    }
+
+    fn buildMessageItemUrl(self: *const LarkChannel, buf: []u8, message_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().print("{s}/im/v1/messages/{s}", .{ self.apiBase(), message_id });
+        return fbs.getWritten();
+    }
+
+    fn buildTextContent(text: []const u8, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().writeAll("{\"text\":");
+        try root.appendJsonStringW(fbs.writer(), text);
+        try fbs.writer().writeAll("}");
+        return fbs.getWritten();
+    }
+
+    fn buildTextMessageBody(recipient: []const u8, text: []const u8, buf: []u8) ![]const u8 {
+        var content_buf: [4096]u8 = undefined;
+        const content = try buildTextContent(text, &content_buf);
+
+        var body_fbs = std.io.fixedBufferStream(buf);
+        const w = body_fbs.writer();
+        try w.writeAll("{\"receive_id\":\"");
+        try w.writeAll(recipient);
+        try w.writeAll("\",\"msg_type\":\"text\",\"content\":");
+        try root.appendJsonStringW(w, content);
+        try w.writeAll("}");
+        return body_fbs.getWritten();
+    }
+
+    fn parseMessageId(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.LarkApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.LarkApiError;
+        const data_val = parsed.value.object.get("data") orelse return error.LarkApiError;
+        if (data_val != .object) return error.LarkApiError;
+        const message_id_val = data_val.object.get("message_id") orelse return error.LarkApiError;
+        if (message_id_val != .string or message_id_val.string.len == 0) return error.LarkApiError;
+        return allocator.dupe(u8, message_id_val.string);
+    }
+
+    fn dupeResponseBodyAndFree(allocator: std.mem.Allocator, stdout: []u8, resp_body: []const u8) ![]u8 {
+        defer allocator.free(stdout);
+        return allocator.dupe(u8, resp_body);
+    }
+
+    fn maybePauseBeforeTypingSend(self: *LarkChannel) void {
+        if (!builtin.is_test) return;
+        if (self.test_typing_hook) |hook| {
+            hook.maybePause();
+        }
+    }
+
     fn extractCardActionOpenId(event: std.json.Value) ?[]const u8 {
         if (event != .object) return null;
 
@@ -1694,6 +1766,16 @@ pub const LarkChannel = struct {
     fn vtableDeleteMessage(ptr: *anyopaque, message_ref: root.Channel.MessageRef) anyerror!void {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
         try self.deleteTrackedMessage(message_ref);
+    }
+
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        try self.startTypingPlaceholder(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        try self.clearTypingPlaceholder(recipient);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -3204,6 +3286,102 @@ test "lark buildWebsocketPong handles unicode timestamp" {
     var pong_buf: [128]u8 = undefined;
     const pong = try LarkChannel.buildWebsocketPong(&pong_buf, "1234567890");
     try std.testing.expectEqualStrings("{\"type\":\"pong\",\"ts\":\"1234567890\"}", pong);
+}
+
+test "lark parseMessageId extracts message id from send response" {
+    const message_id = try LarkChannel.parseMessageId(
+        std.testing.allocator,
+        "{\"code\":0,\"msg\":\"success\",\"data\":{\"message_id\":\"om_test_123\"}}",
+    );
+    defer std.testing.allocator.free(message_id);
+    try std.testing.expectEqualStrings("om_test_123", message_id);
+}
+
+test "lark dupeResponseBodyAndFree releases temporary curl output on success" {
+    const allocator = std.testing.allocator;
+    const stdout = try allocator.dupe(u8, "{\"code\":0,\"msg\":\"success\"}\n200");
+    const nl = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse unreachable;
+
+    // Regression: requestWithBearerRetry must free curl stdout after duplicating
+    // the response body for callers.
+    const body = try LarkChannel.dupeResponseBodyAndFree(allocator, stdout, stdout[0..nl]);
+    defer allocator.free(body);
+
+    try std.testing.expectEqualStrings("{\"code\":0,\"msg\":\"success\"}", body);
+}
+
+test "lark typing placeholder start and stop are best-effort in tests" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    defer ch.deinitTypingPlaceholders();
+
+    try ch.startTypingPlaceholder("oc_chat_1");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    try ch.clearTypingPlaceholder("oc_chat_1");
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+}
+
+test "lark sendMessage clears typing placeholder before final send" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    defer ch.deinitTypingPlaceholders();
+
+    // Regression: Lark should show immediate processing feedback and clear it
+    // when the final reply is sent.
+    try ch.startTypingPlaceholder("oc_chat_2");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    try ch.sendMessage("oc_chat_2", "final reply");
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+}
+
+test "lark stop deletes active typing placeholders in tests" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    // Regression: stopping the channel must delete visible placeholder messages,
+    // not just free the local tracking map.
+    try ch.startTypingPlaceholder("oc_chat_3");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    ch.channel().stop();
+
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+    try std.testing.expectEqual(@as(usize, 1), ch.test_deleted_message_count);
+}
+
+test "lark typing placeholder deletes duplicate send after race" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    defer ch.deinitTypingPlaceholders();
+
+    var hook = LarkChannel.TypingPlaceholderTestHook{};
+    ch.test_typing_hook = &hook;
+
+    const ThreadCtx = struct {
+        channel: *LarkChannel,
+
+        fn run(ctx: *@This()) void {
+            ctx.channel.startTypingPlaceholder("oc_chat_4") catch unreachable;
+        }
+    };
+
+    var ctx = ThreadCtx{ .channel = &ch };
+    const worker = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx});
+    hook.waitUntilPaused();
+
+    try ch.startTypingPlaceholder("oc_chat_4");
+    hook.releaseWaiters();
+    worker.join();
+
+    try std.testing.expectEqual(@as(u64, 2), ch.test_message_seq);
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+    try std.testing.expectEqual(@as(usize, 1), ch.test_deleted_message_count);
 }
 
 test "lark parseEventPayload handles websocket message format" {
