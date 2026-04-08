@@ -37,10 +37,10 @@ NullClaw follows secure-by-default behavior: local bind by default, pairing auth
 
 ## Channel Allowlists
 
-- Most channels: `allow_from: []`: deny all inbound messages.
+- `allow_from` behavior is channel-specific; do not assume `[]` is a deny-by-default switch across every runtime.
+- Some channels, including WeChat and Discord, treat an omitted or empty `allow_from` as "no filtering", so set explicit user IDs/OpenIDs when you want a private bot.
 - `allow_from: ["*"]`: allow all sources (high-risk).
-- Otherwise: exact-match allowlist.
-- Discord currently differs: an omitted or empty `allow_from` disables filtering, so set explicit user IDs in `channels.discord.accounts.*.allow_from` when you want a private bot.
+- Otherwise: expect exact-match allowlists or channel-specific fallback/group-policy behavior.
 
 ## Pairing and Webhook Auth Boundaries
 

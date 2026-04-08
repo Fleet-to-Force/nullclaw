@@ -136,7 +136,7 @@ nullclaw onboard --interactive
 Check:
 
 - `channels.<name>.accounts.*` token/webhook/account settings.
-- `allow_from` accidentally set to empty array.
+- Channel-specific allowlist or gating mismatch (`allow_from`, `group_allow_from`, `require_mention`, and similar settings). Empty `allow_from` is not a universal deny switch.
 - `nullclaw channel status` health output.
 - For DingTalk-specific stream and reply-target checks, open
   [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md).

@@ -122,7 +122,7 @@ nullclaw onboard --interactive
 重点检查：
 
 - `channels.<name>.accounts.*` 的 token / webhook / account 字段是否正确。
-- `allow_from` 是否误设为空数组。
+- 是否存在渠道级 allowlist / gating 配置不匹配（如 `allow_from`、`group_allow_from`、`require_mention` 等）。空 `allow_from` 不是通用的“拒绝所有”开关。
 - `nullclaw channel status` 是否有 unhealthy 标记。
 - 如果是 DingTalk，进一步看
   [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)。
