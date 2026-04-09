@@ -645,7 +645,7 @@ pub fn truncateForDisplay(allocator: std.mem.Allocator, s: []const u8, max_len: 
 /// Check sandbox availability.
 fn checkSandbox(allocator: std.mem.Allocator, cfg: *const Config, items: *std.ArrayList(DiagItem)) void {
     const cat = "sandbox";
-    const enabled = cfg.security.sandbox.enabled orelse false;
+    const enabled = cfg.sandboxEnabled();
 
     if (!enabled) {
         items.append(allocator, DiagItem.ok(cat, "sandbox: disabled")) catch {};

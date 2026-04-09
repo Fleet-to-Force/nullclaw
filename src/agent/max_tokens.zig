@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const config_types = @import("../config_types.zig");
+const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 
 pub const DEFAULT_MODEL_MAX_TOKENS: u32 = config_types.DEFAULT_MODEL_MAX_TOKENS;
@@ -124,16 +125,6 @@ fn lookupProviderMaxTokens(key: []const u8) ?u32 {
     return null;
 }
 
-fn splitProviderModel(model_ref: []const u8) struct { provider: ?[]const u8, model: []const u8 } {
-    const slash = std.mem.indexOfScalar(u8, model_ref, '/') orelse {
-        return .{ .provider = null, .model = model_ref };
-    };
-    return .{
-        .provider = model_ref[0..slash],
-        .model = model_ref[slash + 1 ..],
-    };
-}
-
 fn inferFromModelPattern(model_id: []const u8) ?u32 {
     if (startsWithIgnoreCase(model_id, "gpt-4-32k")) return 4_096;
 
@@ -185,7 +176,10 @@ pub fn lookupModelMaxTokens(model_ref_raw: []const u8) ?u32 {
     if (lookupModelCandidates(model_ref)) |n| return n;
     if (lookupProviderMaxTokens(model_ref)) |n| return n;
 
-    const split = splitProviderModel(model_ref);
+    const split = model_refs.splitProviderModel(model_ref) orelse model_refs.ProviderModelRef{
+        .provider = null,
+        .model = model_ref,
+    };
     if (lookupModelCandidates(split.model)) |n| return n;
 
     // Support nested refs like openrouter/anthropic/claude-sonnet-4.6.
@@ -223,6 +217,20 @@ test "lookupModelMaxTokens resolves model and nested provider refs" {
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openai/gpt-4-turbo"));
     try std.testing.expectEqual(@as(?u32, 8192), lookupModelMaxTokens("openrouter/anthropic/claude-sonnet-4.6"));
     try std.testing.expectEqual(@as(?u32, 32_768), lookupModelMaxTokens("qianfan/custom-model"));
+}
+
+test "lookupModelMaxTokens handles custom url refs with nested provider budgets" {
+    try std.testing.expectEqual(
+        @as(?u32, 32_768),
+        lookupModelMaxTokens("custom:https://api.example.com/openai/v2/qianfan/custom-model"),
+    );
+}
+
+test "lookupModelMaxTokens handles versionless custom url refs with nested provider budgets" {
+    try std.testing.expectEqual(
+        @as(?u32, 32_768),
+        lookupModelMaxTokens("custom:https://gateway.example.com/qianfan/custom-model"),
+    );
 }
 
 test "lookupModelMaxTokens keeps legacy and turbo gpt-4 variants distinct" {

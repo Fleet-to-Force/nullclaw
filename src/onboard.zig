@@ -11,8 +11,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
-const platform = @import("platform.zig");
 const codex_support = @import("codex_support.zig");
 const config_mod = @import("config.zig");
 const net_security = @import("net_security.zig");
@@ -155,26 +155,12 @@ fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
     return null;
 }
 
-fn hasVersionedApiSegment(url: []const u8) bool {
-    const proto_start = std.mem.indexOf(u8, url, "://") orelse return false;
-    var i: usize = proto_start + 3;
-    while (i + 2 < url.len) : (i += 1) {
-        if (url[i] != '/' or url[i + 1] != 'v') continue;
-        var j = i + 2;
-        var has_digit = false;
-        while (j < url.len and std.ascii.isDigit(url[j])) : (j += 1) {
-            has_digit = true;
-        }
-        if (!has_digit) continue;
-        if (j == url.len or (j < url.len and url[j] == '/')) return true;
-    }
-    return false;
-}
-
 fn isValidCustomProviderUrl(url: []const u8) bool {
     if (url.len == 0) return false;
-    if (!(std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://"))) return false;
-    return hasVersionedApiSegment(url);
+    // We allow any http/https URL. While OpenAI-compatible endpoints usually
+    // contain /v1, some gateways (like Bifrost or custom proxies) might not
+    // expose it in the base URL or use a different structure.
+    return std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://");
 }
 
 fn isLocalEndpoint(url: []const u8) bool {
@@ -491,7 +477,7 @@ fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8) ![][]c
 
 /// Fetch available model IDs for a provider (with caching, limit, and fallback).
 ///
-/// Uses file-based cache at `~/.nullclaw/state/models_cache.json` with 12h TTL.
+/// Uses file-based cache at `state/models_cache.json` inside the config directory with 12h TTL.
 /// Returns at most 20 model IDs. Caller ALWAYS owns the returned slice and strings.
 /// Free with: for (models) |m| allocator.free(m); allocator.free(models);
 pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8) ![][]const u8 {
@@ -500,11 +486,11 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
         return codex_support.loadCodexModels(allocator);
     }
 
-    const home = platform.getHomeDir(allocator) catch
+    const config_dir = config_paths.defaultConfigDir(allocator) catch
         return dupeFallbackModels(allocator, provider);
-    defer allocator.free(home);
+    defer allocator.free(config_dir);
 
-    const state_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "state" });
+    const state_dir = try std.fs.path.join(allocator, &.{ config_dir, "state" });
     defer allocator.free(state_dir);
 
     // Ensure state directory exists
@@ -2047,7 +2033,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     } else {
         try out.writeAll("  Step 2/8: Authentication\n");
         if (std.mem.eql(u8, cfg.default_provider, "openai-codex")) {
-            try out.writeAll("  -> Uses local OAuth tokens from ~/.nullclaw/auth.json or ~/.codex/auth.json\n\n");
+            try out.writeAll("  -> Uses local OAuth tokens from auth.json in your nullclaw config directory or ~/.codex/auth.json\n\n");
         } else if (std.mem.eql(u8, cfg.default_provider, "codex-cli")) {
             try out.writeAll("  -> Uses your local Codex CLI login (`codex login`)\n\n");
         } else if (std.mem.eql(u8, cfg.default_provider, "gemini-cli")) {
@@ -2303,7 +2289,7 @@ const catalog_providers = [_]ModelsCatalogProvider{
 };
 
 /// Refresh the model catalog by fetching available models from known providers.
-/// Saves results to ~/.nullclaw/models_cache.json.
+/// Saves results to models_cache.json in the config directory.
 pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
@@ -2312,16 +2298,15 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     try out.flush();
 
     // Build cache path
-    const home = platform.getHomeDir(allocator) catch {
-        try out.writeAll("Could not determine HOME directory.\n");
+    const config_dir = config_paths.defaultConfigDir(allocator) catch {
+        try out.writeAll("Could not determine config directory.\n");
         try out.flush();
         return;
     };
-    defer allocator.free(home);
-    const cache_path = try std.fs.path.join(allocator, &.{ home, ".nullclaw", "models_cache.json" });
+    defer allocator.free(config_dir);
+    const cache_path = try config_paths.pathFromConfigDir(allocator, config_dir, "models_cache.json");
     defer allocator.free(cache_path);
-    const cache_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
-    defer allocator.free(cache_dir);
+    const cache_dir = config_dir;
 
     // Ensure directory exists
     std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
@@ -3008,15 +2993,23 @@ pub fn defaultBackendKey() []const u8 {
 // ── Path helpers ─────────────────────────────────────────────────
 
 fn getDefaultWorkspace(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "workspace" });
+    const config_dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(config_dir);
+    return defaultWorkspaceFromConfigDir(allocator, config_dir);
 }
 
 fn getDefaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "config.json" });
+    const config_dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(config_dir);
+    return defaultConfigPathFromDir(allocator, config_dir);
+}
+
+fn defaultWorkspaceFromConfigDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
+    return std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+}
+
+fn defaultConfigPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
+    return config_paths.pathFromConfigDir(allocator, config_dir, "config.json");
 }
 
 // ── Tests ────────────────────────────────────────────────────────
@@ -3146,6 +3139,26 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.nostr));
     try std.testing.expect(isWizardInteractiveChannel(.max));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
+}
+
+test "defaultWorkspaceFromConfigDir appends workspace" {
+    const path = try defaultWorkspaceFromConfigDir(std.testing.allocator, "/tmp/nullclaw-home");
+    defer std.testing.allocator.free(path);
+
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "workspace" });
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
+}
+
+test "defaultConfigPathFromDir appends config.json" {
+    const path = try defaultConfigPathFromDir(std.testing.allocator, "/tmp/nullclaw-home");
+    defer std.testing.allocator.free(path);
+
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "config.json" });
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
 }
 
 test "parseWizardJsonConfig normalizes valid object payload" {
@@ -3732,9 +3745,13 @@ test "resolveProviderForQuickSetup supports custom: versioned endpoint beyond v1
     try std.testing.expectEqualStrings("custom:https://example.com/openai/v2", custom.key);
 }
 
+test "resolveProviderForQuickSetup supports non-versioned custom: prefix" {
+    const custom = resolveProviderForQuickSetup("custom:https://example.com/api") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/api", custom.key);
+}
+
 test "resolveProviderForQuickSetup rejects invalid custom endpoint format" {
     try std.testing.expect(resolveProviderForQuickSetup("custom:") == null);
-    try std.testing.expect(resolveProviderForQuickSetup("custom:https://example.com/api") == null);
     try std.testing.expect(resolveProviderForQuickSetup("custom:example.com/v1") == null);
 }
 

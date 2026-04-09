@@ -144,6 +144,22 @@ Add to `~/.nullclaw/config.json`:
 | `description` | `"AI assistant"` | Agent description |
 | `url` | `""` | Public URL (used in Agent Card and `supportedInterfaces`) |
 | `version` | `"1.0.0"` | Agent version string |
+| `multi_modal` | `false` | Advertise multi-modal capability in the Agent Card. Set to `true` when the configured model supports image inputs. The gateway probes the model at startup and sets this automatically; override manually if needed. |
+
+**Multi-modal support**
+
+When `multi_modal` is `true`, the Agent Card includes `"multi_modal": true` in its capabilities object, signalling to A2A clients that the agent accepts image attachments. Incoming A2A messages may include `inlineData` parts (base64-encoded images) alongside `text` parts; the gateway forwards them to the model as `[IMAGE: <mime_type>]` markers.
+
+To accept large image payloads, raise the gateway's HTTP body limit and socket read timeout in the `gateway` config block (see [configuration.md](./configuration.md) `gateway` section):
+
+```json
+{
+  "gateway": {
+    "max_body_size_bytes": 20971520,
+    "request_timeout_secs": 120
+  }
+}
+```
 
 ### Agent Card Discovery
 

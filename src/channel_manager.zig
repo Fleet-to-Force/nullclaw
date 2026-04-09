@@ -15,6 +15,7 @@ const channel_loop = @import("channel_loop.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
 const channels_mod = @import("channels/root.zig");
+const telegram = channels_mod.telegram;
 const mattermost = channels_mod.mattermost;
 const discord = channels_mod.discord;
 const dingtalk = channels_mod.dingtalk;
@@ -208,6 +209,11 @@ pub const ChannelManager = struct {
 
         const ch_ptr = try self.allocator.create(ChannelType);
         ch_ptr.* = ChannelType.initFromConfig(self.allocator, cfg);
+        if (comptime std.mem.eql(u8, field_name, "telegram")) {
+            ch_ptr.text_debounce_secs = telegram.TelegramChannel.textDebounceSecsFromMs(
+                self.config.messages.inbound.debounce_ms,
+            );
+        }
         self.maybeAttachBus(ch_ptr);
 
         const ch = ch_ptr.channel();

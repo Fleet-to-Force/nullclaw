@@ -3,8 +3,8 @@
 //! Mirrors ZeroClaw's axum-based gateway with:
 //!   - Sliding-window rate limiting (per-IP)
 //!   - Idempotency store (deduplicates webhook requests)
-//!   - Body size limits (64KB max)
-//!   - Request timeouts (30s)
+//!   - Body size limits (configurable, default 64KB)
+//!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
 //!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
@@ -43,7 +43,6 @@ const buildConversationContext = @import("agent/prompt.zig").buildConversationCo
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
 const MAX_HEADER_SIZE: usize = 8_192;
-const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -83,12 +82,14 @@ fn simpleConversationContext(
     channel: []const u8,
     account_id: ?[]const u8,
     peer_id: []const u8,
+    delivery_chat_id: ?[]const u8,
     is_group: bool,
     group_id: ?[]const u8,
 ) ?ConversationContext {
     return buildConversationContext(.{
         .channel = channel,
         .account_id = account_id,
+        .delivery_chat_id = delivery_chat_id,
         .peer_id = peer_id,
         .is_group = is_group,
         .group_id = if (is_group) (group_id orelse peer_id) else null,
@@ -173,6 +174,8 @@ const GatewayThreadObserver = struct {
         .record_metric = recordMetric,
         .flush = flush,
         .name = name,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
     };
 
     pub fn init(allocator: std.mem.Allocator) GatewayThreadObserver {
@@ -247,6 +250,10 @@ const GatewayThreadObserver = struct {
 
     fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
     fn flush(_: *anyopaque) void {}
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
     fn name(_: *anyopaque) []const u8 {
         return "gateway_thread";
     }
@@ -1723,6 +1730,7 @@ fn webhookRouting(
             .sender_id = sender_id,
             .sender_username = sender_username,
             .sender_display_name = sender_display_name,
+            .delivery_chat_id = bus_chat_id,
             .peer_id = peer_id,
             .is_group = if (peer_kind) |kind| kind != .direct else null,
             .group_id = if (peer_kind) |kind| if (kind == .direct) null else peer_id else null,
@@ -2135,7 +2143,18 @@ fn headerEndOffset(raw: []const u8) ?usize {
     return pos + separator.len;
 }
 
-fn expectedHttpRequestSize(raw: []const u8) !?usize {
+fn maxHttpRequestSize(max_body: usize) usize {
+    return std.math.add(usize, MAX_HEADER_SIZE, max_body) catch std.math.maxInt(usize);
+}
+
+fn effectiveRequestReadTimeoutSecs(config_opt: ?*const Config) u64 {
+    if (config_opt) |cfg| {
+        if (cfg.gateway.request_timeout_secs > 0) return cfg.gateway.request_timeout_secs;
+    }
+    return REQUEST_TIMEOUT_SECS;
+}
+
+fn expectedHttpRequestSize(raw: []const u8, max_body: usize) !?usize {
     const header_end = headerEndOffset(raw) orelse {
         if (raw.len > MAX_HEADER_SIZE) return error.RequestTooLarge;
         return null;
@@ -2148,18 +2167,21 @@ fn expectedHttpRequestSize(raw: []const u8) !?usize {
     if (trimmed.len == 0) return error.InvalidContentLength;
 
     const content_length = std.fmt.parseInt(usize, trimmed, 10) catch return error.InvalidContentLength;
-    if (content_length > MAX_BODY_SIZE) return error.RequestTooLarge;
+    if (content_length > max_body) return error.RequestTooLarge;
 
+    const max_request_size = maxHttpRequestSize(max_body);
     const total = std.math.add(usize, header_end, content_length) catch return error.RequestTooLarge;
-    if (total > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
+    if (total > max_request_size) return error.RequestTooLarge;
     return total;
 }
 
-fn configureRequestReadTimeout(stream: *std.net.Stream) void {
+fn configureRequestReadTimeout(stream: *std.net.Stream, timeout_secs: u64) void {
     if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
 
+    const zero_timeout = std.posix.timeval{ .sec = 0, .usec = 0 };
+    const TimevalSecs = @TypeOf(zero_timeout.sec);
     const timeout = std.posix.timeval{
-        .sec = @intCast(REQUEST_TIMEOUT_SECS),
+        .sec = @intCast(@min(timeout_secs, @as(u64, std.math.maxInt(TimevalSecs)))),
         .usec = 0,
     };
     std.posix.setsockopt(
@@ -2170,11 +2192,11 @@ fn configureRequestReadTimeout(stream: *std.net.Stream) void {
     ) catch {};
 }
 
-fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
+fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype, max_body: usize) ![]u8 {
     var request_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer request_buf.deinit(allocator);
-
     var expected_total: ?usize = null;
+    const max_request_size = maxHttpRequestSize(max_body);
     var chunk: [2048]u8 = undefined;
 
     while (true) {
@@ -2185,10 +2207,10 @@ fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype) ![]u
         if (n == 0) return error.IncompleteRequest;
 
         try request_buf.appendSlice(allocator, chunk[0..n]);
-        if (request_buf.items.len > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
+        if (request_buf.items.len > max_request_size) return error.RequestTooLarge;
 
         if (expected_total == null) {
-            expected_total = try expectedHttpRequestSize(request_buf.items);
+            expected_total = try expectedHttpRequestSize(request_buf.items, max_body);
         }
 
         if (expected_total) |total| {
@@ -2200,8 +2222,13 @@ fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype) ![]u
     }
 }
 
-fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream) ![]u8 {
-    return readHttpRequestFromReader(allocator, stream);
+fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream, max_body: usize) ![]u8 {
+    return readHttpRequestFromReader(allocator, stream, max_body);
+}
+
+fn maybeProbeA2aVision(session_mgr: anytype, allocator: std.mem.Allocator, cfg: *const Config) void {
+    if (!cfg.a2a.enabled) return;
+    session_mgr.probeVision(allocator);
 }
 
 const CONTENT_TYPE_JSON = "application/json";
@@ -3024,6 +3051,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "telegram",
                     tg_account_id,
                     cid_str,
+                    chat_target,
                     std.mem.eql(u8, peer_kind, "group"),
                     if (std.mem.eql(u8, peer_kind, "group")) cid_str else null,
                 );
@@ -3170,6 +3198,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "whatsapp",
                     wa_account_id,
                     wa_peer_id,
+                    wa_chat_target,
                     wa_is_group,
                     wa_group_id,
                 );
@@ -3233,6 +3262,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     "whatsapp",
                     wa_account_id,
                     wa_peer_id,
+                    wa_chat_target_ns,
                     wa_is_group,
                     wa_group_id,
                 );
@@ -3443,6 +3473,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                         "slack",
                         slack_cfg.account_id,
                         if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                        selection.target,
                         !interactive_target.is_dm,
                         if (!interactive_target.is_dm) interactive_target.channel_id else null,
                     );
@@ -3584,6 +3615,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             "slack",
             slack_cfg.account_id,
             if (is_dm) sender_id else channel_id,
+            channel_id,
             !is_dm,
             if (!is_dm) channel_id else null,
         );
@@ -3720,6 +3752,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                         "line",
                         line_account_id,
                         line_peer.id,
+                        line_target,
                         !std.mem.eql(u8, line_peer.kind, "direct"),
                         if (!std.mem.eql(u8, line_peer.kind, "direct")) line_peer.id else null,
                     );
@@ -3847,6 +3880,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
             const conversation_context: ?ConversationContext = simpleConversationContext(
                 "lark",
                 lark_account_id,
+                msg.sender,
                 msg.sender,
                 msg.is_group,
                 if (msg.is_group) msg.sender else null,
@@ -4386,6 +4420,7 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
                 .channel = "qq",
                 .account_id = account_id,
                 .sender_id = inbound.sender_id,
+                .delivery_chat_id = inbound.chat_id,
                 .peer_id = if (peer) |resolved| resolved.id else null,
                 .is_group = if (peer) |resolved| resolved.kind != .direct else null,
                 .group_id = if (peer) |resolved| if (resolved.kind == .direct) null else resolved.id else null,
@@ -4503,6 +4538,7 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
                 "max",
                 max_cfg.account_id,
                 peer_id,
+                reply_target,
                 inbound.is_group,
                 if (inbound.is_group) reply_target else null,
             );
@@ -4687,6 +4723,7 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
         .account_id = teams_cfg.account_id,
         .sender_uuid = from_id,
         .sender_name = from_name,
+        .delivery_chat_id = chat_id,
         .peer_id = peer_info.peer.id,
         .is_group = !peer_info.is_dm,
         .group_id = if (peer_info.is_dm) null else peer_info.peer.id,
@@ -4911,6 +4948,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
     }
     defer if (owned_config) |*c| c.deinit();
+    const max_body = if (config_opt) |cfg| cfg.gateway.max_body_size_bytes else MAX_BODY_SIZE;
+    const request_timeout_secs = effectiveRequestReadTimeoutSecs(config_opt);
 
     // Provider runtime bundle (primary + reliability wrapper) must outlive the accept loop.
     var provider_bundle_opt: ?providers.runtime_bundle.RuntimeProviderBundle = null;
@@ -5064,6 +5103,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .subagent_manager = subagent_manager_opt,
                     .bootstrap_provider = bootstrap_provider_opt,
                     .backend_name = cfg.memory.backend,
+                    .sandbox_backend = cfg.security.sandbox.backend,
+                    .sandbox_enabled = cfg.sandboxEnabled(),
                 }) catch &.{};
 
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, runtime_observer.?.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
@@ -5075,6 +5116,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     tools_mod.bindMemoryRuntime(tools_slice, rt);
                 }
                 session_mgr_opt = sm;
+                // Eagerly probe whether the model accepts image input so we can
+                // advertise multi_modal capability in the agent card accurately.
+                if (session_mgr_opt) |*mgr| maybeProbeA2aVision(mgr, allocator, cfg);
             }
         }
     } else {
@@ -5150,7 +5194,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         };
         var close_conn = true;
         defer if (close_conn) conn.stream.close();
-        configureRequestReadTimeout(&conn.stream);
+        configureRequestReadTimeout(&conn.stream, request_timeout_secs);
 
         // Per-request arena — all request-scoped allocations freed in one shot
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -5158,7 +5202,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const req_allocator = arena.allocator();
 
         // Read full HTTP request (headers + optional body).
-        const raw = readHttpRequest(req_allocator, &conn.stream) catch |err| {
+        const raw = readHttpRequest(req_allocator, &conn.stream, max_body) catch |err| {
             switch (err) {
                 error.RequestTooLarge => writeJsonResponse(&conn.stream, "413 Payload Too Large", "{\"error\":\"request too large\"}"),
                 error.InvalidContentLength => writeJsonResponse(&conn.stream, "400 Bad Request", "{\"error\":\"invalid content-length\"}"),
@@ -5264,7 +5308,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             // A2A Agent Card discovery (public, no auth).
             if (config_opt) |cfg| {
                 if (cfg.a2a.enabled) {
-                    const card = a2a.handleAgentCard(req_allocator, cfg);
+                    const vision_capable = if (session_mgr_opt) |sm| sm.vision_capable else null;
+                    const card = a2a.handleAgentCard(req_allocator, cfg, vision_capable);
                     response_status = card.status;
                     response_body = card.body;
                 } else {
@@ -5994,8 +6039,12 @@ test "rate limiter window_ns calculation" {
     try std.testing.expectEqual(@as(i128, 120_000_000_000), limiter.window_ns);
 }
 
-test "MAX_BODY_SIZE is 64KB" {
+test "MAX_BODY_SIZE is 64KB (default)" {
     try std.testing.expectEqual(@as(usize, 64 * 1024), MAX_BODY_SIZE);
+}
+
+test "maxHttpRequestSize saturates on overflow" {
+    try std.testing.expectEqual(std.math.maxInt(usize), maxHttpRequestSize(std.math.maxInt(usize)));
 }
 
 test "RATE_LIMIT_WINDOW_SECS is 60" {
@@ -6004,6 +6053,20 @@ test "RATE_LIMIT_WINDOW_SECS is 60" {
 
 test "REQUEST_TIMEOUT_SECS is 30" {
     try std.testing.expectEqual(@as(u64, 30), REQUEST_TIMEOUT_SECS);
+}
+
+test "effectiveRequestReadTimeoutSecs uses configured value and defaults zero to 30" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    cfg.gateway.request_timeout_secs = 45;
+    try std.testing.expectEqual(@as(u64, 45), effectiveRequestReadTimeoutSecs(&cfg));
+
+    cfg.gateway.request_timeout_secs = 0;
+    try std.testing.expectEqual(@as(u64, REQUEST_TIMEOUT_SECS), effectiveRequestReadTimeoutSecs(&cfg));
 }
 
 test "rate limiter different keys do not interfere" {
@@ -7686,7 +7749,26 @@ test "webhookRouting uses route engine when standardized peer metadata is presen
     try std.testing.expect(std.mem.indexOf(u8, routing.metadata_json.?, "\"peer_id\":\"session-1\"") != null);
     try std.testing.expect(routing.conversation_context != null);
     try std.testing.expectEqualStrings("web", routing.conversation_context.?.channel.?);
+    try std.testing.expectEqualStrings("session-1", routing.conversation_context.?.delivery_chat_id.?);
     try std.testing.expectEqualStrings("session-1", routing.conversation_context.?.peer_id.?);
+}
+
+test "simpleConversationContext keeps delivery target separate from routing peer" {
+    const context = simpleConversationContext(
+        "slack",
+        "slack-main",
+        "user-42",
+        "D123456",
+        false,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("slack", context.channel.?);
+    try std.testing.expectEqualStrings("slack-main", context.account_id.?);
+    try std.testing.expectEqualStrings("D123456", context.delivery_chat_id.?);
+    try std.testing.expectEqualStrings("user-42", context.peer_id.?);
+    try std.testing.expect(!context.is_group.?);
+    try std.testing.expect(context.group_id == null);
 }
 
 // ── extractBody tests ────────────────────────────────────────────
@@ -7710,34 +7792,48 @@ test "extractBody returns null for no separator" {
 
 test "expectedHttpRequestSize returns null when headers are incomplete" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
-    try std.testing.expect(try expectedHttpRequestSize(raw) == null);
+    try std.testing.expect(try expectedHttpRequestSize(raw, MAX_BODY_SIZE) == null);
 }
 
 test "expectedHttpRequestSize rejects oversized incomplete headers" {
     const raw = try std.testing.allocator.alloc(u8, MAX_HEADER_SIZE + 1);
     defer std.testing.allocator.free(raw);
     for (raw) |*byte| byte.* = 'a';
-    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw, MAX_BODY_SIZE));
 }
 
 test "expectedHttpRequestSize returns header length for requests without body" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw)).?);
+    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw, MAX_BODY_SIZE)).?);
 }
 
 test "expectedHttpRequestSize includes content length payload" {
     const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
-    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw)).?);
+    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw, MAX_BODY_SIZE)).?);
 }
 
 test "expectedHttpRequestSize rejects invalid content length" {
     const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\nhello";
-    try std.testing.expectError(error.InvalidContentLength, expectedHttpRequestSize(raw));
+    try std.testing.expectError(error.InvalidContentLength, expectedHttpRequestSize(raw, MAX_BODY_SIZE));
 }
 
 test "expectedHttpRequestSize rejects oversized content length" {
     const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999\r\n\r\n";
-    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw, MAX_BODY_SIZE));
+}
+
+test "expectedHttpRequestSize honors configured max body size" {
+    // Regression: gateway.max_body_size_bytes must raise the inbound cap for A2A inlineData uploads.
+    const content_length: usize = MAX_BODY_SIZE + 1;
+    const raw = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n",
+        .{content_length},
+    );
+    defer std.testing.allocator.free(raw);
+
+    const expected = (try expectedHttpRequestSize(raw, content_length)).?;
+    try std.testing.expectEqual((headerEndOffset(raw).? + content_length), expected);
 }
 
 test "readHttpRequestFromReader assembles fragmented request" {
@@ -7770,9 +7866,60 @@ test "readHttpRequestFromReader assembles fragmented request" {
     };
     var reader = ChunkedReader{ .chunks = chunks[0..] };
 
-    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader);
+    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE);
     defer std.testing.allocator.free(raw);
     try std.testing.expectEqualStrings(expected, raw);
+}
+
+test "readHttpRequestFromReader honors configured max body size above default" {
+    const ChunkedReader = struct {
+        chunks: []const []const u8,
+        chunk_idx: usize = 0,
+        offset_in_chunk: usize = 0,
+
+        fn read(self: *@This(), out: []u8) !usize {
+            while (self.chunk_idx < self.chunks.len and self.offset_in_chunk >= self.chunks[self.chunk_idx].len) {
+                self.chunk_idx += 1;
+                self.offset_in_chunk = 0;
+            }
+            if (self.chunk_idx >= self.chunks.len) return 0;
+
+            const chunk = self.chunks[self.chunk_idx];
+            const remaining = chunk[self.offset_in_chunk..];
+            const n = @min(out.len, remaining.len);
+            std.mem.copyForwards(u8, out[0..n], remaining[0..n]);
+            self.offset_in_chunk += n;
+            return n;
+        }
+    };
+
+    // Regression: requests larger than 64 KiB must succeed when config raises the limit.
+    const body_len = MAX_BODY_SIZE + 1;
+    const body = try std.testing.allocator.alloc(u8, body_len);
+    defer std.testing.allocator.free(body);
+    @memset(body, 'a');
+
+    const header = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n",
+        .{body_len},
+    );
+    defer std.testing.allocator.free(header);
+
+    const request = try std.mem.concat(std.testing.allocator, u8, &.{ header, body });
+    defer std.testing.allocator.free(request);
+
+    const split = header.len + 1024;
+    const chunks = [_][]const u8{
+        request[0..header.len],
+        request[header.len..split],
+        request[split..],
+    };
+    var reader = ChunkedReader{ .chunks = chunks[0..] };
+
+    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader, body_len);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqualStrings(request, raw);
 }
 
 test "readHttpRequestFromReader returns IncompleteRequest for truncated body" {
@@ -7801,7 +7948,7 @@ test "readHttpRequestFromReader returns IncompleteRequest for truncated body" {
         "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\nabc",
     };
     var reader = ChunkedReader{ .chunks = chunks[0..] };
-    try std.testing.expectError(error.IncompleteRequest, readHttpRequestFromReader(std.testing.allocator, &reader));
+    try std.testing.expectError(error.IncompleteRequest, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
 }
 
 test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
@@ -7814,7 +7961,47 @@ test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
     };
 
     var reader = TimeoutReader{};
-    try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader));
+    try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader, MAX_BODY_SIZE));
+}
+
+test "maybeProbeA2aVision skips probe when a2a is disabled" {
+    const ProbeSpy = struct {
+        calls: usize = 0,
+
+        fn probeVision(self: *@This(), _: std.mem.Allocator) void {
+            self.calls += 1;
+        }
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var spy = ProbeSpy{};
+    maybeProbeA2aVision(&spy, std.testing.allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 0), spy.calls);
+}
+
+test "maybeProbeA2aVision runs probe when a2a is enabled" {
+    const ProbeSpy = struct {
+        calls: usize = 0,
+
+        fn probeVision(self: *@This(), _: std.mem.Allocator) void {
+            self.calls += 1;
+        }
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.a2a.enabled = true;
+
+    var spy = ProbeSpy{};
+    maybeProbeA2aVision(&spy, std.testing.allocator, &cfg);
+    try std.testing.expectEqual(@as(usize, 1), spy.calls);
 }
 
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {

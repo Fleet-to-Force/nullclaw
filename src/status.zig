@@ -73,7 +73,7 @@ pub fn run(allocator: std.mem.Allocator) !void {
 
     // Sandbox
     try w.print("Sandbox:     {s}\n", .{
-        if (cfg.security.sandbox.enabled orelse false) "enabled" else "disabled",
+        if (cfg.sandboxEnabled()) "enabled" else "disabled",
     });
 
     // Audit

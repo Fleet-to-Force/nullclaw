@@ -32,12 +32,12 @@ nullclaw --help
 
 ### 命令行（CMD）(Windows)
 
-直接将下载的nullclaw二进制文件（.exe)在命令行中作为命令执行即可，
+从发布页下载 Windows `.zip` 压缩包并解压后，即可直接在命令行中运行其中的 `nullclaw.exe`。
 
 比如检查nullclaw版本号的命令如下：
 
 ```cmd
-x:\path\nullclaw-xxx version
+x:\path\nullclaw.exe --version
 ```
 
 ## 方式二：官方容器镜像（Docker / Podman）
@@ -203,12 +203,12 @@ if (-not ($user_path -split ";" | Where-Object { $_ -eq $bin })) {
 $env:Path = "$env:Path;$bin"
 ```
 
-### 直接使用下载的二进制文件（Windows,Powershell)
-可将下载的nullclaw二进制文件（.exe)改名为nullclaw.exe，再以管理员权限在Powershell中执行如下命令，将该文件所在的路径加入到windows系统变量PATH中：
+### 直接使用下载的二进制文件（Windows, Powershell)
+从发布页下载 Windows `.zip` 压缩包并解压后，可在管理员权限的 Powershell 中执行如下命令，将 `nullclaw.exe` 所在目录加入 Windows 的 `PATH` 环境变量：
 
 ```Powershell 
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
-$new = "$old;x:\nullclaw二进制文件所在目录"
+$new = "$old;x:\path\to\nullclaw"
 [Environment]::SetEnvironmentVariable("Path", $new, "Machine")
 ```
 

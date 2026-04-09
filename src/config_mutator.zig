@@ -1,5 +1,6 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
+const config_paths = @import("config_paths.zig");
 const platform = @import("platform.zig");
 
 pub const MutationAction = enum {
@@ -28,6 +29,10 @@ pub const Error = error{
     InvalidJson,
 };
 
+const primary_model_path = "agents.defaults.model.primary";
+const primary_model_tokens = [_][]const u8{ "agents", "defaults", "model", "primary" };
+const primary_model_provider_tokens = [_][]const u8{ "agents", "defaults", "model", "provider" };
+
 const allowed_exact_paths = [_][]const u8{
     "default_temperature",
     "reasoning_effort",
@@ -37,7 +42,7 @@ const allowed_exact_paths = [_][]const u8{
     "gateway.host",
     "gateway.port",
     "tunnel.provider",
-    "agents.defaults.model.primary",
+    primary_model_path,
 };
 
 const allowed_prefix_paths = [_][]const u8{
@@ -64,17 +69,13 @@ pub fn freeMutationResult(allocator: std.mem.Allocator, result: *MutationResult)
 }
 
 fn defaultConfigDir(allocator: std.mem.Allocator, nullclaw_home_override: ?[]const u8) ![]u8 {
-    if (nullclaw_home_override) |config_dir| {
-        return allocator.dupe(u8, config_dir);
-    }
-
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    return config_paths.defaultConfigDirFromInputs(allocator, nullclaw_home_override, home);
 }
 
 fn defaultConfigPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]u8 {
-    return try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
+    return config_paths.pathFromConfigDir(allocator, config_dir, "config.json");
 }
 
 pub fn defaultConfigPath(allocator: std.mem.Allocator) ![]u8 {
@@ -157,6 +158,28 @@ fn valueAtPath(root: *std.json.Value, tokens: []const []const u8) ?*std.json.Val
     return current;
 }
 
+fn stringifyPrimaryModelValueJson(allocator: std.mem.Allocator, root: *std.json.Value) ![]u8 {
+    const primary_value = valueAtPath(root, &primary_model_tokens) orelse return try allocator.dupe(u8, "null");
+    const provider_value = valueAtPath(root, &primary_model_provider_tokens) orelse return stringifyValue(allocator, primary_value);
+    if (primary_value.* != .string or provider_value.* != .string) return stringifyValue(allocator, primary_value);
+
+    const combined = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ provider_value.string, primary_value.string });
+    defer allocator.free(combined);
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = combined }, .{});
+}
+
+fn stringifyPathValueJson(
+    allocator: std.mem.Allocator,
+    root: *std.json.Value,
+    path: []const u8,
+    tokens: []const []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, path, primary_model_path)) {
+        return stringifyPrimaryModelValueJson(allocator, root);
+    }
+    return stringifyValue(allocator, valueAtPath(root, tokens));
+}
+
 fn setAtPath(
     root: *std.json.Value,
     allocator: std.mem.Allocator,
@@ -188,6 +211,35 @@ fn setAtPath(
 
     const key_copy = try allocator.dupe(u8, last);
     try obj.put(key_copy, value);
+}
+
+fn setPrimaryModelPathValue(
+    root: *std.json.Value,
+    allocator: std.mem.Allocator,
+    raw_input: []const u8,
+) !void {
+    const parsed_value = try parseValueInput(allocator, raw_input);
+    switch (parsed_value) {
+        .string => |primary| {
+            if (config_mod.splitPrimaryModelRef(primary)) |parsed_ref| {
+                if (config_mod.shouldSerializeDefaultModelProviderField(parsed_ref.provider)) {
+                    try setAtPath(root, allocator, &primary_model_provider_tokens, .{ .string = parsed_ref.provider });
+                    try setAtPath(root, allocator, &primary_model_tokens, .{ .string = parsed_ref.model });
+                    return;
+                }
+            }
+        },
+        else => {},
+    }
+
+    // Keep the logical provider/model pair in sync for user-facing primary updates.
+    _ = unsetAtPath(root, &primary_model_provider_tokens);
+    try setAtPath(root, allocator, &primary_model_tokens, parsed_value);
+}
+
+fn unsetPrimaryModelPathValue(root: *std.json.Value) void {
+    _ = unsetAtPath(root, &primary_model_provider_tokens);
+    _ = unsetAtPath(root, &primary_model_tokens);
 }
 
 fn unsetAtPath(root: *std.json.Value, tokens: []const []const u8) bool {
@@ -303,8 +355,7 @@ pub fn getPathValueJson(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     }
 
     const tokens = try splitPathTokens(a, path);
-    const value = valueAtPath(&root, tokens);
-    return stringifyValue(allocator, value);
+    return stringifyPathValueJson(allocator, &root, path, tokens);
 }
 
 pub fn validateCurrentConfig(allocator: std.mem.Allocator) !void {
@@ -347,21 +398,29 @@ pub fn mutateDefaultConfig(
 
     const tokens = try splitPathTokens(a, trimmed_path);
 
-    const old_value_json = try stringifyValue(allocator, valueAtPath(&root, tokens));
+    const old_value_json = try stringifyPathValueJson(allocator, &root, trimmed_path, tokens);
     errdefer allocator.free(old_value_json);
 
     switch (action) {
         .set => {
             const raw = value_raw orelse return error.MissingValue;
-            const parsed_value = try parseValueInput(a, raw);
-            try setAtPath(&root, a, tokens, parsed_value);
+            if (std.mem.eql(u8, trimmed_path, primary_model_path)) {
+                try setPrimaryModelPathValue(&root, a, raw);
+            } else {
+                const parsed_value = try parseValueInput(a, raw);
+                try setAtPath(&root, a, tokens, parsed_value);
+            }
         },
         .unset => {
-            _ = unsetAtPath(&root, tokens);
+            if (std.mem.eql(u8, trimmed_path, primary_model_path)) {
+                unsetPrimaryModelPathValue(&root);
+            } else {
+                _ = unsetAtPath(&root, tokens);
+            }
         },
     }
 
-    const new_value_json = try stringifyValue(allocator, valueAtPath(&root, tokens));
+    const new_value_json = try stringifyPathValueJson(allocator, &root, trimmed_path, tokens);
     errdefer allocator.free(new_value_json);
 
     const changed = !std.mem.eql(u8, old_value_json, new_value_json);
@@ -447,4 +506,82 @@ test "unsetAtPath removes existing key" {
     try std.testing.expect(valueAtPath(&root, &tokens) != null);
     try std.testing.expect(unsetAtPath(&root, &tokens));
     try std.testing.expect(valueAtPath(&root, &tokens) == null);
+}
+
+test "stringifyPathValueJson reconstructs logical default model primary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        \\{"agents":{"defaults":{"model":{"provider":"custom:https://example.com/api","primary":"meta-llama/Llama-4-70B-Instruct"}}}}
+    ,
+        .{},
+    );
+    var root = parsed.value;
+    const tokens = try splitPathTokens(a, primary_model_path);
+
+    const value_json = try stringifyPathValueJson(std.testing.allocator, &root, primary_model_path, tokens);
+    defer std.testing.allocator.free(value_json);
+
+    // Regression: split provider/model storage must still surface the documented provider/model path value.
+    try std.testing.expectEqualStrings(
+        "\"custom:https://example.com/api/meta-llama/Llama-4-70B-Instruct\"",
+        value_json,
+    );
+}
+
+test "setPrimaryModelPathValue stores split provider field for versionless custom urls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = std.json.Value{ .object = std.json.ObjectMap.init(a) };
+
+    try setPrimaryModelPathValue(&root, a, "custom:https://gateway.example.com/api/qianfan/custom-model");
+
+    const provider_value = valueAtPath(&root, &primary_model_provider_tokens) orelse return error.TestUnexpectedResult;
+    const primary_value = valueAtPath(&root, &primary_model_tokens) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(provider_value.* == .string);
+    try std.testing.expect(primary_value.* == .string);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/api", provider_value.string);
+    try std.testing.expectEqualStrings("qianfan/custom-model", primary_value.string);
+}
+
+test "setPrimaryModelPathValue clears stale split provider field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        \\{"agents":{"defaults":{"model":{"provider":"custom:https://example.com/api","primary":"meta-llama/Llama-4-70B-Instruct"}}}}
+    ,
+        .{},
+    );
+    var root = parsed.value;
+
+    try setPrimaryModelPathValue(&root, a, "openai/gpt-5.2");
+
+    try std.testing.expect(valueAtPath(&root, &primary_model_provider_tokens) == null);
+
+    const tokens = try splitPathTokens(a, primary_model_path);
+    const value_json = try stringifyPathValueJson(std.testing.allocator, &root, primary_model_path, tokens);
+    defer std.testing.allocator.free(value_json);
+    try std.testing.expectEqualStrings("\"openai/gpt-5.2\"", value_json);
+
+    const rendered = try std.json.Stringify.valueAlloc(std.testing.allocator, root, .{});
+    defer std.testing.allocator.free(rendered);
+
+    var cfg_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer cfg_arena.deinit();
+    var cfg = config_mod.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .allocator = cfg_arena.allocator(),
+    };
+    try cfg.parseJson(rendered);
+
+    try std.testing.expectEqualStrings("openai", cfg.default_provider);
+    try std.testing.expectEqualStrings("gpt-5.2", cfg.default_model.?);
 }

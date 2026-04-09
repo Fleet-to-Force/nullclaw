@@ -182,6 +182,14 @@ pub const ReliabilityConfig = struct {
     model_fallbacks: []const ModelFallbackEntry = &.{},
 };
 
+pub const InboundMessagesConfig = struct {
+    debounce_ms: u32 = 3_000,
+};
+
+pub const MessagesConfig = struct {
+    inbound: InboundMessagesConfig = .{},
+};
+
 pub const SchedulerConfig = struct {
     enabled: bool = true,
     max_tasks: u32 = 64,
@@ -526,6 +534,7 @@ pub const LarkConfig = struct {
     allow_from: []const []const u8 = &.{},
     receive_mode: LarkReceiveMode = .websocket,
     port: ?u16 = null,
+    reaction_emojis: []const []const u8 = &.{},
 };
 
 pub const DingTalkConfig = struct {
@@ -1052,6 +1061,8 @@ pub const MemoryConfig = struct {
     /// Apply profile defaults. Only sets fields that are still at their default values,
     /// so explicit user overrides always win (profile is applied AFTER parsing).
     pub fn applyProfileDefaults(self: *MemoryConfig) void {
+        const rollout_off = "off";
+        const rollout_on = "on";
         const p = MemoryProfile.fromString(self.profile);
         switch (p) {
             .hybrid_keyword => {
@@ -1061,7 +1072,10 @@ pub const MemoryConfig = struct {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
             },
             .markdown_only => {
-                // Base default is already markdown.
+                if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "markdown";
+                if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
+                if (!self.search.query.hybrid.temporal_decay.enabled) self.search.query.hybrid.temporal_decay.enabled = true;
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .postgres_keyword => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
@@ -1071,14 +1085,14 @@ pub const MemoryConfig = struct {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
                 if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
-                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .postgres_hybrid => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "postgres";
                 if (std.mem.eql(u8, self.search.provider, "none")) self.search.provider = "openai";
                 if (!self.search.query.hybrid.enabled) self.search.query.hybrid.enabled = true;
                 if (std.mem.eql(u8, self.search.store.kind, "auto")) self.search.store.kind = "pgvector";
-                if (std.mem.eql(u8, self.reliability.rollout_mode, "off")) self.reliability.rollout_mode = "on";
+                if (std.mem.eql(u8, self.reliability.rollout_mode, rollout_off)) self.reliability.rollout_mode = rollout_on;
             },
             .minimal_none => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "none";
@@ -1310,6 +1324,14 @@ pub const GatewayConfig = struct {
     webhook_rate_limit_per_minute: u32 = 60,
     idempotency_ttl_secs: u64 = 300,
     paired_tokens: []const []const u8 = &.{},
+    /// Maximum HTTP request body size in bytes.
+    /// Default 65536 (64 KB). Raise this when the gateway is configured
+    /// for multi-modal use and needs to accept image payloads.
+    max_body_size_bytes: usize = 65_536,
+    /// Socket read timeout for incoming HTTP requests in seconds.
+    /// Default 30s. Raise this when accepting large payloads (e.g. images)
+    /// over slow or high-latency connections.
+    request_timeout_secs: u64 = 30,
 };
 
 // ── A2A (Agent-to-Agent) protocol config ────────────────────────
@@ -1320,6 +1342,9 @@ pub const A2aConfig = struct {
     description: []const u8 = "AI assistant",
     url: []const u8 = "",
     version: []const u8 = "1.0.0",
+    /// When true, the agent card advertises multi_modal capability,
+    /// signalling that the gateway's model accepts image/file attachments.
+    multi_modal: bool = false,
 };
 
 // ── Composio config ─────────────────────────────────────────────
@@ -1934,4 +1959,38 @@ test "ProviderEntry.max_streaming_prompt_bytes defaults to null" {
 test "ProviderEntry.api_mode defaults to chat_completions" {
     const pe = ProviderEntry{ .name = "test" };
     try std.testing.expectEqual(ProviderEntry.ApiMode.chat_completions, pe.api_mode);
+}
+
+test "markdown_only profile enables markdown retrieval defaults" {
+    var cfg = MemoryConfig{
+        .profile = "markdown_only",
+    };
+
+    cfg.applyProfileDefaults();
+
+    try std.testing.expectEqualStrings("markdown", cfg.backend);
+    try std.testing.expect(cfg.search.query.hybrid.enabled);
+    try std.testing.expect(cfg.search.query.hybrid.temporal_decay.enabled);
+    try std.testing.expectEqual(@as(u32, 30), cfg.search.query.hybrid.temporal_decay.half_life_days);
+    try std.testing.expectEqualStrings("on", cfg.reliability.rollout_mode);
+}
+
+test "markdown_only profile preserves explicit half-life override" {
+    var cfg = MemoryConfig{
+        .profile = "markdown_only",
+        .search = .{
+            .query = .{
+                .hybrid = .{
+                    .temporal_decay = .{
+                        .half_life_days = 0,
+                    },
+                },
+            },
+        },
+    };
+
+    cfg.applyProfileDefaults();
+
+    // Regression: markdown_only should not clobber an explicit half-life override.
+    try std.testing.expectEqual(@as(u32, 0), cfg.search.query.hybrid.temporal_decay.half_life_days);
 }

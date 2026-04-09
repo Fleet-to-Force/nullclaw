@@ -1,15 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const config_paths = @import("../config_paths.zig");
 const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
 const identity_mod = @import("../identity.zig");
-const platform = @import("../platform.zig");
 const memory_root = @import("../memory/root.zig");
 const tools_mod = @import("../tools/root.zig");
 const path_prefix = @import("../path_prefix.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
 const bootstrap_mod = @import("../bootstrap/root.zig");
+const observability = @import("../observability.zig");
 const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 const pathStartsWith = path_prefix.pathStartsWith;
 
@@ -123,6 +124,7 @@ pub const ConversationContext = struct {
     sender_username: ?[]const u8 = null,
     sender_display_name: ?[]const u8 = null,
     // Shared
+    delivery_chat_id: ?[]const u8 = null,
     peer_id: ?[]const u8 = null,
     group_id: ?[]const u8 = null,
     is_group: ?bool = null,
@@ -155,6 +157,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
     const sender_id = normalizeOptionalString(args.sender_id);
     const sender_username = normalizeOptionalString(args.sender_username);
     const sender_display_name = normalizeOptionalString(args.sender_display_name);
+    const delivery_chat_id = normalizeOptionalString(args.delivery_chat_id);
     const peer_id = normalizeOptionalString(args.peer_id);
     const is_group = args.is_group;
     const group_id = if (normalizeOptionalString(args.group_id)) |value|
@@ -170,7 +173,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         sender_name != null or
         sender_username != null or
         sender_display_name != null;
-    const has_scope = account_id != null or peer_id != null or group_id != null or is_group != null;
+    const has_scope = account_id != null or delivery_chat_id != null or peer_id != null or group_id != null or is_group != null;
     if (channel == null and !has_sender_identity and !has_scope) return null;
 
     return .{
@@ -182,6 +185,7 @@ pub fn buildConversationContext(args: ConversationContext) ?ConversationContext 
         .sender_id = sender_id,
         .sender_username = sender_username,
         .sender_display_name = sender_display_name,
+        .delivery_chat_id = delivery_chat_id,
         .peer_id = peer_id,
         .group_id = group_id,
         .is_group = is_group,
@@ -205,6 +209,7 @@ pub const PromptContext = struct {
     conversation_context: ?ConversationContext = null,
     bootstrap_provider: ?BootstrapProvider = null,
     identity_config: ?config_types.IdentityConfig = null,
+    observer: ?observability.Observer = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -398,7 +403,7 @@ pub fn buildSystemPrompt(
     try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
 
     // Skills section
-    try appendSkillsSection(allocator, w, ctx.workspace_dir);
+    try appendSkillsSection(allocator, w, ctx.workspace_dir, ctx.observer);
 
     // Workspace section
     try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
@@ -814,11 +819,11 @@ pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]co
 
 /// Allocating wrapper around appendSkillsSection for callers that need
 /// skill guidance as a standalone string (e.g. subagent runner).
-pub fn buildSkillsSection(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]const u8 {
+pub fn buildSkillsSection(allocator: std.mem.Allocator, workspace_dir: []const u8, observer: ?observability.Observer) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, workspace_dir);
+    try appendSkillsSection(allocator, w, workspace_dir, observer);
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -843,25 +848,21 @@ fn appendSkillsSection(
     allocator: std.mem.Allocator,
     w: anytype,
     workspace_dir: []const u8,
+    observer: ?observability.Observer,
 ) !void {
-    // Two-source loading: workspace skills + ~/.nullclaw/skills/
-    const home_dir = platform.getHomeDir(allocator) catch null;
-    defer if (home_dir) |h| allocator.free(h);
-    const community_base = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".nullclaw" }) catch null
-    else
-        null;
+    // Two-source loading: workspace skills + config directory skills/
+    const community_base = config_paths.defaultConfigDir(allocator) catch null;
     defer if (community_base) |cb| allocator.free(cb);
 
     // listSkillsMerged already calls checkRequirements on each skill.
     // The fallback listSkills path needs explicit checkRequirements calls.
     var used_merged = false;
     const skill_list = if (community_base) |cb| blk: {
-        const merged = skills_mod.listSkillsMerged(allocator, cb, workspace_dir) catch
-            break :blk skills_mod.listSkills(allocator, workspace_dir) catch return;
+        const merged = skills_mod.listSkillsMerged(allocator, cb, workspace_dir, observer) catch
+            break :blk skills_mod.listSkills(allocator, workspace_dir, observer) catch return;
         used_merged = true;
         break :blk merged;
-    } else skills_mod.listSkills(allocator, workspace_dir) catch return;
+    } else skills_mod.listSkills(allocator, workspace_dir, observer) catch return;
     defer skills_mod.freeSkills(allocator, skill_list);
 
     // checkRequirements only needed for the non-merged path
@@ -2115,14 +2116,14 @@ test "appendSkillsSection with no skills produces nothing" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills");
+    try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills", null);
 
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
 }
 
 test "buildSkillsSection with no skills returns empty" {
     const allocator = std.testing.allocator;
-    const content = try buildSkillsSection(allocator, "/tmp/nullclaw-prompt-test-no-skills-wrapper");
+    const content = try buildSkillsSection(allocator, "/tmp/nullclaw-prompt-test-no-skills-wrapper", null);
     defer allocator.free(content);
     try std.testing.expectEqual(@as(usize, 0), content.len);
 }
@@ -2148,7 +2149,7 @@ test "appendSkillsSection renders summary XML for always=false skill" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    try appendSkillsSection(allocator, w, base, null);
 
     const output = buf.items;
     // Summary skills should appear as child-element XML
@@ -2182,7 +2183,7 @@ test "appendSkillsSection escapes XML attributes in summary output" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    try appendSkillsSection(allocator, w, base, null);
 
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "&quot;") != null);
@@ -2210,7 +2211,7 @@ test "appendSkillsSection supports markdown-only installed skill" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    try appendSkillsSection(allocator, w, base, null);
 
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "<name>md-only</name>") != null);
@@ -2244,7 +2245,7 @@ test "appendSkillsSection renders full instructions for always=true skill" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    try appendSkillsSection(allocator, w, base, null);
 
     const output = buf.items;
     // Full instructions should be in the output
@@ -2290,7 +2291,7 @@ test "appendSkillsSection renders mixed always=true and always=false" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    try appendSkillsSection(allocator, w, base, null);
 
     const output = buf.items;
     // Full skill should be in ## Skills section with active header
@@ -2325,7 +2326,7 @@ test "appendSkillsSection renders unavailable skill with missing deps" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    try appendSkillsSection(allocator, w, base, null);
 
     const output = buf.items;
     // Should render as unavailable in XML
@@ -2364,7 +2365,7 @@ test "appendSkillsSection unavailable always=true skill renders in XML not full"
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    try appendSkillsSection(allocator, w, base);
+    try appendSkillsSection(allocator, w, base, null);
 
     const output = buf.items;
     // Even though always=true, since unavailable it should render as XML summary

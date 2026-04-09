@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const config_paths = @import("config_paths.zig");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
 const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
+const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
@@ -471,6 +473,7 @@ pub const CronScheduler = struct {
     allocator: std.mem.Allocator,
     shell_cwd: ?[]const u8 = null,
     agent_timeout_secs: u64 = 0,
+    observer: ?observability.Observer = null,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -872,6 +875,15 @@ pub const CronScheduler = struct {
         for (self.jobs.items, 0..) |*job, idx| {
             if (job.paused or job.next_run_secs > now) continue;
             changed = true;
+
+            if (self.observer) |obs| {
+                const event = observability.ObserverEvent{ .cron_job_start = .{
+                    .task = job.command,
+                    .channel = job.delivery.channel,
+                    .bot_account = job.delivery.account_id,
+                } };
+                obs.recordEvent(&event);
+            }
 
             switch (job.job_type) {
                 .shell => {
@@ -1651,18 +1663,20 @@ const JsonCronJob = struct {
     delivery_to: ?[]const u8 = null,
 };
 
-/// Get the default cron.json path: ~/.nullclaw/cron.json
-fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw", "cron.json" });
+fn cronJsonPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]const u8 {
+    return config_paths.pathFromConfigDir(allocator, config_dir, "cron.json");
 }
 
-/// Ensure the ~/.nullclaw directory exists.
+/// Get the cron.json path inside the config directory.
+fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
+    const dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(dir);
+    return cronJsonPathFromDir(allocator, dir);
+}
+
+/// Ensure the config directory exists.
 fn ensureCronDir(allocator: std.mem.Allocator) !void {
-    const home = try platform.getHomeDir(allocator);
-    defer allocator.free(home);
-    const dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    const dir = try config_paths.defaultConfigDir(allocator);
     defer allocator.free(dir);
     std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
@@ -1670,7 +1684,7 @@ fn ensureCronDir(allocator: std.mem.Allocator) !void {
     };
 }
 
-/// Save scheduler jobs to ~/.nullclaw/cron.json.
+/// Save scheduler jobs to cron.json in the config directory.
 pub fn saveJobs(scheduler: *const CronScheduler) !void {
     try ensureCronDir(scheduler.allocator);
     const path = try cronJsonPath(scheduler.allocator);
@@ -1792,12 +1806,12 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
     try writeFileAtomic(scheduler.allocator, path, buf.items);
 }
 
-/// Load jobs from ~/.nullclaw/cron.json into the scheduler.
+/// Load jobs from cron.json in the config directory into the scheduler.
 pub fn loadJobs(scheduler: *CronScheduler) !void {
     try loadJobsWithPolicy(scheduler, .best_effort);
 }
 
-/// Load jobs from ~/.nullclaw/cron.json; unlike loadJobs, this returns
+/// Load jobs from cron.json in the config directory; unlike loadJobs, this returns
 /// parse/read errors (except missing file/path).
 pub fn loadJobsStrict(scheduler: *CronScheduler) !void {
     try loadJobsWithPolicy(scheduler, .strict);
@@ -1867,12 +1881,12 @@ fn trimOwnedRight(allocator: std.mem.Allocator, raw: []u8) ?[]u8 {
     return owned;
 }
 
-/// Try to read the gateway URL from ~/.nullclaw/daemon_state.json.
+/// Try to read the gateway URL from daemon_state.json in the config directory.
 /// Returns an allocated string like "http://127.0.0.1:3000" or null.
 fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
-    const home = platform.getHomeDir(allocator) catch return null;
-    defer allocator.free(home);
-    const state_path = std.fs.path.join(allocator, &.{ home, ".nullclaw", "daemon_state.json" }) catch return null;
+    const dir = config_paths.defaultConfigDir(allocator) catch return null;
+    defer allocator.free(dir);
+    const state_path = config_paths.pathFromConfigDir(allocator, dir, "daemon_state.json") catch return null;
     defer allocator.free(state_path);
 
     const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, state_path, 64 * 1024) catch return null;
@@ -1894,11 +1908,11 @@ fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
     return std.fmt.allocPrint(allocator, "http://{s}", .{host_port}) catch null;
 }
 
-/// Read the paired bearer token from ~/.nullclaw/paired_token (if present).
+/// Read the paired bearer token from paired_token in the config directory (if present).
 fn readPairedToken(allocator: std.mem.Allocator) ?[]const u8 {
-    const home = platform.getHomeDir(allocator) catch return null;
-    defer allocator.free(home);
-    const token_path = std.fs.path.join(allocator, &.{ home, ".nullclaw", "paired_token" }) catch return null;
+    const dir = config_paths.defaultConfigDir(allocator) catch return null;
+    defer allocator.free(dir);
+    const token_path = config_paths.pathFromConfigDir(allocator, dir, "paired_token") catch return null;
     defer allocator.free(token_path);
     const raw = fs_compat.readFileAlloc(std.fs.cwd(), allocator, token_path, 4096) catch return null;
     return trimOwnedRight(allocator, raw);
@@ -3687,6 +3701,71 @@ test "tick without bus still executes jobs" {
     try std.testing.expect(scheduler.jobs.items[0].next_run_secs > 0);
 }
 
+test "tick records cron start delivery attribution" {
+    const RecordingObserver = struct {
+        saw_cron_job_start: bool = false,
+        last_channel: ?[]const u8 = null,
+        last_bot_account: ?[]const u8 = null,
+
+        const vtable = observability.Observer.VTable{
+            .record_event = recordEvent,
+            .record_metric = recordMetric,
+            .flush = flush,
+            .name = name,
+            .get_trace_id = getTraceId,
+            .set_trace_id = setTraceId,
+        };
+
+        fn observer(self: *@This()) observability.Observer {
+            return .{
+                .ptr = @ptrCast(self),
+                .vtable = &vtable,
+            };
+        }
+
+        fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (event.*) {
+                .cron_job_start => |payload| {
+                    self.saw_cron_job_start = true;
+                    self.last_channel = payload.channel;
+                    self.last_bot_account = payload.bot_account;
+                },
+                else => {},
+            }
+        }
+
+        fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+        fn flush(_: *anyopaque) void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "recording";
+        }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var observer = RecordingObserver{};
+    scheduler.observer = observer.observer();
+
+    _ = try scheduler.addJob("* * * * *", "echo attributed");
+    scheduler.jobs.items[0].delivery.channel = "telegram";
+    scheduler.jobs.items[0].delivery.account_id = "bot-main";
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    // Regression: cron_job_start should preserve the delivery metadata carried by the job.
+    _ = scheduler.tick(0, null);
+
+    try std.testing.expect(observer.saw_cron_job_start);
+    try std.testing.expectEqualStrings("telegram", observer.last_channel.?);
+    try std.testing.expectEqualStrings("bot-main", observer.last_bot_account.?);
+}
+
 test "tick reschedules recurring job using cron expression" {
     const allocator = std.testing.allocator;
     var scheduler = CronScheduler.init(allocator, 10, true);
@@ -3716,4 +3795,40 @@ test "tick reschedules anchored recurring job using cron expression" {
 
     _ = scheduler.tick(3480, null);
     try std.testing.expectEqual(@as(i64, 4080), scheduler.jobs.items[0].next_run_secs);
+}
+
+// Regression: #691 — NULLCLAW_HOME must override the HOME-based fallback.
+test "resolveConfigDir prefers NULLCLAW_HOME override" {
+    const allocator = std.testing.allocator;
+    const dir = try config_paths.defaultConfigDirFromInputs(allocator, "test-nullclaw-data", "ignored-home");
+    defer allocator.free(dir);
+    try std.testing.expectEqualStrings("test-nullclaw-data", dir);
+}
+
+// Regression: #691 — without NULLCLAW_HOME, cron.zig must use HOME/.nullclaw.
+test "resolveConfigDir falls back to HOME/.nullclaw when NULLCLAW_HOME unset" {
+    const allocator = std.testing.allocator;
+    const dir = try config_paths.defaultConfigDirFromInputs(allocator, null, "test-home");
+    defer allocator.free(dir);
+
+    const expected = try std.fs.path.join(allocator, &.{ "test-home", ".nullclaw" });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, dir);
+}
+
+// Regression: #691 — cron.json must live under the resolved config directory.
+test "cronJsonPath appends cron.json to resolved config dir" {
+    const allocator = std.testing.allocator;
+    const path = try cronJsonPathFromDir(allocator, "test-nullclaw-data");
+    defer allocator.free(path);
+
+    const expected = try std.fs.path.join(allocator, &.{ "test-nullclaw-data", "cron.json" });
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
+}
+
+test "resolveConfigDir reports missing home when no config directory inputs exist" {
+    try std.testing.expectError(error.HomeDirNotFound, config_paths.defaultConfigDirFromInputs(std.testing.allocator, null, null));
 }

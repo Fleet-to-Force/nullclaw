@@ -223,6 +223,10 @@ Host 请求：
 - `runtime.state_dir` 是 host 分配给这个账号的持久化目录
 - 插件应把 `config` 当成自己的 opaque settings
 - 只有 JSON-RPC 成功但没有 `result.started: true` 会被 host 拒绝
+- 插件完成自身运行时初始化后，`start` 就应尽快返回；不要把 QR 扫码、
+  设备配对或人工登录这类交互过程塞进 `start` 的阻塞等待里
+- 如果首次认证还没完成，也应先返回 `started: true`，再通过 `health`
+  暴露当前尚未就绪的状态
 
 ### `stop`
 
@@ -260,6 +264,14 @@ host 不要求额外的固定字段，但仍然建议插件返回一个 `result`
 - 否则 `ok`、`connected`、`logged_in` 至少要出现一个
 - 空对象 `{}` 是非法响应
 - 如果插件不支持 `health`，就不要声明 capability，不要返回假的 stub 成功
+
+建议的异步认证行为：
+
+- 当插件已经启动成功、但认证仍在等待时，`start` 应立即返回，并通过
+  `health` 报告 `connected: false` 和/或 `logged_in: false`
+- `healthy: false` 应保留给插件运行时本身异常的情况，而不是单纯“还在等扫码”
+- 登录完成后，`health` 应自然收敛为 `connected: true` 与 `logged_in: true`，
+  不需要 host 重启插件
 
 ## 出站 RPC
 
@@ -637,6 +649,13 @@ Host 行为：
 - 保持 stdout 不被阻塞
 - 尽量不要在 JSON-RPC 主线程里做过长耗时工作
 
+对于 QR 扫码、设备绑定这类交互式认证流程，更推荐异步登录模型：
+
+- `start` 只负责拉起后台连接/认证流程，并尽快返回
+- `health` 负责持续暴露当前是否已连接、是否已登录
+- QR 展示和配对交互应由插件或其配套 bridge 负责，而不是通过放大 host
+  控制面的超时时间来兜底
+
 ## 安全与隔离
 
 host/plugin 边界虽然很窄，但插件本质上仍然是以 nullclaw 用户权限运行的本地进程。
@@ -702,6 +721,7 @@ reference adapter 和 authoring template。
 - 实现 `start`、`send`、`stop`
 - 返回 `protocol_version: 2`
 - `start` 返回 `started: true`
+- 不要让 `start` 因 QR 扫码、配对或交互式认证而长期阻塞
 - 被接受的出站动作返回 `accepted: true`
 - `inbound_message` 使用 `text`，不要再用 `content`
 - peer routing 有意义时，在 metadata 里带上 `peer_kind` 和 `peer_id`

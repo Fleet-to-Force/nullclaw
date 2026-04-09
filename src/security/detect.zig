@@ -19,9 +19,9 @@ pub const SandboxBackend = enum {
 
 /// Detect and create the best available sandbox backend.
 ///
-/// Priority on Linux: landlock > firejail > bubblewrap > docker > noop
+/// Priority on Linux: firejail > bubblewrap > docker > noop
 /// Priority on macOS: docker > noop
-/// Explicit backend selection overrides auto-detection.
+/// Landlock is not surfaced until rule installation is implemented.
 pub fn createSandbox(
     allocator: std.mem.Allocator,
     backend: SandboxBackend,
@@ -81,19 +81,19 @@ pub const SandboxStorage = struct {
 /// Auto-detect the best available sandbox backend.
 fn detectBest(allocator: std.mem.Allocator, workspace_dir: []const u8, storage: *SandboxStorage) Sandbox {
     if (comptime builtin.os.tag == .linux) {
-        // Try Landlock first (native, no external dependencies)
+        // Keep landlock hidden from auto mode until rule installation exists.
         storage.landlock = .{ .workspace_dir = workspace_dir };
         if (storage.landlock.sandbox().isAvailable()) {
             return storage.landlock.sandbox();
         }
 
-        // Try Firejail second
+        // Try Firejail first
         storage.firejail = .{ .workspace_dir = workspace_dir };
         if (storage.firejail.sandbox().isAvailable()) {
             return storage.firejail.sandbox();
         }
 
-        // Try Bubblewrap third
+        // Try Bubblewrap second
         storage.bubblewrap = .{ .workspace_dir = workspace_dir };
         if (storage.bubblewrap.sandbox().isAvailable()) {
             return storage.bubblewrap.sandbox();
@@ -147,9 +147,9 @@ pub fn detectAvailable(allocator: std.mem.Allocator, workspace_dir: []const u8) 
 
 test "detect available returns struct" {
     const avail = detectAvailable(std.testing.allocator, "/tmp/workspace");
-    // On macOS, landlock/firejail/bubblewrap should be false
+    try std.testing.expect(!avail.landlock);
+    // On macOS, firejail/bubblewrap should be false
     if (comptime builtin.os.tag != .linux) {
-        try std.testing.expect(!avail.landlock);
         try std.testing.expect(!avail.firejail);
         try std.testing.expect(!avail.bubblewrap);
     }
@@ -164,11 +164,18 @@ test "create sandbox with none returns noop" {
     try std.testing.expect(sb.isAvailable());
 }
 
+test "create sandbox with landlock falls back to noop until implemented" {
+    var storage: SandboxStorage = .{};
+    const sb = createSandbox(std.testing.allocator, .landlock, "/tmp/workspace", &storage);
+    try std.testing.expectEqualStrings("none", sb.name());
+}
+
 test "create sandbox with auto returns something" {
     var storage: SandboxStorage = .{};
     const sb = createSandbox(std.testing.allocator, .auto, "/tmp/workspace", &storage);
     // Should always return at least some sandbox
     try std.testing.expect(sb.name().len > 0);
+    try std.testing.expect(!std.mem.eql(u8, sb.name(), "landlock"));
 }
 
 test "create sandbox with docker returns docker" {

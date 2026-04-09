@@ -1,6 +1,6 @@
 # NullClaw 中文文档
 
-本目录提供面向使用者、运维者、贡献者的中文文档入口。
+本目录提供面向使用者、运维者与贡献者的中文文档入口。
 
 社区： [加入 Discord](https://discord.gg/Bfmdua22Ud)
 
@@ -18,8 +18,6 @@
 
 - 还没跑起来：先看 [安装指南](./installation.md)
 - 已经装好，准备接 provider / memory / channel：看 [配置指南](./configuration.md)
-- 要接入非 core 渠道插件：看 [外部渠道插件](./external-channels.md)
-- 要运维内建 DingTalk 渠道：看 [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)
 - 只想找命令：直接去 [命令参考](./commands.md)
 
 **如果你是从这里跳过来的**
@@ -30,27 +28,43 @@
 
 ## 从哪开始
 
-### 1. 我只想先跑起来
-
-推荐顺序：
-
-1. [安装指南](./installation.md)
-2. [配置指南](./configuration.md)
-3. [使用与运维](./usage.md)
-4. [命令参考](./commands.md)
-
+TH:### 0. 我没有任何技术背景
+JQ:
+NP:如果这是你第一次接触 NullClaw、从未配置过 AI 模型、没编辑过 JSON 文件，先从这里开始。
+VB:
+BV:[新手入门指南](./beginners-guide.md)
+VX:
+MS:
+TH:### 1. 我只想先跑起来
+JQ:
+HT:推荐顺序：
+WV:
+JX:1. [安装指南](./installation.md)
+ZS:2. [配置指南](./configuration.md)
+JY:3. [使用与运维](./usage.md)
+SQ:4. [命令参考](./commands.md)
+MS:
 ### 2. 我要部署和长期运行
 
 重点看：
 
 - [使用与运维](./usage.md)
-- [Lark 运维就绪](./ops/lark-ops-readiness.md)，用于排查飞书/Lark websocket 与权限问题
 - [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)
-- [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md) 适合 DingTalk 入站与回复链路排查
+- [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)
+- [Lark 运维就绪](./ops/lark-ops-readiness.md)
 - [Signal 部署专题](../../SIGNAL.md)
 
-### 3. 我要开发、改代码、提 PR
+### 3. 我要接入内置渠道之外的系统
+
+重点看：
+
+- [外部渠道插件](./external-channels.md)
+- [配置指南](./configuration.md)
+- [使用与运维](./usage.md)
+- [架构总览](./architecture.md)
+
+### 4. 我要开发、改代码、提 PR
 
 重点看：
 
@@ -61,18 +75,22 @@
 
 ## 文档导航
 
+BP:- [新手入门指南](./beginners-guide.md)  ← 第一次接触 NullClaw，从这里开始
 - [安装指南](./installation.md)
 - [Termux 指南](./termux.md)
 - [配置指南](./configuration.md)
-- [外部渠道插件](./external-channels.md)
 - [使用与运维](./usage.md)
-- [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)
-- [Lark 运维就绪](./ops/lark-ops-readiness.md)
 - [架构总览](./architecture.md)
 - [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)
+- [外部渠道插件](./external-channels.md)
 - [命令参考](./commands.md)
 - [开发指南](./development.md)
+
+## 运维专题
+
+- [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)
+- [Lark 运维就绪](./ops/lark-ops-readiness.md)
 
 ## 先看这 3 条
 
@@ -88,7 +106,7 @@ nullclaw onboard --interactive
 nullclaw agent -m "你好，nullclaw"
 ```
 
-如果你不用 Homebrew，请按 [安装指南](./installation.md) 走源码构建流程。
+如果你不用 Homebrew，请按 [安装指南](./installation.md) 走源码或容器流程。
 
 ## 推荐阅读顺序
 
@@ -115,24 +133,19 @@ nullclaw agent -m "你好，nullclaw"
 ## 专题文档
 
 - [安全披露流程](../../SECURITY.md)
-- [Lark 运维就绪](./ops/lark-ops-readiness.md)
 - [Signal 渠道部署](../../SIGNAL.md)
 - [贡献指南](../../CONTRIBUTING.md)
 
 ## 下一步
 
 - 新用户：按 [安装指南](./installation.md) → [配置指南](./configuration.md) → [使用与运维](./usage.md) 继续。
-- 需要扩展渠道：在 [配置指南](./configuration.md) 之后继续读 [外部渠道插件](./external-channels.md)。
-- 遇到飞书/Lark 运行异常：继续看 [Lark 运维就绪](./ops/lark-ops-readiness.md)。
-- 运维 / 集成：先看 [使用与运维](./usage.md)，再补 [安全机制](./security.md) 与 [Gateway API](./gateway-api.md)。
+- 运维 / 集成：先看 [使用与运维](./usage.md)，再补 [安全机制](./security.md)、[Gateway API](./gateway-api.md) 与对应运维专题。
 - 贡献者：先读 [开发指南](./development.md)，需要提交流程时再看 [贡献指南](../../CONTRIBUTING.md)。
 
 ## 相关页面
 
 - [Termux 指南](./termux.md)
 - [命令参考](./commands.md)
-- [外部渠道插件](./external-channels.md)
-- [Lark 运维就绪](./ops/lark-ops-readiness.md)
 - [架构总览](./architecture.md)
 - [安全机制](./security.md)
 - [Gateway API](./gateway-api.md)

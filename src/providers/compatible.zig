@@ -101,21 +101,24 @@ fn lookupFallbackStatusCode(root_obj: std.json.ObjectMap) ?u16 {
     return null;
 }
 
+fn lookupErrorMessageField(obj: std.json.ObjectMap) ?[]const u8 {
+    if (obj.get("message")) |message| {
+        if (message == .string) return message.string;
+    }
+    if (obj.get("msg")) |message| {
+        if (message == .string) return message.string;
+    }
+    return null;
+}
+
 fn lookupFallbackMessage(root_obj: std.json.ObjectMap) ?[]const u8 {
     if (root_obj.get("error")) |err_value| {
         if (err_value == .object) {
-            const err_obj = err_value.object;
-            if (err_obj.get("message")) |message| {
-                if (message == .string) return message.string;
-            }
+            if (lookupErrorMessageField(err_value.object)) |message| return message;
         }
     }
 
-    if (root_obj.get("message")) |message| {
-        if (message == .string) return message.string;
-    }
-
-    return null;
+    return lookupErrorMessageField(root_obj);
 }
 
 fn isResponsesFallbackMessage(message: []const u8) bool {
@@ -2394,6 +2397,12 @@ test "shouldFallbackToResponses only for explicit 404 payloads" {
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"message\":\"temporary overload\",\"code\":503}}"));
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
     try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "not json at all"));
+}
+
+test "shouldFallbackToResponses accepts msg fallback fields" {
+    try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"msg\":\"Not found\",\"code\":404}}"));
+    try std.testing.expect(shouldFallbackToResponses(std.testing.allocator, "{\"status\":404,\"msg\":\"unknown endpoint\"}"));
+    try std.testing.expect(!shouldFallbackToResponses(std.testing.allocator, "{\"error\":{\"msg\":\"No endpoints found that support image input\",\"code\":404}}"));
 }
 
 test "returnLoggedCompatibleApiError preserves fallback error" {

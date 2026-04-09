@@ -452,6 +452,32 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: usize) type {
             return item;
         }
 
+        pub fn consumeTimeout(self: *Self, timeout_ms: u32) error{Timeout}!?T {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const deadline_ns: i128 = std.time.nanoTimestamp() +
+                (@as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms);
+
+            while (self.len == 0 and !self.closed) {
+                const remaining_ns = remainingTimeoutNs(deadline_ns);
+                if (remaining_ns == 0) return error.Timeout;
+                self.not_empty.timedWait(&self.mutex, remaining_ns) catch |err| switch (err) {
+                    error.Timeout => {
+                        if (self.len == 0 and !self.closed) return error.Timeout;
+                    },
+                };
+            }
+            if (self.len == 0) return null;
+
+            const item = self.buf[self.head];
+            self.head = (self.head + 1) % capacity;
+            self.len -= 1;
+
+            self.not_full.signal();
+            return item;
+        }
+
         /// Closes the queue, waking all waiting threads.
         pub fn close(self: *Self) void {
             self.mutex.lock();
@@ -502,6 +528,10 @@ pub const Bus = struct {
 
     pub fn consumeInbound(self: *Bus) ?InboundMessage {
         return self.inbound.consume();
+    }
+
+    pub fn consumeInboundTimeout(self: *Bus, timeout_ms: u32) error{Timeout}!?InboundMessage {
+        return self.inbound.consumeTimeout(timeout_ms);
     }
 
     // -- Outbound: agent/cron/heartbeat → channels --

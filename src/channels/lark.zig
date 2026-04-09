@@ -16,10 +16,13 @@ const invalid_socket: SocketFd = switch (builtin.os.tag) {
     else => -1,
 };
 const AtomicU32 = std.atomic.Value(u32);
+const PendingReactionQueue = std.ArrayListUnmanaged([]const u8);
 const DEFAULT_LARK_PING_INTERVAL_MS: u32 = 120 * std.time.ms_per_s;
 const EVENT_CACHE_TTL_MS: i64 = 10_000;
 const LARK_WS_METHOD_CONTROL: i32 = 0;
 const LARK_WS_METHOD_DATA: i32 = 1;
+const LARK_API_MAX_BYTES: usize = 256 * 1024;
+const LARK_TYPING_PLACEHOLDER = "...";
 
 const LarkWsConnectConfig = struct {
     url: []u8,
@@ -97,6 +100,54 @@ pub const LarkChannel = struct {
     cached_token: ?[]const u8 = null,
     /// Epoch seconds when cached_token expires.
     token_expires_at: i64 = 0,
+    reaction_emojis: []const []const u8 = &.{},
+    /// Pending reaction message_ids queued per chat_id (for undo after responses are sent).
+    pending_reactions: std.StringHashMapUnmanaged(PendingReactionQueue) = .empty,
+    typing_mutex: std.Thread.Mutex = .{},
+    typing_placeholders: std.StringHashMapUnmanaged(root.Channel.MessageRef) = .empty,
+    test_message_seq: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
+    test_deleted_message_count: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    test_typing_hook: if (builtin.is_test) ?*TypingPlaceholderTestHook else void = if (builtin.is_test) null else {},
+
+    const TypingPlaceholderTestHook = struct {
+        mutex: std.Thread.Mutex = .{},
+        cond: std.Thread.Condition = .{},
+        armed: bool = true,
+        paused: bool = false,
+        released: bool = false,
+
+        fn maybePause(self: *TypingPlaceholderTestHook) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (!self.armed) return;
+            self.armed = false;
+            self.paused = true;
+            self.cond.broadcast();
+            while (!self.released) {
+                self.cond.wait(&self.mutex);
+            }
+        }
+
+        fn waitUntilPaused(self: *TypingPlaceholderTestHook) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.paused) {
+                self.cond.wait(&self.mutex);
+            }
+        }
+
+        fn releaseWaiters(self: *TypingPlaceholderTestHook) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.released = true;
+            self.cond.broadcast();
+        }
+    };
+
+    const AuthenticatedRequest = union(enum) {
+        post: []const u8,
+        delete,
+    };
 
     pub const FEISHU_BASE_URL = "https://open.feishu.cn/open-apis";
     pub const LARK_BASE_URL = "https://open.larksuite.com/open-apis";
@@ -134,7 +185,119 @@ pub const LarkChannel = struct {
         ch.account_id = cfg.account_id;
         ch.receive_mode = cfg.receive_mode;
         ch.use_feishu = cfg.use_feishu;
+        ch.reaction_emojis = cfg.reaction_emojis;
         return ch;
+    }
+
+    fn deinitPendingReactionQueue(allocator: std.mem.Allocator, queue: *PendingReactionQueue) void {
+        for (queue.items) |message_id| allocator.free(message_id);
+        queue.deinit(allocator);
+    }
+
+    fn deinitPendingReactions(self: *LarkChannel) void {
+        var pending = self.pending_reactions;
+        self.pending_reactions = .empty;
+
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            deinitPendingReactionQueue(self.allocator, entry.value_ptr);
+            self.allocator.free(@constCast(entry.key_ptr.*));
+        }
+        pending.deinit(self.allocator);
+    }
+
+    fn deinitTypingPlaceholders(self: *LarkChannel) void {
+        self.typing_mutex.lock();
+        var placeholders = self.typing_placeholders;
+        self.typing_placeholders = .empty;
+        self.typing_mutex.unlock();
+
+        var it = placeholders.iterator();
+        while (it.next()) |entry| {
+            self.deleteTrackedMessage(entry.value_ptr.*) catch {};
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        placeholders.deinit(self.allocator);
+    }
+
+    fn resetOwnedState(self: *LarkChannel) void {
+        self.deinitTypingPlaceholders();
+        self.deinitPendingReactions();
+        self.invalidateToken();
+    }
+
+    fn enqueuePendingReaction(self: *LarkChannel, chat_id: []const u8, message_id: []const u8) !void {
+        const gop = try self.pending_reactions.getOrPut(self.allocator, chat_id);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, chat_id);
+            gop.value_ptr.* = .empty;
+            errdefer {
+                if (self.pending_reactions.fetchRemove(chat_id)) |entry| {
+                    var queue = entry.value;
+                    queue.deinit(self.allocator);
+                    self.allocator.free(@constCast(entry.key));
+                }
+            }
+        }
+
+        const message_copy = try self.allocator.dupe(u8, message_id);
+        errdefer self.allocator.free(message_copy);
+        try gop.value_ptr.append(self.allocator, message_copy);
+    }
+
+    fn buildMessageCollectionUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
+        return fbs.getWritten();
+    }
+
+    fn buildMessageItemUrl(self: *const LarkChannel, buf: []u8, message_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().print("{s}/im/v1/messages/{s}", .{ self.apiBase(), message_id });
+        return fbs.getWritten();
+    }
+
+    fn buildTextContent(text: []const u8, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        try fbs.writer().writeAll("{\"text\":");
+        try root.appendJsonStringW(fbs.writer(), text);
+        try fbs.writer().writeAll("}");
+        return fbs.getWritten();
+    }
+
+    fn buildTextMessageBody(recipient: []const u8, text: []const u8, buf: []u8) ![]const u8 {
+        var content_buf: [4096]u8 = undefined;
+        const content = try buildTextContent(text, &content_buf);
+
+        var body_fbs = std.io.fixedBufferStream(buf);
+        const w = body_fbs.writer();
+        try w.writeAll("{\"receive_id\":\"");
+        try w.writeAll(recipient);
+        try w.writeAll("\",\"msg_type\":\"text\",\"content\":");
+        try root.appendJsonStringW(w, content);
+        try w.writeAll("}");
+        return body_fbs.getWritten();
+    }
+
+    fn parseMessageId(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.LarkApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.LarkApiError;
+
+        const data_val = parsed.value.object.get("data") orelse return error.LarkApiError;
+        if (data_val != .object) return error.LarkApiError;
+
+        const message_id_val = data_val.object.get("message_id") orelse return error.LarkApiError;
+        if (message_id_val != .string or message_id_val.string.len == 0) return error.LarkApiError;
+        return allocator.dupe(u8, message_id_val.string);
+    }
+
+    fn maybePauseBeforeTypingSend(self: *LarkChannel) void {
+        if (!builtin.is_test) return;
+        if (self.test_typing_hook) |hook| {
+            hook.maybePause();
+        }
     }
 
     /// Return the API base URL based on region setting.
@@ -200,6 +363,7 @@ pub const LarkChannel = struct {
                 .content = try allocator.dupe(u8, text),
                 .timestamp = root.nowEpochSecs(),
                 .is_group = extractCardActionIsGroup(event, root_context),
+                .message_id = &.{},
             });
             return result.toOwnedSlice(allocator);
         } else {
@@ -279,11 +443,16 @@ pub const LarkChannel = struct {
             break :blk root.nowEpochSecs();
         };
 
+        // Extract message_id for reaction support
+        const msg_id_val = msg_obj.object.get("message_id");
+        const message_id = if (msg_id_val) |mid_val| (if (mid_val == .string) mid_val.string else "") else "";
+
         try result.append(allocator, .{
             .sender = try allocator.dupe(u8, chat_id),
             .content = try allocator.dupe(u8, text),
             .timestamp = timestamp,
             .is_group = std.mem.eql(u8, chat_type, "group"),
+            .message_id = if (message_id.len > 0) try allocator.dupe(u8, message_id) else &.{},
         });
 
         return result.toOwnedSlice(allocator);
@@ -660,41 +829,115 @@ pub const LarkChannel = struct {
         return self.allocator.dupe(u8, token_val.string);
     }
 
-    /// POST body to url with Lark bearer auth, retrying once on 401 token expiry.
-    fn postWithTokenRetry(self: *LarkChannel, url: []const u8, body: []const u8) !void {
+    fn requestWithTokenRetry(
+        self: *LarkChannel,
+        op: []const u8,
+        url: []const u8,
+        request: AuthenticatedRequest,
+    ) ![]u8 {
         const token = try self.getTenantAccessToken();
         defer self.allocator.free(token);
+        return self.requestWithBearerRetry(op, url, request, token, true);
+    }
 
+    fn requestWithBearerRetry(
+        self: *LarkChannel,
+        op: []const u8,
+        url: []const u8,
+        request: AuthenticatedRequest,
+        bearer_token: []const u8,
+        allow_retry: bool,
+    ) ![]u8 {
         var auth_buf: [512]u8 = undefined;
-        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{bearer_token}) catch return error.LarkApiError;
         var auth_header_buf: [576]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
 
-        const resp = http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}) catch return error.LarkApiError;
-        defer self.allocator.free(resp.body);
+        const resp = switch (request) {
+            .post => |body| http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}),
+            .delete => curlDeleteWithStatus(self.allocator, url, &.{auth_header}),
+        } catch return error.LarkApiError;
+        errdefer self.allocator.free(resp.body);
 
-        if (resp.status_code == 401) {
+        if (resp.status_code == 401 and allow_retry) {
+            self.allocator.free(resp.body);
             self.invalidateToken();
             const new_token = self.getTenantAccessToken() catch return error.LarkApiError;
             defer self.allocator.free(new_token);
-
-            var retry_buf: [512]u8 = undefined;
-            const retry_value = std.fmt.bufPrint(&retry_buf, "Bearer {s}", .{new_token}) catch return error.LarkApiError;
-            var retry_header_buf: [576]u8 = undefined;
-            const retry_header = std.fmt.bufPrint(&retry_header_buf, "Authorization: {s}", .{retry_value}) catch return error.LarkApiError;
-
-            const retry_resp = http_util.curlPostWithStatus(self.allocator, url, body, &.{retry_header}) catch return error.LarkApiError;
-            defer self.allocator.free(retry_resp.body);
-
-            if (!statusCodeIsSuccess(retry_resp.status_code)) {
-                return error.LarkApiError;
-            }
-            try validateBusinessResponse(self.allocator, "send_message", retry_resp.body);
-            return;
+            return self.requestWithBearerRetry(op, url, request, new_token, false);
         }
 
         if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
-        try validateBusinessResponse(self.allocator, "send_message", resp.body);
+        try validateBusinessResponse(self.allocator, op, resp.body);
+        return resp.body;
+    }
+
+    /// POST body to url with Lark bearer auth, retrying once on 401 token expiry.
+    fn postWithTokenRetry(self: *LarkChannel, op: []const u8, url: []const u8, body: []const u8) !void {
+        const resp_body = try self.requestWithTokenRetry(op, url, .{ .post = body });
+        defer self.allocator.free(resp_body);
+    }
+
+    fn curlDeleteWithStatus(
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        headers: []const []const u8,
+    ) !http_util.HttpResponse {
+        var argv_buf: [24][]const u8 = undefined;
+        var argc: usize = 0;
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-s";
+        argc += 1;
+        argv_buf[argc] = "-X";
+        argc += 1;
+        argv_buf[argc] = "DELETE";
+        argc += 1;
+
+        for (headers) |header| {
+            if (argc + 2 > argv_buf.len) break;
+            argv_buf[argc] = "-H";
+            argc += 1;
+            argv_buf[argc] = header;
+            argc += 1;
+        }
+
+        argv_buf[argc] = "-w";
+        argc += 1;
+        argv_buf[argc] = "\n%{http_code}";
+        argc += 1;
+        argv_buf[argc] = url;
+        argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch return error.LarkApiError;
+
+        const stdout = child.stdout.?.readToEndAlloc(allocator, LARK_API_MAX_BYTES) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.LarkApiError;
+        };
+        errdefer allocator.free(stdout);
+
+        const term = child.wait() catch return error.LarkApiError;
+        switch (term) {
+            .Exited => |code| if (code != 0) return error.LarkApiError,
+            else => return error.LarkApiError,
+        }
+
+        const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.LarkApiError;
+        const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
+        if (status_raw.len != 3) return error.LarkApiError;
+        const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.LarkApiError;
+        const body = try allocator.dupe(u8, stdout[0..status_sep]);
+        allocator.free(stdout);
+
+        return .{
+            .status_code = status_code,
+            .body = body,
+        };
     }
 
     fn buildRichCardContent(buf: []u8, payload: root.Channel.OutboundPayload) ![]const u8 {
@@ -775,39 +1018,101 @@ pub const LarkChannel = struct {
         return card_fbs.getWritten();
     }
 
+    fn sendTextTracked(self: *LarkChannel, recipient: []const u8, text: []const u8) !root.Channel.MessageRef {
+        if (builtin.is_test) {
+            const message_id = try std.fmt.allocPrint(self.allocator, "lark-test-{d}", .{self.test_message_seq});
+            self.test_message_seq += 1;
+            return .{
+                .target = try self.allocator.dupe(u8, recipient),
+                .message_id = message_id,
+            };
+        }
+
+        var url_buf: [256]u8 = undefined;
+        const url = try self.buildMessageCollectionUrl(&url_buf);
+
+        var body_buf: [8192]u8 = undefined;
+        const body = try buildTextMessageBody(recipient, text, &body_buf);
+        const resp_body = try self.requestWithTokenRetry("send_message", url, .{ .post = body });
+        defer self.allocator.free(resp_body);
+
+        return .{
+            .target = try self.allocator.dupe(u8, recipient),
+            .message_id = try parseMessageId(self.allocator, resp_body),
+        };
+    }
+
+    fn deleteTrackedMessage(self: *LarkChannel, message_ref: root.Channel.MessageRef) !void {
+        if (builtin.is_test) {
+            self.test_deleted_message_count += 1;
+            return;
+        }
+
+        var url_buf: [256]u8 = undefined;
+        const url = try self.buildMessageItemUrl(&url_buf, message_ref.message_id);
+        const resp_body = try self.requestWithTokenRetry("delete_message", url, .delete);
+        defer self.allocator.free(resp_body);
+    }
+
+    fn clearTypingPlaceholder(self: *LarkChannel, recipient: []const u8) !void {
+        var owned_ref: ?root.Channel.MessageRef = null;
+
+        self.typing_mutex.lock();
+        if (self.typing_placeholders.fetchRemove(recipient)) |entry| {
+            self.allocator.free(entry.key);
+            owned_ref = entry.value;
+        }
+        self.typing_mutex.unlock();
+
+        if (owned_ref) |message_ref| {
+            defer message_ref.deinit(self.allocator);
+            try self.deleteTrackedMessage(message_ref);
+        }
+    }
+
+    fn startTypingPlaceholder(self: *LarkChannel, recipient: []const u8) !void {
+        self.typing_mutex.lock();
+        if (self.typing_placeholders.contains(recipient)) {
+            self.typing_mutex.unlock();
+            return;
+        }
+        self.typing_mutex.unlock();
+
+        self.maybePauseBeforeTypingSend();
+
+        const message_ref = try self.sendTextTracked(recipient, LARK_TYPING_PLACEHOLDER);
+        errdefer message_ref.deinit(self.allocator);
+
+        self.typing_mutex.lock();
+        defer self.typing_mutex.unlock();
+
+        const gop = try self.typing_placeholders.getOrPut(self.allocator, recipient);
+        if (gop.found_existing) {
+            self.deleteTrackedMessage(message_ref) catch {};
+            message_ref.deinit(self.allocator);
+            return;
+        }
+        errdefer _ = self.typing_placeholders.fetchRemove(recipient);
+        gop.key_ptr.* = try self.allocator.dupe(u8, recipient);
+        gop.value_ptr.* = message_ref;
+    }
+
     /// Send a plain text message to a Lark chat via the Open API.
     /// POST /im/v1/messages?receive_id_type=chat_id
     pub fn sendMessage(self: *LarkChannel, recipient: []const u8, text: []const u8) !void {
-        var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
-        const url = url_fbs.getWritten();
-
-        var content_buf: [4096]u8 = undefined;
-        var content_fbs = std.io.fixedBufferStream(&content_buf);
-        try content_fbs.writer().writeAll("{\"text\":");
-        try root.appendJsonStringW(content_fbs.writer(), text);
-        try content_fbs.writer().writeAll("}");
-
-        var body_buf: [8192]u8 = undefined;
-        var body_fbs = std.io.fixedBufferStream(&body_buf);
-        const w = body_fbs.writer();
-        try w.writeAll("{\"receive_id\":\"");
-        try w.writeAll(recipient);
-        try w.writeAll("\",\"msg_type\":\"text\",\"content\":");
-        try root.appendJsonStringW(w, content_fbs.getWritten());
-        try w.writeAll("}");
-
-        try self.postWithTokenRetry(url, body_fbs.getWritten());
+        self.clearTypingPlaceholder(recipient) catch {};
+        const message_ref = try self.sendTextTracked(recipient, text);
+        message_ref.deinit(self.allocator);
     }
 
     /// Send a rich interactive card to a Lark chat via the Open API.
     /// Renders as a Lark Card 2.0 (schema 2.0) interactive message.
     pub fn sendRichMessage(self: *LarkChannel, recipient: []const u8, payload: root.Channel.OutboundPayload) !void {
+        self.clearTypingPlaceholder(recipient) catch {};
+        if (builtin.is_test) return;
+
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
-        const url = url_fbs.getWritten();
+        const url = try self.buildMessageCollectionUrl(&url_buf);
 
         var card_buf: [16384]u8 = undefined;
         const card_content = try buildRichCardContent(&card_buf, payload);
@@ -820,7 +1125,138 @@ pub const LarkChannel = struct {
         try root.appendJsonStringW(bw, card_content);
         try bw.writeAll("}");
 
-        try self.postWithTokenRetry(url, body_fbs.getWritten());
+        try self.postWithTokenRetry("send_message", url, body_fbs.getWritten());
+    }
+
+    /// Add a reaction emoji to a message. Randomly picks from reaction_emojis config.
+    /// Stores the reaction for later undo (via deletePendingReaction).
+    fn reactToMessage(self: *LarkChannel, message_id: []const u8, chat_id: []const u8) !void {
+        if (message_id.len == 0) return;
+        if (self.reaction_emojis.len == 0) return;
+
+        const idx = if (self.reaction_emojis.len == 1) 0 else blk: {
+            const seed = @as(u64, @bitCast(std.time.timestamp()));
+            break :blk @as(usize, @intCast(@mod(seed, @as(u64, @intCast(self.reaction_emojis.len)))));
+        };
+        const emoji = self.reaction_emojis[idx];
+
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions", .{ self.apiBase(), message_id });
+
+        var body_buf: [256]u8 = undefined;
+        var body_fbs = std.io.fixedBufferStream(&body_buf);
+        try body_fbs.writer().writeAll("{\"reaction_type\":{\"emoji_type\":\"");
+        try body_fbs.writer().writeAll(emoji);
+        try body_fbs.writer().writeAll("\"}}");
+
+        const token = try self.getTenantAccessToken();
+        defer self.allocator.free(token);
+
+        var auth_buf: [512]u8 = undefined;
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
+
+        const resp = http_util.curlPostWithStatus(self.allocator, url_fbs.getWritten(), body_fbs.getWritten(), &.{auth_header}) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
+
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+        try validateBusinessResponse(self.allocator, "add_reaction", resp.body);
+
+        if (chat_id.len > 0) {
+            try self.enqueuePendingReaction(chat_id, message_id);
+        }
+    }
+
+    /// Delete pending reaction for a chat (called after sending response).
+    fn deletePendingReaction(self: *LarkChannel, chat_id: []const u8) void {
+        const queue = self.pending_reactions.getPtr(chat_id) orelse return;
+        if (queue.items.len == 0) return;
+
+        const message_id = queue.items[0];
+        self.deleteReaction(message_id) catch |err| {
+            log.warn("lark deletePendingReaction failed: {}", .{err});
+            return;
+        };
+
+        self.allocator.free(queue.orderedRemove(0));
+        if (queue.items.len == 0) {
+            if (self.pending_reactions.fetchRemove(chat_id)) |entry| {
+                var pending_queue = entry.value;
+                pending_queue.deinit(self.allocator);
+                self.allocator.free(@constCast(entry.key));
+            }
+        }
+    }
+
+    /// List reactions on a message and delete ones matching our configured emojis.
+    fn deleteReaction(self: *LarkChannel, message_id: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions", .{ self.apiBase(), message_id });
+
+        const token = try self.getTenantAccessToken();
+        defer self.allocator.free(token);
+
+        var auth_buf: [512]u8 = undefined;
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
+
+        const resp = http_util.curlGetWithStatus(self.allocator, url_fbs.getWritten(), &.{auth_header}) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
+
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+        try validateBusinessResponse(self.allocator, "list_reactions", resp.body);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp.body, .{}) catch return error.LarkApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        const data = parsed.value.object.get("data") orelse return;
+        if (data != .object) return;
+        const items = data.object.get("items") orelse return;
+        if (items != .array) return;
+
+        for (items.array.items) |item| {
+            if (item != .object) continue;
+            const reaction_type = item.object.get("reaction_type") orelse continue;
+            if (reaction_type != .object) continue;
+            const emoji_type = reaction_type.object.get("emoji_type") orelse continue;
+            if (emoji_type != .string) continue;
+            const reaction_id = item.object.get("reaction_id") orelse continue;
+            if (reaction_id != .string) continue;
+
+            for (self.reaction_emojis) |our_emoji| {
+                if (std.mem.eql(u8, emoji_type.string, our_emoji)) {
+                    self.deleteReactionById(message_id, reaction_id.string) catch |err| {
+                        log.warn("lark deleteReactionById failed: {}", .{err});
+                    };
+                    break;
+                }
+            }
+        }
+    }
+
+    fn deleteReactionById(self: *LarkChannel, message_id: []const u8, reaction_id: []const u8) !void {
+        var url_buf: [256]u8 = undefined;
+        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions/{s}", .{ self.apiBase(), message_id, reaction_id });
+
+        const token = try self.getTenantAccessToken();
+        defer self.allocator.free(token);
+
+        var auth_buf: [512]u8 = undefined;
+        const auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch return error.LarkApiError;
+        var auth_header_buf: [576]u8 = undefined;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
+
+        const resp = curlDeleteWithStatus(self.allocator, url_fbs.getWritten(), &.{auth_header}) catch return error.LarkApiError;
+        defer self.allocator.free(resp.body);
+
+        if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
+        try validateBusinessResponse(self.allocator, "delete_reaction", resp.body);
     }
 
     fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
@@ -961,6 +1397,12 @@ pub const LarkChannel = struct {
     }
 
     fn publishInboundMessage(self: *LarkChannel, msg: ParsedLarkMessage) void {
+        if (msg.message_id.len > 0) {
+            self.reactToMessage(msg.message_id, msg.sender) catch |err| {
+                log.warn("lark reactToMessage failed: {}", .{err});
+            };
+        }
+
         var key_buf: [256]u8 = undefined;
         const session_key = std.fmt.bufPrint(&key_buf, "lark:{s}", .{msg.sender}) catch "lark:unknown";
 
@@ -1218,16 +1660,40 @@ pub const LarkChannel = struct {
             t.join();
             self.ws_thread = null;
         }
+
+        self.resetOwnedState();
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
         try self.sendMessage(target, message);
+        self.deletePendingReaction(target);
     }
 
     fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
         const self: *LarkChannel = @ptrCast(@alignCast(ptr));
         try self.sendRichMessage(target, payload);
+        self.deletePendingReaction(target);
+    }
+
+    fn vtableSendTracked(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!?root.Channel.MessageRef {
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        return try self.sendTextTracked(target, message);
+    }
+
+    fn vtableStartTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        try self.startTypingPlaceholder(recipient);
+    }
+
+    fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        try self.clearTypingPlaceholder(recipient);
+    }
+
+    fn vtableDeleteMessage(ptr: *anyopaque, message_ref: root.Channel.MessageRef) anyerror!void {
+        const self: *LarkChannel = @ptrCast(@alignCast(ptr));
+        try self.deleteTrackedMessage(message_ref);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -1245,6 +1711,10 @@ pub const LarkChannel = struct {
         .stop = &vtableStop,
         .send = &vtableSend,
         .sendRich = &vtableSendRich,
+        .sendTracked = &vtableSendTracked,
+        .startTyping = &vtableStartTyping,
+        .stopTyping = &vtableStopTyping,
+        .deleteMessage = &vtableDeleteMessage,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
     };
@@ -1259,10 +1729,12 @@ pub const ParsedLarkMessage = struct {
     content: []const u8,
     timestamp: u64,
     is_group: bool = false,
+    message_id: []const u8 = &.{},
 
     pub fn deinit(self: *ParsedLarkMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.sender);
         allocator.free(self.content);
+        if (self.message_id.len > 0) allocator.free(self.message_id);
     }
 };
 
@@ -2372,6 +2844,117 @@ test "lark buildRichCardContent uses action group button ids directly" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"submit_text\"") == null);
 }
 
+test "lark parseMessageId extracts message id from send response" {
+    const message_id = try LarkChannel.parseMessageId(
+        std.testing.allocator,
+        "{\"code\":0,\"msg\":\"success\",\"data\":{\"message_id\":\"om_test_123\"}}",
+    );
+    defer std.testing.allocator.free(message_id);
+    try std.testing.expectEqualStrings("om_test_123", message_id);
+}
+
+test "lark channel sendTracked and deleteMessage are safe in tests" {
+    const allocator = std.testing.allocator;
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &.{});
+
+    const message_ref = (try ch.channel().sendTracked("oc_chat_tracked", "draft")) orelse
+        return error.TestUnexpectedResult;
+    defer message_ref.deinit(allocator);
+
+    try std.testing.expectEqualStrings("oc_chat_tracked", message_ref.target);
+    try std.testing.expectEqualStrings("lark-test-0", message_ref.message_id);
+
+    try ch.channel().deleteMessage(message_ref);
+    try std.testing.expectEqual(@as(usize, 1), ch.test_deleted_message_count);
+}
+
+test "lark typing placeholder start and stop are best-effort in tests" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    defer ch.deinitTypingPlaceholders();
+
+    try ch.startTypingPlaceholder("oc_chat_1");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    try ch.clearTypingPlaceholder("oc_chat_1");
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+}
+
+test "lark sendMessage clears typing placeholder before final send" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    defer ch.deinitTypingPlaceholders();
+
+    // Regression: Lark should show immediate processing feedback and clear it
+    // when the final reply is sent.
+    try ch.startTypingPlaceholder("oc_chat_2");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    try ch.sendMessage("oc_chat_2", "final reply");
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+}
+
+test "lark sendRichMessage clears typing placeholder before final send" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    defer ch.deinitTypingPlaceholders();
+
+    try ch.startTypingPlaceholder("oc_chat_rich");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    try ch.sendRichMessage("oc_chat_rich", .{ .text = "rich reply" });
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+}
+
+test "lark stop deletes active typing placeholders in tests" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    // Regression: stopping the channel must delete visible placeholder messages,
+    // not just free the local tracking map.
+    try ch.startTypingPlaceholder("oc_chat_3");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    ch.channel().stop();
+
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+    try std.testing.expectEqual(@as(usize, 1), ch.test_deleted_message_count);
+}
+
+test "lark typing placeholder deletes duplicate send after race" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+    defer ch.deinitTypingPlaceholders();
+
+    var hook = LarkChannel.TypingPlaceholderTestHook{};
+    ch.test_typing_hook = &hook;
+
+    const ThreadCtx = struct {
+        channel: *LarkChannel,
+
+        fn run(ctx: *@This()) void {
+            ctx.channel.startTypingPlaceholder("oc_chat_4") catch unreachable;
+        }
+    };
+
+    var ctx = ThreadCtx{ .channel = &ch };
+    const worker = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctx});
+    hook.waitUntilPaused();
+
+    try ch.startTypingPlaceholder("oc_chat_4");
+    hook.releaseWaiters();
+    worker.join();
+
+    try std.testing.expectEqual(@as(u64, 2), ch.test_message_seq);
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+    try std.testing.expectEqual(@as(usize, 1), ch.test_deleted_message_count);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // WebSocket Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -2647,6 +3230,28 @@ test "lark parseEventPayload handles websocket message format" {
     try std.testing.expectEqual(@as(u64, 1_700_000_000), msgs[0].timestamp);
 }
 
+test "lark parseEventPayload captures message_id for reactions" {
+    const allocator = std.testing.allocator;
+    const users = [_][]const u8{"*"};
+    const ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &users);
+
+    const payload =
+        \\{"uuid":"uuid-123-456","header":{"event_type":"im.message.receive_v1"},"event":{"sender":{"sender_id":{"open_id":"ou_user"}},"message":{"message_id":"om_456","message_type":"text","content":"{\"text\":\"websocket message\"}","chat_id":"oc_chat","create_time":"1700000000000"}}}
+    ;
+
+    const msgs = try ch.parseEventPayload(allocator, payload);
+    defer {
+        for (msgs) |*m| {
+            var mm = m.*;
+            mm.deinit(allocator);
+        }
+        allocator.free(msgs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), msgs.len);
+    try std.testing.expectEqualStrings("om_456", msgs[0].message_id);
+}
+
 test "lark parseEventPayload handles websocket message with mentions" {
     const allocator = std.testing.allocator;
     const users = [_][]const u8{"*"};
@@ -2699,6 +3304,19 @@ test "lark initFromConfig with webhook mode" {
     try std.testing.expect(!ch.use_feishu);
 }
 
+test "lark initFromConfig carries reaction emojis" {
+    const cfg = config_types.LarkConfig{
+        .account_id = "lark-reactions-test",
+        .app_id = "cli_react",
+        .app_secret = "sec_react",
+        .reaction_emojis = &.{ "SMILE", "THUMBSUP" },
+    };
+    const ch = LarkChannel.initFromConfig(std.testing.allocator, cfg);
+    try std.testing.expectEqual(@as(usize, 2), ch.reaction_emojis.len);
+    try std.testing.expectEqualStrings("SMILE", ch.reaction_emojis[0]);
+    try std.testing.expectEqualStrings("THUMBSUP", ch.reaction_emojis[1]);
+}
+
 test "lark running and connected defaults" {
     const ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
     try std.testing.expect(!ch.running.load(.acquire));
@@ -2719,6 +3337,43 @@ test "lark invalidateToken clears cached token" {
 
     try std.testing.expect(ch.cached_token == null);
     try std.testing.expectEqual(@as(i64, 0), ch.token_expires_at);
+}
+
+test "lark resetOwnedState keeps pending reactions FIFO and frees allocations" {
+    const allocator = std.testing.allocator;
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &.{});
+
+    // Regression: multiple inbound messages in one chat must not overwrite or leak pending reactions.
+    try ch.enqueuePendingReaction("chat-1", "msg-1");
+    try ch.enqueuePendingReaction("chat-1", "msg-2");
+    try ch.enqueuePendingReaction("chat-2", "msg-3");
+    ch.cached_token = try allocator.dupe(u8, "cached_tok_123");
+    ch.token_expires_at = std.time.timestamp() + 7200;
+
+    try std.testing.expectEqual(@as(usize, 2), ch.pending_reactions.getPtr("chat-1").?.items.len);
+    try std.testing.expectEqualStrings("msg-1", ch.pending_reactions.getPtr("chat-1").?.items[0]);
+    try std.testing.expectEqualStrings("msg-2", ch.pending_reactions.getPtr("chat-1").?.items[1]);
+    try std.testing.expectEqual(@as(usize, 1), ch.pending_reactions.getPtr("chat-2").?.items.len);
+
+    ch.resetOwnedState();
+
+    try std.testing.expect(ch.cached_token == null);
+    try std.testing.expectEqual(@as(i64, 0), ch.token_expires_at);
+    try std.testing.expect(ch.pending_reactions.get("chat-1") == null);
+    try std.testing.expect(ch.pending_reactions.get("chat-2") == null);
+}
+
+test "lark resetOwnedState deletes tracked typing placeholders" {
+    const allocator = std.testing.allocator;
+    var ch = LarkChannel.init(allocator, "id", "secret", "token", 9898, &.{});
+
+    try ch.startTypingPlaceholder("oc_chat_reset");
+    try std.testing.expectEqual(@as(usize, 1), ch.typing_placeholders.count());
+
+    ch.resetOwnedState();
+
+    try std.testing.expectEqual(@as(usize, 0), ch.typing_placeholders.count());
+    try std.testing.expectEqual(@as(usize, 1), ch.test_deleted_message_count);
 }
 
 test "lark parseEventPayload websocket payload with post message" {

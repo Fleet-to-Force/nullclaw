@@ -14,6 +14,7 @@ pub const websocket = @import("websocket.zig");
 // Phase 1: Core
 pub const bus = @import("bus.zig");
 pub const config = @import("config.zig");
+pub const config_paths = @import("config_paths.zig");
 pub const util = @import("util.zig");
 pub const platform = @import("platform.zig");
 pub const codex_support = @import("codex_support.zig");
@@ -38,6 +39,7 @@ pub const list_models = @import("list_models.zig");
 pub const provider_probe = @import("provider_probe.zig");
 pub const channel_probe = @import("channel_probe.zig");
 pub const from_json = @import("from_json.zig");
+pub const inbound_debounce = @import("inbound_debounce.zig");
 
 // Phase 2: Agent core
 pub const agent = @import("agent.zig");

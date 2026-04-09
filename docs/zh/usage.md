@@ -56,7 +56,10 @@ nullclaw gateway
 
 建议在长期运行场景使用 service 子命令：
 
+- macOS 走 `launchctl`。
 - Linux 环境会优先使用 `systemd --user`，在 Alpine / OpenRC 系统上会自动切换为 OpenRC。
+- Windows 走 Service Control Manager。
+- 如果 Linux 上既没有可用的 `systemd --user`，也缺少必需的 OpenRC 命令，这组子命令会失败；此时应改用前台 `nullclaw gateway` 或其他外部 supervisor。
 
 ```bash
 nullclaw service install
@@ -76,6 +79,7 @@ nullclaw service start
 - 默认网关地址：`127.0.0.1:3000`
 - 推荐保持 `gateway.require_pairing = true`
 - 建议通过 tunnel 暴露外网访问，不直接公网监听网关
+- `/pair` 仅支持 POST，并使用 `X-Pairing-Code`；多次错误尝试会触发限流，且可能进入临时锁定
 
 网关健康检查：
 
@@ -118,7 +122,7 @@ nullclaw onboard --interactive
 重点检查：
 
 - `channels.<name>.accounts.*` 的 token / webhook / account 字段是否正确。
-- `allow_from` 是否误设为空数组。
+- 是否存在渠道级 allowlist / gating 配置不匹配（如 `allow_from`、`group_allow_from`、`require_mention` 等）。空 `allow_from` 不是通用的“拒绝所有”开关。
 - `nullclaw channel status` 是否有 unhealthy 标记。
 - 如果是 DingTalk，进一步看
   [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)。

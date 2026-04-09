@@ -288,6 +288,58 @@ Practical effect:
 - Two named agents can share the same provider/model family but keep separate durable notes and separate workspaces.
 - `workspace_path` does not route chats by itself. Routing still comes from `bindings`, `/bind`, or explicit `--agent` / `/subagents spawn --agent`.
 
+### `messages.inbound`
+
+- `debounce_ms` delays handling rapid-fire plain-text inbound messages so several short fragments can collapse into one turn.
+- Default: `3000`.
+- Applies to daemon-routed inbound text and the Agent CLI REPL.
+- Set `0` to disable it.
+- Slash commands and media-bearing inbound messages bypass debounce.
+- Telegram keeps its channel-specific split-message merge path; this setting becomes the base debounce window for that path.
+
+Example:
+
+```json
+{
+  "messages": {
+    "inbound": {
+      "debounce_ms": 1500
+    }
+  }
+}
+```
+
+### `reliability`
+
+- Configures global retry and failover behavior for LLM providers.
+- `provider_retries`: Number of times to retry a failed LLM request (default: 2).
+- `provider_backoff_ms`: Initial exponential backoff delay between retries (default: 500).
+- `fallback_providers`: List of provider names to try if an unqualified model should fan out beyond the primary provider.
+- `model_fallbacks`: Mapping of a model to an ordered list of fallback models. Each fallback may be either another bare model name or an explicit `provider/model` ref.
+
+Example:
+
+```json
+{
+  "reliability": {
+    "provider_retries": 2,
+    "provider_backoff_ms": 500,
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- Failover order for bare model refs: primary provider first, then each listed `fallback_provider`.
+- Provider-qualified fallback refs such as `openai/gpt-4o` route directly to that provider and skip the generic provider fanout.
+- `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.
@@ -385,9 +437,9 @@ contract, see [External Channel Plugins](./external-channels.md).
 - `config` must be a JSON object; it is forwarded to the plugin `start` request as `params.config`.
 - Plugins must answer `get_manifest`, handle `start`/`send`/`stop`; `health` is recommended so supervision can detect disconnected sidecars instead of only live processes.
 - `get_manifest.result` must contain `protocol_version: 2`; `capabilities.health`, `capabilities.streaming`, `capabilities.send_rich`, `capabilities.typing`, `capabilities.edit`, `capabilities.delete`, `capabilities.reactions`, and `capabilities.read_receipts` are optional capability bits.
-- `health.result` must report an explicit boolean (`healthy`) or explicit health signals (`ok`, `connected`, `logged_in`); an empty object is treated as invalid.
+- `health.result` must report an explicit boolean (`healthy`) or explicit health signals (`ok`, `connected`, `logged_in`); an empty object is treated as invalid. For QR/device-link style channels, this is the place to report `connected: false` or `logged_in: false` while background auth is still in progress.
 - `start.params` now has a nested `runtime` object with `name`, `account_id`, and host-owned `state_dir`.
-- `start.result` must contain `started: true`; `send`, `send_rich`, `edit_message`, `delete_message`, and typing/message-action RPCs must return `result.accepted: true` when the plugin actually accepts the action. A JSON-RPC success envelope by itself is not enough.
+- `start.result` must contain `started: true`; `start` should return promptly after local initialization instead of blocking on QR scans or human login. `send`, `send_rich`, `edit_message`, `delete_message`, and typing/message-action RPCs must return `result.accepted: true` when the plugin actually accepts the action. A JSON-RPC success envelope by itself is not enough.
 - `send.params` now has nested `runtime` and `message` objects; text payloads use `message.text`.
 - If a plugin declares both `capabilities.edit=true` and `capabilities.delete=true`, `send.result` may also include `message_id` or `message { target?, message_id }`; that lets nullclaw keep a tracked draft updated on channels that do not support native `.chunk` streaming.
 - If `capabilities.streaming=true`, nullclaw may emit `.chunk` staged `send` events during model streaming. If it is absent or `false`, nullclaw will only emit final responses.
@@ -418,6 +470,35 @@ Telegram example:
   }
 }
 ```
+
+WeChat example:
+
+```json
+{
+  "channels": {
+    "wechat": [
+      {
+        "account_id": "main",
+        "callback_token": "wechat-callback-token",
+        "encoding_aes_key": "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        "app_id": "wx1234567890abcdef",
+        "app_secret": "wechat-app-secret",
+        "allow_from": ["openid_123"]
+      }
+    ]
+  }
+}
+```
+
+WeChat notes:
+
+- NullClaw already supports WeChat as a built-in webhook channel; you do not need an external plugin to receive Official Account callbacks.
+- The gateway webhook path is `/wechat`. Use `?account_id=<id>` when you have multiple configured WeChat accounts.
+- `callback_token` is required for signature verification.
+- `encoding_aes_key` is optional but required when your WeChat callback is configured for `encrypt_type=aes`.
+- `app_id` and `app_secret` are optional unless you want outbound active-message delivery through the WeChat custom message API.
+- `allow_from` should list trusted OpenIDs. Keep it explicit; do not rely on an empty allowlist for privacy.
+- Build with `-Dchannels=wechat` (or `-Dchannels=all`) if your binary was compiled without the WeChat channel.
 
 Telegram forum topics:
 
@@ -598,8 +679,8 @@ Effect on delivery:
 
 Rules:
 
-- `allow_from: []` means deny all inbound messages.
-- `allow_from: ["*"]` means allow all sources (use only when you accept the risk).
+- Empty `allow_from` behavior is channel-specific. Some channels, including WeChat and Discord, treat an omitted or empty list as "no filtering" rather than "deny all", so set explicit IDs/OpenIDs for a private bot.
+- `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
 
 Max example:
 
@@ -762,6 +843,8 @@ Common issues:
 - `auto_save`: persists conversation memory automatically.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
 
+**Note**: The `markdown_only` memory profile automatically enables hybrid retrieval with temporal decay (half-life 30 days) for optimal relevance scoring. This ensures temporal awareness even with plain markdown files.
+
 ### `gateway`
 
 Recommended defaults:
@@ -770,6 +853,18 @@ Recommended defaults:
 - `require_pairing = true`
 
 Avoid direct public exposure. Use tunnel when external access is required.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `host` | `"127.0.0.1"` | Listen address |
+| `port` | `3000` | Listen port |
+| `require_pairing` | `true` | Require bearer token on all API requests |
+| `allow_public_bind` | `false` | Allow binding to non-loopback addresses |
+| `pair_rate_limit_per_minute` | `10` | Max `/pair` requests per minute per IP |
+| `webhook_rate_limit_per_minute` | `60` | Max webhook requests per minute per IP |
+| `idempotency_ttl_secs` | `300` | Duration to cache idempotent request results |
+| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image or file payloads (e.g. `20971520` for 20 MB). |
+| `request_timeout_secs` | `30` | Socket read timeout for incoming HTTP requests in seconds. Raise this when accepting large payloads over slow connections. |
 
 ### `tunnel`
 

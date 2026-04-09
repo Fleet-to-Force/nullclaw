@@ -70,7 +70,10 @@ nullclaw gateway
 
 For long-running deployments:
 
+- macOS uses `launchctl`.
 - Linux uses `systemd --user` when available and falls back to OpenRC on Alpine/OpenRC systems.
+- Windows uses the Service Control Manager.
+- If Linux has neither working `systemd --user` nor the required OpenRC commands, service subcommands fail; use foreground `nullclaw gateway` or another supervisor instead.
 
 ```bash
 nullclaw service install
@@ -90,6 +93,7 @@ nullclaw service start
 - Default gateway: `127.0.0.1:3000`
 - Recommended: keep `gateway.require_pairing = true`
 - For public access, prefer tunnel/reverse proxy over direct public bind
+- `/pair` is POST-only, uses `X-Pairing-Code`, and can be rate-limited or temporarily locked after repeated invalid attempts
 
 Health check:
 
@@ -132,7 +136,7 @@ nullclaw onboard --interactive
 Check:
 
 - `channels.<name>.accounts.*` token/webhook/account settings.
-- `allow_from` accidentally set to empty array.
+- Channel-specific allowlist or gating mismatch (`allow_from`, `group_allow_from`, `require_mention`, and similar settings). Empty `allow_from` is not a universal deny switch.
 - `nullclaw channel status` health output.
 - For DingTalk-specific stream and reply-target checks, open
   [DingTalk Ops Readiness](./ops/dingtalk-ops-readiness.md).

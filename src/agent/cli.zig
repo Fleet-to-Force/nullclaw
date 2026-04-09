@@ -21,7 +21,9 @@ const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const subagent_mod = @import("../subagent.zig");
 const subagent_runner = @import("../subagent_runner.zig");
+const bus_mod = @import("../bus.zig");
 const cli_mod = @import("../channels/cli.zig");
+const inbound_debounce = @import("../inbound_debounce.zig");
 const security = @import("../security/policy.zig");
 const codex_support = @import("../codex_support.zig");
 const onboard = @import("../onboard.zig");
@@ -356,6 +358,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const start_event = ObserverEvent{ .agent_start = .{
         .provider = if (selected_profile_storage) |profile| profile.provider else cfg.default_provider,
         .model = if (selected_profile_storage) |profile| profile.model else (cfg.default_model orelse "(default)"),
+        .channel = "cli",
     } };
     obs.recordEvent(&start_event);
 
@@ -439,6 +442,8 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .subagent_manager = &subagent_manager,
         .bootstrap_provider = bootstrap_provider,
         .backend_name = cfg.memory.backend,
+        .sandbox_backend = cfg.security.sandbox.backend,
+        .sandbox_enabled = cfg.sandboxEnabled(),
     });
     defer tools_mod.deinitTools(allocator, tools);
 
@@ -603,29 +608,49 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const stdin = std.fs.File.stdin();
     var line_buf: [4096]u8 = undefined;
+    var pending_line: ?[]u8 = null;
+    defer if (pending_line) |line| allocator.free(line);
 
     while (true) {
-        try w.print("> ", .{});
-        try w.flush();
+        var owned_line: ?[]u8 = null;
+        defer if (owned_line) |line| allocator.free(line);
 
-        // Read a line from stdin byte-by-byte
-        var pos: usize = 0;
-        while (pos < line_buf.len) {
-            const n = stdin.read(line_buf[pos .. pos + 1]) catch return;
-            if (n == 0) return; // EOF (Ctrl+D)
-            if (line_buf[pos] == '\n') break;
-            pos += 1;
-        }
-        const line = line_buf[0..pos];
+        const line = blk: {
+            if (pending_line) |queued| {
+                pending_line = null;
+                owned_line = queued;
+                break :blk queued;
+            }
+
+            try w.print("> ", .{});
+            try w.flush();
+
+            // Read a line from stdin byte-by-byte
+            var pos: usize = 0;
+            while (pos < line_buf.len) {
+                const n = stdin.read(line_buf[pos .. pos + 1]) catch return;
+                if (n == 0) return; // EOF (Ctrl+D)
+                if (line_buf[pos] == '\n') break;
+                pos += 1;
+            }
+            break :blk line_buf[0..pos];
+        };
 
         if (line.len == 0) continue;
         if (cli_mod.CliChannel.isQuitCommand(line)) return;
 
-        // Append to history
-        repl_history.append(allocator, allocator.dupe(u8, line) catch continue) catch {};
+        var debounced_input = try collectCliDebouncedInput(allocator, stdin, line, cfg.messages.inbound.debounce_ms);
+        defer debounced_input.deinit(allocator);
+        if (debounced_input.queued_next) |queued| {
+            pending_line = queued;
+            debounced_input.queued_next = null;
+        }
+
+        // Append the effective turn input after debounce coalescing.
+        repl_history.append(allocator, allocator.dupe(u8, debounced_input.current) catch continue) catch {};
 
         stream_ctx.emitted_text = false;
-        const response = agent.turn(line) catch |err| {
+        const response = agent.turn(debounced_input.current) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
             } else if (err == error.RateLimited) {
@@ -654,6 +679,97 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
 }
 
+fn collectCliDebouncedInput(
+    allocator: std.mem.Allocator,
+    stdin: std.fs.File,
+    first_line: []const u8,
+    debounce_ms: u32,
+) !CliDebouncedInput {
+    if (debounce_ms == 0 or @import("builtin").os.tag == .windows) {
+        return .{ .current = try allocator.dupe(u8, first_line) };
+    }
+
+    var debouncer = inbound_debounce.InboundDebouncer.init(allocator, debounce_ms);
+    defer debouncer.deinit();
+
+    var ready: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
+    defer {
+        for (ready.items) |msg| msg.deinit(allocator);
+        ready.deinit(allocator);
+    }
+
+    try debouncer.push(try bus_mod.makeInbound(allocator, "cli", "local-user", "cli", first_line, "cli:repl"), inbound_debounce.nowMs(), &ready);
+
+    while (ready.items.len == 0) {
+        const timeout_ms = debouncer.nextPollTimeoutMs(inbound_debounce.nowMs());
+        if (timeout_ms == 0) {
+            try debouncer.flushMatured(inbound_debounce.nowMs(), &ready);
+            continue;
+        }
+
+        var poll_fds = [_]std.posix.pollfd{
+            .{ .fd = stdin.handle, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const poll_timeout: i32 = if (timeout_ms > std.math.maxInt(i32))
+            std.math.maxInt(i32)
+        else
+            @intCast(timeout_ms);
+        const events = std.posix.poll(&poll_fds, poll_timeout) catch 0;
+        if (events > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
+            var extra_line_buf: [4096]u8 = undefined;
+            const extra_line = readCliLine(stdin, &extra_line_buf) orelse break;
+            if (extra_line.len > 0) {
+                try debouncer.push(try bus_mod.makeInbound(allocator, "cli", "local-user", "cli", extra_line, "cli:repl"), inbound_debounce.nowMs(), &ready);
+            }
+        } else {
+            try debouncer.flushMatured(inbound_debounce.nowMs(), &ready);
+        }
+    }
+
+    if (ready.items.len == 0) {
+        return .{ .current = try allocator.dupe(u8, first_line) };
+    }
+    return try buildCliDebouncedInput(allocator, ready.items);
+}
+
+fn readCliLine(stdin: std.fs.File, buf: []u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (pos < buf.len) {
+        const n = stdin.read(buf[pos .. pos + 1]) catch return null;
+        if (n == 0) return null;
+        if (buf[pos] == '\n') break;
+        pos += 1;
+    }
+    return buf[0..pos];
+}
+
+const CliDebouncedInput = struct {
+    current: []u8,
+    queued_next: ?[]u8 = null,
+
+    fn deinit(self: *CliDebouncedInput, allocator: std.mem.Allocator) void {
+        allocator.free(self.current);
+        if (self.queued_next) |queued| allocator.free(queued);
+    }
+};
+
+fn buildCliDebouncedInput(
+    allocator: std.mem.Allocator,
+    ready: []const bus_mod.InboundMessage,
+) !CliDebouncedInput {
+    std.debug.assert(ready.len > 0);
+
+    var input = CliDebouncedInput{
+        .current = try allocator.dupe(u8, ready[0].content),
+    };
+    errdefer input.deinit(allocator);
+
+    if (ready.len > 1) {
+        input.queued_next = try allocator.dupe(u8, ready[1].content);
+    }
+    return input;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -671,6 +787,31 @@ test "cliStreamCallback handles empty delta" {
     const chunk = providers.StreamChunk.finalChunk();
     cliStreamCallback(@ptrCast(&ctx), chunk);
     try std.testing.expect(!ctx.emitted_text);
+}
+
+test "buildCliDebouncedInput preserves queued bypass command" {
+    const allocator = std.testing.allocator;
+    var ready: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
+    defer {
+        for (ready.items) |msg| msg.deinit(allocator);
+        ready.deinit(allocator);
+    }
+
+    try ready.append(
+        allocator,
+        try bus_mod.makeInbound(allocator, "cli", "local-user", "cli", "hello", "cli:repl"),
+    );
+    try ready.append(
+        allocator,
+        try bus_mod.makeInbound(allocator, "cli", "local-user", "cli", "/quit", "cli:repl"),
+    );
+
+    var input = try buildCliDebouncedInput(allocator, ready.items);
+    defer input.deinit(allocator);
+
+    try std.testing.expectEqualStrings("hello", input.current);
+    try std.testing.expect(input.queued_next != null);
+    try std.testing.expectEqualStrings("/quit", input.queued_next.?);
 }
 
 test "cliStreamCallback text delta chunk" {

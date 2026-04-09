@@ -26,11 +26,12 @@ fn buildSubagentSystemPrompt(
     system_prompt: []const u8,
     workspace_dir: []const u8,
     tools: []const tools_mod.Tool,
+    observer: ?observability.Observer,
 ) ![]const u8 {
     const tool_instructions = try agent_mod.prompt.buildToolInstructions(allocator, tools);
     defer allocator.free(tool_instructions);
 
-    const skills_section = try agent_mod.prompt.buildSkillsSection(allocator, workspace_dir);
+    const skills_section = try agent_mod.prompt.buildSkillsSection(allocator, workspace_dir, observer);
     defer allocator.free(skills_section);
 
     if (skills_section.len > 0) {
@@ -164,6 +165,7 @@ pub fn runTaskWithTools(
         request.system_prompt,
         request.workspace_dir,
         tools,
+        obs,
     );
     // After append, ownership transfers to agent.history; agent.deinit() frees it.
     // Use catch to free only if append itself fails (avoids double-free with deinit).
@@ -271,6 +273,7 @@ test "buildSubagentSystemPrompt includes installed skills before tool instructio
         "You are a background subagent.",
         workspace_dir,
         no_tools[0..],
+        null,
     );
     defer allocator.free(prompt);
 

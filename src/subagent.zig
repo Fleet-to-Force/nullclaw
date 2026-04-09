@@ -78,6 +78,7 @@ const ThreadContext = struct {
     origin_channel: []const u8,
     origin_chat_id: []const u8,
     agent_name: ?[]const u8 = null,
+    trace_id: ?[32]u8 = null,
 };
 
 // ── SubagentManager ─────────────────────────────────────────────
@@ -230,6 +231,8 @@ pub const SubagentManager = struct {
         const agent_name_copy = if (agent_name) |name| try self.allocator.dupe(u8, name) else null;
         errdefer if (agent_name_copy) |name| self.allocator.free(name);
 
+        const trace_id = if (self.observer) |obs| obs.getTraceId() else null;
+
         // Build thread context
         const ctx = try self.allocator.create(ThreadContext);
         errdefer self.allocator.destroy(ctx);
@@ -241,6 +244,7 @@ pub const SubagentManager = struct {
             .origin_channel = origin_channel_copy,
             .origin_chat_id = origin_chat_copy,
             .agent_name = agent_name_copy,
+            .trace_id = trace_id,
         };
 
         state.thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, subagentThreadFn, .{ctx});
@@ -362,6 +366,19 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.allocator.free(ctx.origin_chat_id);
         if (ctx.agent_name) |agent_name| ctx.manager.allocator.free(agent_name);
         ctx.manager.allocator.destroy(ctx);
+    }
+
+    if (ctx.manager.observer) |obs| {
+        if (ctx.trace_id) |tid| {
+            obs.setTraceId(tid);
+        }
+
+        const name_to_report = ctx.agent_name orelse "default";
+        const subagent_start_event = observability.ObserverEvent{ .subagent_start = .{
+            .agent_name = name_to_report,
+            .task = ctx.task,
+        } };
+        obs.recordEvent(&subagent_start_event);
     }
 
     // Default prompt differs based on execution mode:

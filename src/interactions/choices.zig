@@ -1,4 +1,5 @@
 const std = @import("std");
+const json_util = @import("../json_util.zig");
 
 pub const START_TAG = "<nc_choices>";
 pub const END_TAG = "</nc_choices>";
@@ -46,21 +47,6 @@ pub const ParsedAssistantChoices = struct {
     }
 };
 
-fn appendJsonString(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, value: []const u8) !void {
-    try out.append(allocator, '"');
-    for (value) |ch| {
-        switch (ch) {
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            else => try out.append(allocator, ch),
-        }
-    }
-    try out.append(allocator, '"');
-}
-
 fn validateRenderableOption(id: []const u8, label: []const u8, submit_text: []const u8) !void {
     if (!isValidChoiceId(id)) return error.InvalidChoices;
     if (label.len == 0 or label.len > MAX_LABEL_LEN) return error.InvalidChoices;
@@ -95,11 +81,11 @@ pub fn renderAssistantChoices(allocator: std.mem.Allocator, visible_text: []cons
         try validateRenderableOption(option.id, option.label, option.submit_text);
         if (idx > 0) try out.append(allocator, ',');
         try out.appendSlice(allocator, "{\"id\":");
-        try appendJsonString(&out, allocator, option.id);
+        try json_util.appendJsonString(&out, allocator, option.id);
         try out.appendSlice(allocator, ",\"label\":");
-        try appendJsonString(&out, allocator, option.label);
+        try json_util.appendJsonString(&out, allocator, option.label);
         try out.appendSlice(allocator, ",\"submit_text\":");
-        try appendJsonString(&out, allocator, option.submit_text);
+        try json_util.appendJsonString(&out, allocator, option.submit_text);
         try out.append(allocator, '}');
     }
     try out.appendSlice(allocator, "]}");

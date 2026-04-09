@@ -1057,18 +1057,11 @@ const VisibleSkills = struct {
 };
 
 fn loadVisibleSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !VisibleSkills {
-    const home = yc.platform.getHomeDir(allocator) catch null;
-    defer if (home) |path| allocator.free(path);
-
-    var community_base: ?[]u8 = null;
+    var community_base: ?[]u8 = yc.config_paths.defaultConfigDir(allocator) catch null;
     errdefer if (community_base) |path| allocator.free(path);
 
-    if (home) |path| {
-        community_base = std.fs.path.join(allocator, &.{ path, ".nullclaw" }) catch null;
-    }
-
     if (community_base) |base| {
-        if (yc.skills.listSkillsMerged(allocator, base, workspace_dir)) |skills| {
+        if (yc.skills.listSkillsMerged(allocator, base, workspace_dir, null)) |skills| {
             return .{
                 .skills = skills,
                 .community_base = base,
@@ -1079,7 +1072,7 @@ fn loadVisibleSkills(allocator: std.mem.Allocator, workspace_dir: []const u8) !V
         }
     }
 
-    const skills = try yc.skills.listSkills(allocator, workspace_dir);
+    const skills = try yc.skills.listSkills(allocator, workspace_dir, null);
     for (skills) |*skill| {
         yc.skills.checkRequirements(allocator, skill);
     }
@@ -2661,27 +2654,27 @@ fn runGatewayChannel(allocator: std.mem.Allocator, config: *const yc.config.Conf
 
 // ── Signal Channel ─────────────────────────────────────────────────
 
-fn hasReliabilityCredentialFallback(allocator: std.mem.Allocator, config: *const yc.config.Config) bool {
-    for (config.reliability.api_keys) |raw_key| {
-        if (std.mem.trim(u8, raw_key, " \t\r\n").len > 0) return true;
+fn ensureChannelStartupCredentials(
+    allocator: std.mem.Allocator,
+    config: *const yc.config.Config,
+) void {
+    if (yc.channel_loop.hasStartupProviderCredentials(allocator, config)) return;
+
+    if (std.mem.eql(u8, config.default_provider, "openai-codex")) {
+        std.debug.print("No OpenAI Codex credentials configured.\n", .{});
+        std.debug.print("  Run `nullclaw auth login openai-codex` or `nullclaw auth login openai-codex --import-codex`.\n", .{});
+        std.process.exit(1);
     }
 
-    for (config.reliability.fallback_providers) |provider_name| {
-        if (yc.providers.classifyProvider(provider_name) == .openai_codex_provider) return true;
-
-        const resolved = yc.providers.resolveApiKeyFromConfig(
-            allocator,
-            provider_name,
-            config.providers,
-        ) catch null;
-        defer if (resolved) |k| allocator.free(k);
-
-        if (resolved) |key| {
-            if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
-        }
+    if (yc.provider_probe.providerRequiresApiKey(config.default_provider, config.getProviderBaseUrl(config.default_provider))) {
+        std.debug.print("No usable provider credentials configured for {s}. Set env var or add to ~/.nullclaw/config.json:\n", .{config.default_provider});
+        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
+        std.process.exit(1);
     }
 
-    return false;
+    std.debug.print("No usable startup credentials configured for provider {s}.\n", .{config.default_provider});
+    std.debug.print("Authenticate the provider locally or configure a reliability fallback provider.\n", .{});
+    std.process.exit(1);
 }
 
 fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, config: *const yc.config.Config, signal_config: yc.config.SignalConfig) !void {
@@ -2691,22 +2684,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         std.process.exit(1);
     }
 
-    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
-    const resolved_api_key = yc.providers.resolveApiKeyFromConfig(
-        allocator,
-        config.default_provider,
-        config.providers,
-    ) catch null;
-    defer if (resolved_api_key) |k| allocator.free(k);
-
-    // OAuth providers (openai-codex) don't need an API key
-    const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, config);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
-        std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
-        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
-        std.process.exit(1);
-    }
+    ensureChannelStartupCredentials(allocator, config);
 
     const temperature = config.default_temperature;
 
@@ -2767,197 +2745,13 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     }
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
-
-    // Build security policy from config
-    const security = @import("nullclaw").security.policy;
-    var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
-    defer tracker.deinit();
-
-    var sec_policy = security.SecurityPolicy{
-        .autonomy = config.autonomy.level,
-        .workspace_dir = config.workspace_dir,
-        .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
-        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
-        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
-        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
-        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
-        .tracker = &tracker,
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, config) catch |err| {
+        std.debug.print("Runtime init failed: {}\n", .{err});
+        std.process.exit(1);
     };
-
-    var subagent_manager = yc.subagent.SubagentManager.init(allocator, config, null, .{});
-    subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
-    var subagent_manager_needs_err_cleanup = true;
-    errdefer if (subagent_manager_needs_err_cleanup) subagent_manager.deinit();
-
-    // Create optional memory backend (don't fail if unavailable).
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
-
-    const bootstrap_provider: ?yc.bootstrap.BootstrapProvider = yc.bootstrap.createProvider(
-        allocator,
-        config.memory.backend,
-        mem_opt,
-        config.workspace_dir,
-    ) catch null;
-    defer if (bootstrap_provider) |bp| bp.deinit();
-
-    // Create tools (for system prompt and tool calling)
-    const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
-        .http_enabled = config.http_request.enabled,
-        .http_allowed_domains = config.http_request.allowed_domains,
-        .http_max_response_size = config.http_request.max_response_size,
-        .http_timeout_secs = config.http_request.timeout_secs,
-        .web_search_base_url = config.http_request.search_base_url,
-        .web_search_provider = config.http_request.search_provider,
-        .web_search_fallback_providers = config.http_request.search_fallback_providers,
-        .browser_enabled = config.browser.enabled,
-        .screenshot_enabled = true,
-        .mcp_server_configs = config.mcp_servers,
-        .agents = config.agents,
-        .configured_providers = config.providers,
-        .fallback_api_key = resolved_api_key,
-        .tools_config = config.tools,
-        .allowed_paths = config.autonomy.allowed_paths,
-        .policy = &sec_policy,
-        .subagent_manager = &subagent_manager,
-        .bootstrap_provider = bootstrap_provider,
-        .backend_name = config.memory.backend,
-    }) catch &.{};
-    defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
-
-    // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
-    if (mem_rt) |*rt| {
-        yc.tools.bindMemoryRuntime(tools, rt);
-    }
-
-    // Create provider with reliability wrapper (retry + fallback chains).
-    var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, config);
-    defer runtime_provider.deinit();
-    const provider_i = runtime_provider.provider();
-
-    const runtime_observer = try yc.observability.RuntimeObserver.create(
-        allocator,
-        .{
-            .workspace_dir = config.workspace_dir,
-            .backend = config.diagnostics.backend,
-            .otel_endpoint = config.diagnostics.otel_endpoint,
-            .otel_service_name = config.diagnostics.otel_service_name,
-        },
-        config.diagnostics.otel_headers,
-        &.{},
-    );
-    defer runtime_observer.destroy();
-    subagent_manager_needs_err_cleanup = false;
-    defer subagent_manager.deinit();
-    const obs = runtime_observer.observer();
-    subagent_manager.observer = runtime_observer.backendObserver();
-
-    // Initialize session manager
-    var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
-    session_mgr.policy = &sec_policy;
-    if (mem_rt) |*rt| {
-        session_mgr.mem_rt = rt;
-    }
-    defer session_mgr.deinit();
-
-    // Session key buffer
-    var key_buf: [128]u8 = undefined;
-
-    // Message loop: poll → full agent loop (tool calling) → reply
-    while (true) {
-        const messages = sg.pollMessages(allocator) catch |err| {
-            std.debug.print("Signal poll error: {}\n", .{err});
-            std.Thread.sleep(5 * std.time.ns_per_s);
-            continue;
-        };
-
-        for (messages) |msg| {
-            std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
-
-            // Session key — resolve through route engine, fallback to legacy key.
-            const group_peer_id = yc.channels.signal.signalGroupPeerId(msg.reply_target);
-            var routed_session_key: ?[]const u8 = null;
-            defer if (routed_session_key) |key| allocator.free(key);
-            const session_key = blk: {
-                const route = yc.agent_routing.resolveRouteWithSession(
-                    allocator,
-                    .{
-                        .channel = "signal",
-                        .account_id = sg.account_id,
-                        .peer = .{
-                            .kind = if (msg.is_group) .group else .direct,
-                            .id = if (msg.is_group) group_peer_id else msg.sender,
-                        },
-                    },
-                    config.agent_bindings,
-                    config.agents,
-                    config.session,
-                ) catch break :blk if (msg.is_group)
-                    std.fmt.bufPrint(&key_buf, "signal:{s}:group:{s}:{s}", .{
-                        sg.account_id,
-                        group_peer_id,
-                        msg.sender,
-                    }) catch msg.sender
-                else
-                    std.fmt.bufPrint(&key_buf, "signal:{s}:{s}", .{ sg.account_id, msg.sender }) catch msg.sender;
-                allocator.free(route.main_session_key);
-                routed_session_key = route.session_key;
-                break :blk route.session_key;
-            };
-
-            // Build conversation context for Signal (includes sender UUID and group ID)
-            const conversation_context: ?yc.agent.ConversationContext = if (std.mem.eql(u8, msg.channel, "signal")) blk: {
-                break :blk .{
-                    .channel = "signal",
-                    .account_id = sg.account_id,
-                    .sender_number = if (msg.sender.len > 0 and msg.sender[0] == '+') msg.sender else null,
-                    .sender_uuid = msg.sender_uuid,
-                    .peer_id = if (msg.is_group) msg.group_id else msg.sender,
-                    .group_id = msg.group_id,
-                    .is_group = msg.is_group,
-                };
-            } else null;
-
-            const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                std.debug.print("  Agent error: {}\n", .{err});
-                const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again or /new for a fresh session.",
-                };
-                if (msg.reply_target) |target| {
-                    sg.sendMessage(target, err_msg, &.{}) catch |send_err| std.debug.print("  Send error: {}\n", .{send_err});
-                }
-                continue;
-            };
-            defer allocator.free(reply);
-
-            std.debug.print("  -> {s}\n", .{reply});
-
-            // Reply on Signal; handles split
-            if (msg.reply_target) |target| {
-                sg.sendMessage(target, reply, &.{}) catch |err| {
-                    std.debug.print("  Send error: {}\n", .{err});
-                };
-            }
-        }
-
-        if (messages.len > 0) {
-            // Free message memory
-            for (messages) |msg| {
-                msg.deinit(allocator);
-            }
-            allocator.free(messages);
-        }
-
-        // Small delay between polls
-        std.Thread.sleep(500 * std.time.ns_per_ms);
-    }
+    defer runtime.deinit();
+    var loop_state = yc.channel_loop.SignalLoopState.init();
+    yc.channel_loop.runSignalLoop(allocator, config, runtime, &loop_state, &sg);
 }
 
 // ── Matrix Channel ────────────────────────────────────────────────
@@ -2973,6 +2767,8 @@ fn runMatrixChannel(
         std.debug.print("Matrix channel is disabled in this build.\n", .{});
         std.process.exit(1);
     }
+
+    ensureChannelStartupCredentials(allocator, config);
 
     var mx = yc.channels.matrix.MatrixChannel.initFromConfig(allocator, matrix_config);
 
@@ -3025,6 +2821,8 @@ fn runMaxChannel(
         std.process.exit(1);
     }
 
+    ensureChannelStartupCredentials(allocator, config);
+
     var mx = yc.channels.max.MaxChannel.initFromConfig(allocator, max_config);
 
     if (mx.mode == .webhook) {
@@ -3068,157 +2866,6 @@ fn runMaxChannel(
 
 // ── Telegram Channel ───────────────────────────────────────────────-
 
-fn sendStandaloneTelegramStartGreeting(
-    tg: *yc.channels.telegram.TelegramChannel,
-    sender: []const u8,
-    first_name: ?[]const u8,
-    fallback_name: []const u8,
-    model: []const u8,
-    reply_to_id: ?i64,
-) void {
-    var greeting_buf: [512]u8 = undefined;
-    const name = first_name orelse fallback_name;
-    const greeting = std.fmt.bufPrint(
-        &greeting_buf,
-        "Hello, {s}! I'm nullClaw.\n\nModel: {s}\nType /help for available commands.",
-        .{ name, model },
-    ) catch "Hello! I'm nullClaw. Type /help for commands.";
-    tg.sendMessageWithReply(sender, greeting, reply_to_id) catch |err| {
-        log.err("failed to send /start reply: {}", .{err});
-    };
-}
-
-fn handleStandaloneTelegramBuiltinCommand(
-    allocator: std.mem.Allocator,
-    config: *const yc.config.Config,
-    session_mgr: *yc.session.SessionManager,
-    tg: *yc.channels.telegram.TelegramChannel,
-    content: []const u8,
-    sender: []const u8,
-    sender_identity: []const u8,
-    first_name: ?[]const u8,
-    model: []const u8,
-    is_group: bool,
-    reply_to_id: ?i64,
-    message_id: ?i64,
-) bool {
-    const cmd = control_plane.parseSlashCommand(content) orelse return false;
-
-    if (control_plane.isSlashName(cmd, "start")) {
-        sendStandaloneTelegramStartGreeting(tg, sender, first_name, sender_identity, model, reply_to_id);
-        return true;
-    }
-
-    if (control_plane.isSlashName(cmd, "bind")) {
-        tg.setTaskReaction(sender, message_id, .accepted);
-
-        if (!tg.binding_commands_enabled) {
-            tg.setTaskReaction(sender, message_id, .failed);
-            tg.sendMessageWithReply(sender, "Binding commands are disabled for this Telegram account.", reply_to_id) catch |err| {
-                log.err("failed to send /bind disabled reply: {}", .{err});
-            };
-            return true;
-        }
-
-        tg.setTaskReaction(sender, message_id, .running);
-        const reply = yc.channel_loop.applyTelegramBindingCommand(allocator, config, tg.account_id, sender, is_group, cmd.arg) catch |err| {
-            tg.setTaskReaction(sender, message_id, .failed);
-            log.err("failed to handle /bind command: {}", .{err});
-            tg.sendMessageWithReply(sender, "Failed to update Telegram binding.", reply_to_id) catch |send_err| {
-                log.err("failed to send /bind error reply: {}", .{send_err});
-            };
-            return true;
-        };
-        defer allocator.free(reply);
-
-        tg.sendMessageWithReply(sender, reply, reply_to_id) catch |err| {
-            tg.setTaskReaction(sender, message_id, .failed);
-            log.err("failed to send /bind reply: {}", .{err});
-            return true;
-        };
-        tg.setTaskReaction(sender, message_id, .done);
-        return true;
-    }
-
-    if (control_plane.isSlashName(cmd, "topics") or control_plane.isSlashName(cmd, "topic-map")) {
-        tg.setTaskReaction(sender, message_id, .accepted);
-
-        if (!tg.topic_map_command_enabled) {
-            tg.setTaskReaction(sender, message_id, .failed);
-            tg.sendMessageWithReply(sender, "Topic map command is disabled for this Telegram account.", reply_to_id) catch |err| {
-                log.err("failed to send /topics disabled reply: {}", .{err});
-            };
-            return true;
-        }
-
-        tg.setTaskReaction(sender, message_id, .running);
-        const report = yc.channel_loop.buildTelegramTopicMapReply(allocator, session_mgr, sender) catch |err| {
-            tg.setTaskReaction(sender, message_id, .failed);
-            log.err("failed to build /topics reply: {}", .{err});
-            tg.sendMessageWithReply(sender, "Failed to build topic/session map.", reply_to_id) catch |send_err| {
-                log.err("failed to send /topics error reply: {}", .{send_err});
-            };
-            return true;
-        };
-        defer allocator.free(report);
-
-        tg.sendMessageWithReply(sender, report, reply_to_id) catch |err| {
-            tg.setTaskReaction(sender, message_id, .failed);
-            log.err("failed to send /topics reply: {}", .{err});
-            return true;
-        };
-        tg.setTaskReaction(sender, message_id, .done);
-        return true;
-    }
-
-    if (!control_plane.isSlashName(cmd, "topic")) return false;
-
-    tg.setTaskReaction(sender, message_id, .accepted);
-
-    if (!tg.topic_commands_enabled) {
-        tg.setTaskReaction(sender, message_id, .failed);
-        tg.sendMessageWithReply(sender, "Topic commands are disabled for this Telegram account.", reply_to_id) catch |err| {
-            log.err("failed to send /topic disabled reply: {}", .{err});
-        };
-        return true;
-    }
-
-    const topic_name = std.mem.trim(u8, cmd.arg, " \t\r\n");
-    if (topic_name.len == 0) {
-        tg.setTaskReaction(sender, message_id, .failed);
-        tg.sendMessageWithReply(sender, "Usage: /topic <name>", reply_to_id) catch |err| {
-            log.err("failed to send /topic usage reply: {}", .{err});
-        };
-        return true;
-    }
-
-    tg.setTaskReaction(sender, message_id, .running);
-    const thread_id = tg.createForumTopicFromTarget(sender, topic_name) catch |err| {
-        tg.setTaskReaction(sender, message_id, .failed);
-        const err_msg: []const u8 = switch (err) {
-            error.InvalidTopicName => "Topic name must be 1-128 characters.",
-            else => "Failed to create topic. This works only in forum-enabled supergroups where the bot can manage topics.",
-        };
-        tg.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| {
-            log.err("failed to send /topic error reply: {}", .{send_err});
-        };
-        return true;
-    };
-
-    const confirmation = std.fmt.allocPrint(
-        allocator,
-        "Created topic \"{s}\" (thread {d}). Messages in that topic will use an isolated nullclaw session.",
-        .{ topic_name, thread_id },
-    ) catch null;
-    defer if (confirmation) |msg| allocator.free(msg);
-
-    tg.sendMessageWithReply(sender, confirmation orelse "Topic created.", reply_to_id) catch |err| {
-        log.err("failed to send /topic confirmation: {}", .{err});
-    };
-    tg.setTaskReaction(sender, message_id, .done);
-    return true;
-}
-
 fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, config: yc.config.Config, telegram_config: yc.config.TelegramConfig) !void {
     if (!build_options.enable_channel_telegram) {
         std.debug.print("Telegram channel is disabled in this build.\n", .{});
@@ -3242,30 +2889,10 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     else
         telegram_config.allow_from;
 
-    // Resolve API key: config providers first, then env vars (ANTHROPIC_API_KEY, etc.)
-    const resolved_api_key = yc.providers.resolveApiKeyFromConfig(
-        allocator,
-        config.default_provider,
-        config.providers,
-    ) catch null;
-    defer if (resolved_api_key) |k| allocator.free(k);
-
-    // OAuth providers (openai-codex) don't need an API key
-    const provider_kind = yc.providers.classifyProvider(config.default_provider);
-    const has_fallback_credentials = hasReliabilityCredentialFallback(allocator, &config);
-    if (resolved_api_key == null and provider_kind != .openai_codex_provider and !has_fallback_credentials) {
-        std.debug.print("No API key configured. Set env var or add to ~/.nullclaw/config.json:\n", .{});
-        std.debug.print("  \"providers\": {{ \"{s}\": {{ \"api_key\": \"...\" }} }}\n", .{config.default_provider});
-        std.process.exit(1);
-    }
-
-    const model = config.default_model.?;
-    const temperature = config.default_temperature;
-
+    ensureChannelStartupCredentials(allocator, &config);
     std.debug.print("nullclaw telegram bot starting...\n", .{});
-    std.debug.print("  Provider: {s}\n", .{config.default_provider});
-    std.debug.print("  Model: {s}\n", .{model});
-    std.debug.print("  Temperature: {d:.1}\n", .{temperature});
+    config.printModelConfig();
+    std.debug.print("  Temperature: {d:.1}\n", .{config.default_temperature});
     if (allowed.len == 0) {
         std.debug.print("  Allowed users: (none — all messages will be denied)\n", .{});
     } else if (allowed.len == 1 and std.mem.eql(u8, allowed[0], "*")) {
@@ -3291,249 +2918,20 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     tg.topic_commands_enabled = telegram_config.topic_commands_enabled;
     tg.topic_map_command_enabled = telegram_config.topic_map_command_enabled;
     tg.commands_menu_mode = telegram_config.commands_menu_mode;
-
-    // Set up transcription — key comes from providers.{audio_media.provider}
-    const trans = config.audio_media;
-    const whisper_ptr: ?*yc.voice.WhisperTranscriber = if (config.getProviderKey(trans.provider)) |key| blk: {
-        const wt = try allocator.create(yc.voice.WhisperTranscriber);
-        wt.* = .{
-            .endpoint = yc.voice.resolveTranscriptionEndpoint(trans.provider, trans.base_url),
-            .api_key = key,
-            .model = trans.model,
-            .language = trans.language,
-        };
-        break :blk wt;
-    } else null;
-    defer if (whisper_ptr) |wt| allocator.destroy(wt);
-    if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
-
-    // Build security policy from config
-    const security = @import("nullclaw").security.policy;
-    var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
-    defer tracker.deinit();
-
-    var sec_policy = security.SecurityPolicy{
-        .autonomy = config.autonomy.level,
-        .workspace_dir = config.workspace_dir,
-        .workspace_only = config.autonomy.workspace_only,
-        .allowed_commands = security.resolveAllowedCommands(config.autonomy.level, config.autonomy.allowed_commands),
-        .max_actions_per_hour = config.autonomy.max_actions_per_hour,
-        .require_approval_for_medium_risk = config.autonomy.require_approval_for_medium_risk,
-        .block_high_risk_commands = config.autonomy.block_high_risk_commands,
-        .allow_raw_url_chars = config.autonomy.allow_raw_url_chars,
-        .tracker = &tracker,
-    };
-
-    var subagent_manager = yc.subagent.SubagentManager.init(allocator, &config, null, .{});
-    subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
-    var subagent_manager_needs_err_cleanup = true;
-    errdefer if (subagent_manager_needs_err_cleanup) subagent_manager.deinit();
-
-    // Create optional memory backend (don't fail if unavailable).
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
-
-    const bootstrap_provider: ?yc.bootstrap.BootstrapProvider = yc.bootstrap.createProvider(
-        allocator,
-        config.memory.backend,
-        mem_opt,
-        config.workspace_dir,
-    ) catch null;
-    defer if (bootstrap_provider) |bp| bp.deinit();
-
-    // Create tools (for system prompt and tool calling)
-    const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
-        .http_enabled = config.http_request.enabled,
-        .http_allowed_domains = config.http_request.allowed_domains,
-        .http_max_response_size = config.http_request.max_response_size,
-        .http_timeout_secs = config.http_request.timeout_secs,
-        .web_search_base_url = config.http_request.search_base_url,
-        .web_search_provider = config.http_request.search_provider,
-        .web_search_fallback_providers = config.http_request.search_fallback_providers,
-        .browser_enabled = config.browser.enabled,
-        .screenshot_enabled = true,
-        .mcp_server_configs = config.mcp_servers,
-        .agents = config.agents,
-        .configured_providers = config.providers,
-        .fallback_api_key = resolved_api_key,
-        .tools_config = config.tools,
-        .allowed_paths = config.autonomy.allowed_paths,
-        .policy = &sec_policy,
-        .subagent_manager = &subagent_manager,
-        .bootstrap_provider = bootstrap_provider,
-        .backend_name = config.memory.backend,
-    }) catch &.{};
-    defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
-
-    // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
-    if (mem_rt) |*rt| {
-        yc.tools.bindMemoryRuntime(tools, rt);
-    }
-
-    const runtime_observer = try yc.observability.RuntimeObserver.create(
-        allocator,
-        .{
-            .workspace_dir = config.workspace_dir,
-            .backend = config.diagnostics.backend,
-            .otel_endpoint = config.diagnostics.otel_endpoint,
-            .otel_service_name = config.diagnostics.otel_service_name,
-        },
-        config.diagnostics.otel_headers,
-        &.{},
+    tg.text_debounce_secs = yc.channels.telegram.TelegramChannel.textDebounceSecsFromMs(
+        config.messages.inbound.debounce_ms,
     );
-    defer runtime_observer.destroy();
-    subagent_manager_needs_err_cleanup = false;
-    defer subagent_manager.deinit();
-    const obs = runtime_observer.observer();
-    subagent_manager.observer = runtime_observer.backendObserver();
-
-    // Create provider with reliability wrapper (retry + fallback chains).
-    var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &config);
-    defer runtime_provider.deinit();
-    const provider_i: yc.providers.Provider = runtime_provider.provider();
-
-    std.debug.print("  Tools: {d} loaded\n", .{tools.len});
-    std.debug.print("  Memory: {s}\n", .{if (mem_opt != null) "enabled" else "disabled"});
-
-    if (yc.channel_loop.loadTelegramUpdateOffset(allocator, &config, tg.account_id, tg.bot_token)) |saved_update_id| {
-        tg.last_update_id = saved_update_id;
-    }
-
-    tg.deleteWebhookKeepPending();
-
-    // Register bot commands in Telegram's "/" menu
-    tg.syncCommandsMenu();
-
+    const runtime = yc.channel_loop.ChannelRuntime.init(allocator, &config) catch |err| {
+        std.debug.print("Runtime init failed: {}\n", .{err});
+        std.process.exit(1);
+    };
+    defer runtime.deinit();
+    std.debug.print("  Tools: {d} loaded\n", .{runtime.tools.len});
+    std.debug.print("  Memory: {s}\n", .{if (runtime.mem_rt != null) "enabled" else "disabled"});
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
-    var session_mgr = yc.session.SessionManager.init(allocator, &config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
-    session_mgr.policy = &sec_policy;
-    if (mem_rt) |*rt| {
-        session_mgr.mem_rt = rt;
-    }
-    defer session_mgr.deinit();
-
-    var evict_counter: u32 = 0;
-    var persisted_update_id: i64 = tg.last_update_id;
-
-    // Bot loop: poll → full agent loop (tool calling) → reply
-    while (true) {
-        const messages = tg.pollUpdates(allocator) catch |err| {
-            std.debug.print("Poll error: {}\n", .{err});
-            std.Thread.sleep(5 * std.time.ns_per_s);
-            continue;
-        };
-
-        for (messages) |msg| {
-            std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
-
-            // Determine reply-to: always in groups, configurable in private chats
-            const use_reply_to = msg.is_group or telegram_config.reply_in_private;
-            const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
-
-            if (handleStandaloneTelegramBuiltinCommand(
-                allocator,
-                &config,
-                &session_mgr,
-                &tg,
-                msg.content,
-                msg.sender,
-                msg.id,
-                msg.first_name,
-                model,
-                msg.is_group,
-                reply_to_id,
-                msg.message_id,
-            )) {
-                continue;
-            }
-
-            tg.setTaskReaction(msg.sender, msg.message_id, .accepted);
-
-            const session_key = yc.channel_loop.resolveTelegramSessionKey(
-                allocator,
-                &session_mgr,
-                &config,
-                tg.account_id,
-                msg.sender,
-                msg.is_group,
-            ) catch |err| {
-                tg.setTaskReaction(msg.sender, msg.message_id, .failed);
-                log.err("failed to resolve telegram session key: {}", .{err});
-                tg.sendMessageWithReply(msg.sender, "Failed to resolve session for this Telegram topic.", reply_to_id) catch |send_err| {
-                    log.err("failed to send telegram session-key error reply: {}", .{send_err});
-                };
-                continue;
-            };
-            defer allocator.free(session_key);
-
-            // Start periodic typing indicator while the model is processing
-            const typing_target = msg.sender;
-            tg.startTyping(typing_target) catch {};
-            defer tg.stopTyping(typing_target) catch {};
-
-            tg.setTaskReaction(msg.sender, msg.message_id, .running);
-            const conversation_context = yc.agent.buildConversationContext(.{
-                .channel = "telegram",
-                .account_id = tg.account_id,
-                .peer_id = msg.sender,
-                .is_group = msg.is_group,
-                .group_id = if (msg.is_group) msg.sender else null,
-            });
-            const reply = session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
-                std.debug.print("  Agent error: {}\n", .{err});
-                tg.setTaskReaction(msg.sender, msg.message_id, .failed);
-                const err_msg = switch (err) {
-                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                    error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-                    error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-                    error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-                    error.OutOfMemory => "Out of memory.",
-                    else => "An error occurred. Try again or /new for a fresh session.",
-                };
-                tg.sendMessageWithReply(msg.sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-                continue;
-            };
-            defer allocator.free(reply);
-
-            std.debug.print("  -> {s}\n", .{reply});
-
-            // Reply on telegram; handles [IMAGE:path] markers + split
-            tg.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
-                tg.setTaskReaction(msg.sender, msg.message_id, .failed);
-                std.debug.print("  Send error: {}\n", .{err});
-                continue;
-            };
-            tg.setTaskReaction(msg.sender, msg.message_id, .done);
-        }
-
-        if (messages.len > 0) {
-            // Free message memory
-            for (messages) |msg| {
-                msg.deinit(allocator);
-            }
-            allocator.free(messages);
-        }
-
-        if (tg.persistableUpdateOffset()) |persistable_update_id| {
-            yc.channel_loop.persistTelegramUpdateOffsetIfAdvanced(
-                allocator,
-                &config,
-                tg.account_id,
-                tg.bot_token,
-                &persisted_update_id,
-                persistable_update_id,
-            );
-        }
-
-        // Periodically evict sessions idle longer than the configured timeout
-        evict_counter += 1;
-        if (evict_counter >= 100) {
-            evict_counter = 0;
-            _ = session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
-        }
-    }
+    var loop_state = yc.channel_loop.TelegramLoopState.init();
+    yc.channel_loop.runTelegramLoop(allocator, &config, runtime, &loop_state, &tg);
 }
 
 // ── Auth ─────────────────────────────────────────────────────────
@@ -3596,7 +2994,7 @@ fn runAuth(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         } else if (yc.codex_support.hasOpenAiCodexCredential(allocator)) {
             std.debug.print("openai-codex: authenticated via Codex CLI\n", .{});
             std.debug.print("  Tokens found in ~/.codex/auth.json\n", .{});
-            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in ~/.nullclaw/auth.json.\n", .{});
+            std.debug.print("  Run `nullclaw auth login openai-codex --import-codex` to persist them in auth.json in your nullclaw config directory.\n", .{});
         } else {
             std.debug.print("openai-codex: not authenticated\n", .{});
             std.debug.print("  Run `nullclaw auth login openai-codex` to authenticate.\n", .{});
@@ -3821,7 +3219,7 @@ fn runAuthImportCodex(
             std.debug.print("  Token: expired (will auto-refresh)\n", .{});
         }
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in config.json in your nullclaw config directory\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 /// Decode the "exp" claim from a JWT, returning the Unix timestamp or 0 if not decodable.
@@ -3875,7 +3273,7 @@ fn saveAndPrintResult(
     } else {
         std.debug.print("Authenticated successfully.\n", .{});
     }
-    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in ~/.nullclaw/config.json\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
+    std.debug.print("\nTo use: set \"agents.defaults.model.primary\": \"openai-codex/{s}\" in config.json in your nullclaw config directory\n", .{yc.codex_support.DEFAULT_CODEX_MODEL});
 }
 
 fn printUsage() void {
@@ -4206,6 +3604,101 @@ test "hasConfiguredButBuildDisabledStartableChannels detects configured disabled
     };
 
     try std.testing.expectEqual(!yc.channel_catalog.isBuildEnabled(.telegram), hasConfiguredButBuildDisabledStartableChannels(&cfg));
+}
+
+test "hasStartupProviderCredentials accepts configured primary key" {
+    const providers_cfg = [_]yc.config.ProviderEntry{
+        .{ .name = "anthropic", .api_key = "sk-test" },
+    };
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+        .providers = &providers_cfg,
+    };
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials accepts local compatible provider without api key" {
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "custom:http://127.0.0.1:8080/v1",
+        .default_model = "custom/local-model",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials accepts gemini oauth env token" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const env_name = try std.testing.allocator.dupeZ(u8, "GEMINI_OAUTH_TOKEN");
+    defer std.testing.allocator.free(env_name);
+    const env_value = try std.testing.allocator.dupeZ(u8, "ya29.test-oauth-token");
+    defer std.testing.allocator.free(env_value);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, env_value.ptr, 1));
+    defer _ = c.unsetenv(env_name.ptr);
+
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "gemini",
+        .default_model = "gemini/gemini-2.5-pro",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials accepts reliability fallback credentials" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+    };
+    cfg.reliability.api_keys = &.{"rotating-key"};
+
+    try std.testing.expect(yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials rejects blank configured key" {
+    // Regression: blank API keys must not bypass channel startup credential checks.
+    const providers_cfg = [_]yc.config.ProviderEntry{
+        .{ .name = "anthropic", .api_key = "   " },
+    };
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+        .providers = &providers_cfg,
+    };
+
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
+}
+
+test "hasStartupProviderCredentials rejects missing provider and fallback credentials" {
+    // Regression: channel startup must still fail fast when neither the primary provider nor fallbacks can authenticate.
+    const cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "anthropic",
+        .default_model = "anthropic/claude-3-7-sonnet",
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expect(!yc.channel_loop.hasStartupProviderCredentials(std.testing.allocator, &cfg));
 }
 
 test "parseCronAddAgentOptions preserves delivery account flag" {

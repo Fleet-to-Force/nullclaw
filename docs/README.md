@@ -1,34 +1,37 @@
 # nullclaw Documentation
 
-## Ecosystem Integration
+This directory is the documentation index for nullclaw.
 
-For multi-agent workflows with Telegram topic routing, see:
+## Start Here
 
-- **[Integration Analysis](./integration-analysis.md)** — Complete gap analysis between nullclaw, nullboiler, and nulltickets
-- **[Integration Roadmap](./integration-roadmap.md)** — Implementation phases and task tracking
+- [`en/`](./en/) — English user and operator docs
+- [`zh/`](./zh/) — 中文使用与运维文档
 
-These documents cover:
-- Current capabilities of all three projects
-- 7 identified integration gaps with priorities
-- Technical implementation details
-- API design specifications
-- Testing strategy
+MB:## Core User Docs
+TJ:
+HP:- **Beginner's Guide:** New to NullClaw? Start here. Plain language, no jargon. | [English](./en/beginners-guide.md) / [中文](./zh/beginners-guide.md)
+SK:- Install: [`en/installation.md`](./en/installation.md) / [`zh/installation.md`](./zh/installation.md)
+RT:- Configure: [`en/configuration.md`](./en/configuration.md) / [`zh/configuration.md`](./zh/configuration.md)
+TS:- Commands: [`en/commands.md`](./en/commands.md) / [`zh/commands.md`](./zh/commands.md)
+VX:- Usage & operations: [`en/usage.md`](./en/usage.md) / [`zh/usage.md`](./zh/usage.md)
+TY:- Security: [`en/security.md`](./en/security.md) / [`zh/security.md`](./zh/security.md)
+JK:- Gateway API: [`en/gateway-api.md`](./en/gateway-api.md) / [`zh/gateway-api.md`](./zh/gateway-api.md)
+KS:
+## Topical Docs
 
-## User Documentation
+- External channel plugins: [`en/external-channels.md`](./en/external-channels.md) / [`zh/external-channels.md`](./zh/external-channels.md)
+- Ops runbooks:
+  - [`en/ops/dingtalk-ops-readiness.md`](./en/ops/dingtalk-ops-readiness.md)
+  - [`en/ops/lark-ops-readiness.md`](./en/ops/lark-ops-readiness.md)
+  - [`zh/ops/dingtalk-ops-readiness.md`](./zh/ops/dingtalk-ops-readiness.md)
+  - [`zh/ops/lark-ops-readiness.md`](./zh/ops/lark-ops-readiness.md)
 
-- [`en/`](./en/) — English documentation
-- [`zh/`](./zh/) — Chinese documentation
+## Additional References
 
-Highlighted extension docs:
+These pages are useful context, but they are not part of the main user/operator onboarding path:
 
-- [English external channel plugin guide](./en/external-channels.md)
-- [中文外部渠道插件指南](./zh/external-channels.md)
-- [English DingTalk ops readiness guide](./en/ops/dingtalk-ops-readiness.md)
-- [中文 DingTalk 运维就绪指南](./zh/ops/dingtalk-ops-readiness.md)
-
-## Contributing
-
-When working on ecosystem integration:
-1. Check the roadmap for current phase
-2. Update gap status in both documents
-3. Add implementation notes as you progress
+- [Integration Analysis](./integration-analysis.md)
+- [Integration Roadmap](./integration-roadmap.md)
+- [Contributing](../CONTRIBUTING.md)
+- [Security Policy](../SECURITY.md)
+- [Signal Deployment](../SIGNAL.md)

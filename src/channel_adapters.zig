@@ -337,6 +337,17 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
     },
 };
 
+pub fn derivePeerForStaticChannel(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    for (&inbound_route_descriptors) |*desc| {
+        if (desc.channel_name) |name| {
+            if (std.mem.eql(u8, name, input.channel_name)) {
+                return desc.derive_peer(input, meta);
+            }
+        }
+    }
+    return null;
+}
+
 pub fn findInboundRouteDescriptor(config: *const Config, channel_name: []const u8) ?*const InboundRouteDescriptor {
     for (&inbound_route_descriptors) |*desc| {
         if (desc.channel_name) |name| {

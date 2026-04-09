@@ -202,8 +202,13 @@
   "reliability": {
     "provider_retries": 2,
     "provider_backoff_ms": 500,
-    "fallback_providers": [],
-    "model_fallbacks": []
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
   },
 
   "autonomy": {

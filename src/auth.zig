@@ -2,12 +2,12 @@
 //!
 //! Provides reusable OAuth primitives for all providers:
 //! - PKCE challenge generation (RFC 7636)
-//! - Token storage with filesystem-based credential store (~/.nullclaw/auth.json)
+//! - Token storage with filesystem-based credential store (auth.json in the config directory)
 //! - Device Authorization Grant flow (RFC 8628)
 
 const std = @import("std");
+const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
-const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
 
 // ── PKCE (RFC 7636) ────────────────────────────────────────────────────
@@ -81,8 +81,17 @@ pub const OAuthToken = struct {
 
 // ── Credential Store ───────────────────────────────────────────────────
 
-const CRED_DIR = ".nullclaw";
 const CRED_FILE = "auth.json";
+
+fn credentialFilePathFromConfigDir(allocator: std.mem.Allocator, config_dir: []const u8) ![]u8 {
+    return config_paths.pathFromConfigDir(allocator, config_dir, CRED_FILE);
+}
+
+fn credentialFilePath(allocator: std.mem.Allocator) ![]u8 {
+    const config_dir = try config_paths.defaultConfigDir(allocator);
+    defer allocator.free(config_dir);
+    return credentialFilePathFromConfigDir(allocator, config_dir);
+}
 
 fn writeCredentialsFileAtomic(allocator: std.mem.Allocator, file_path: []const u8, contents: []const u8) !void {
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{file_path});
@@ -106,21 +115,19 @@ fn writeCredentialsFileAtomic(allocator: std.mem.Allocator, file_path: []const u
     };
 }
 
-/// Save a credential for the given provider to ~/.nullclaw/auth.json.
+/// Save a credential for the given provider to auth.json in the config directory.
 /// Merges with existing credentials (other providers are preserved).
 /// File permissions are set to 0o600.
 pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token: OAuthToken) !void {
-    const home = platform.getHomeDir(allocator) catch return error.HomeNotSet;
-    defer allocator.free(home);
-
-    const dir_path = try std.fs.path.join(allocator, &.{ home, CRED_DIR });
-    defer allocator.free(dir_path);
+    const file_path = credentialFilePath(allocator) catch |err| switch (err) {
+        error.HomeDirNotFound => return error.HomeNotSet,
+        else => return err,
+    };
+    defer allocator.free(file_path);
 
     // Ensure directory exists
+    const dir_path = std.fs.path.dirname(file_path) orelse return error.CredentialWriteFailed;
     fs_compat.makePath(dir_path) catch return error.CredentialWriteFailed;
-
-    const file_path = try std.fs.path.join(allocator, &.{ dir_path, CRED_FILE });
-    defer allocator.free(file_path);
 
     // Read existing credentials (if any)
     var existing = loadAllCredentials(allocator, file_path) orelse std.StringArrayHashMap(StoredToken).init(allocator);
@@ -190,14 +197,11 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
     try writeCredentialsFileAtomic(allocator, file_path, buf.items);
 }
 
-/// Load a credential for the given provider from ~/.nullclaw/auth.json.
+/// Load a credential for the given provider from auth.json in the config directory.
 /// Returns null if the file is missing, the provider is not found, or the token
 /// is expired and cannot be refreshed.
 pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAuthToken {
-    const home = platform.getHomeDir(allocator) catch return null;
-    defer allocator.free(home);
-
-    const file_path = try std.fs.path.join(allocator, &.{ home, CRED_DIR, CRED_FILE });
+    const file_path = credentialFilePath(allocator) catch return null;
     defer allocator.free(file_path);
 
     const file = std.fs.cwd().openFile(file_path, .{}) catch return null;
@@ -400,13 +404,13 @@ pub fn refreshAccessToken(
 
 // ── Credential Deletion ───────────────────────────────────────────────
 
-/// Delete a credential for the given provider from ~/.nullclaw/auth.json.
+/// Delete a credential for the given provider from auth.json in the config directory.
 /// Returns true if the credential was found and removed.
 pub fn deleteCredential(allocator: std.mem.Allocator, provider: []const u8) !bool {
-    const home = platform.getHomeDir(allocator) catch return error.HomeNotSet;
-    defer allocator.free(home);
-
-    const file_path = try std.fs.path.join(allocator, &.{ home, CRED_DIR, CRED_FILE });
+    const file_path = credentialFilePath(allocator) catch |err| switch (err) {
+        error.HomeDirNotFound => return error.HomeNotSet,
+        else => return err,
+    };
     defer allocator.free(file_path);
 
     var existing = loadAllCredentials(allocator, file_path) orelse return false;
@@ -912,4 +916,14 @@ test "Allocating writer deinit frees full buffer — no invalid free on sub-slic
     // If we reach here without panic, DebugAllocator confirmed:
     // 1. No invalid free (sub-slice length mismatch)
     // 2. No memory leak (all allocations freed)
+}
+
+test "credentialFilePathFromConfigDir appends auth.json" {
+    const path = try credentialFilePathFromConfigDir(std.testing.allocator, "/tmp/nullclaw-home");
+    defer std.testing.allocator.free(path);
+
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "auth.json" });
+    defer std.testing.allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, path);
 }

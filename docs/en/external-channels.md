@@ -227,6 +227,11 @@ Notes:
 - `runtime.state_dir` is host-owned persistent storage for the plugin account
 - plugins should treat `config` as opaque plugin-local settings
 - a JSON-RPC success envelope without `result.started: true` is rejected
+- `start` should return promptly once the plugin process has initialized its own
+  runtime state; do not hold `start` open for QR scans, device pairing, or
+  human login steps
+- if first-run auth is still pending, return `started: true` and expose that
+  readiness gap through `health`
 
 ### `stop`
 
@@ -266,6 +271,15 @@ Rules:
 - an empty `{}` result is invalid
 - if the plugin does not support `health`, omit the capability bit rather than
   returning stub success
+
+Recommended async-auth behavior:
+
+- when startup succeeds but auth is still pending, answer `start` immediately
+  and report `connected: false` and/or `logged_in: false` from `health`
+- reserve `healthy: false` for cases where the plugin runtime itself is not
+  operating correctly, not merely for waiting on a QR scan
+- once login completes, `health` should converge to `connected: true` and
+  `logged_in: true` without requiring the host to restart the plugin
 
 ## Outbound RPCs
 
@@ -649,6 +663,14 @@ Plugins should still:
 - keep stdout unblocked
 - avoid long-running work on the JSON-RPC main thread when possible
 
+For interactive auth flows such as QR scans or device linking, prefer an async
+login model:
+
+- `start` launches background connect/auth work and returns quickly
+- `health` reports whether the channel is connected and logged in yet
+- the plugin or its companion bridge owns QR rendering / pairing UX rather than
+  stretching host control-plane timeouts
+
 ## Security And Isolation
 
 The host boundary is intentionally narrow, but plugin code still runs as a local
@@ -717,6 +739,7 @@ code. The in-tree examples here are reference adapters and templates.
 - Implement `start`, `send`, and `stop`
 - Return `protocol_version: 2`
 - Return `started: true` from `start`
+- Keep `start` non-blocking with respect to QR scans, pairing, and interactive auth
 - Return `accepted: true` from accepted outbound actions
 - Emit `inbound_message` with `text`, not `content`
 - Include `peer_kind` and `peer_id` in metadata when peer routing matters

@@ -1,6 +1,6 @@
 .{
     .name = .nullclaw,
-    .version = "2026.3.21",
+    .version = "2026.4.7",
     .fingerprint = 0xe73e13d1c95956c2,
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
@@ -8,8 +8,8 @@
             .path = "vendor/sqlite3",
         },
         .websocket = .{
-            .url = "git+https://github.com/nullclaw/websocket#4b2c70da94d2dd0cca93d8eecb771633f609424b",
-            .hash = "websocket-0.1.0-ZPISdXp4AwB5_c0jHAA9mZXqJFuOC_dtpVRRFPBbRaNO",
+            .url = "git+https://github.com/nullclaw/websocket#6a62e67405d883206a526cb25d667cf2e6fc4b2c",
+            .hash = "websocket-0.1.0-ZPISdRt7AwCgmiEnDNUp_kwBgzTEyVeLAPhTHZ7UZhMI",
         },
         .wasm3 = .{
             .url = "git+https://github.com/nullclaw/wasm3#8a29b0080f1f65dbbe8b8f8c4d8148480feff377",
