@@ -86,6 +86,10 @@ pub const ProviderEntry = struct {
     /// When set, 0 forces the non-streaming path for every request and any
     /// positive value applies that byte threshold. Example: 524288 for 512 KiB.
     max_streaming_prompt_bytes: ?usize = null,
+    /// Optional compact JSON string of additional key-value pairs to merge into
+    /// request bodies for OpenAI-compatible providers. The encoded value must
+    /// be a JSON object.
+    extra_body_params: ?[]const u8 = null,
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────

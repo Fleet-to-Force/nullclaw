@@ -67,6 +67,7 @@ fn providerHasStartupCredentials(
         config.getProviderApiMode(provider_name),
         config.getProviderMaxStreamingPromptBytes(provider_name),
         config.getProviderChatTemplateEnableThinkingParam(provider_name),
+        config.getProviderExtraBodyParams(provider_name),
     );
     defer holder.deinit();
 

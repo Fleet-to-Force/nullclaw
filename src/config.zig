@@ -343,6 +343,15 @@ pub const Config = struct {
         return true;
     }
 
+    /// Look up extra body parameters for a provider.
+    /// Returns null if provider is not in the list or has no extra params.
+    pub fn getProviderExtraBodyParams(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.providers) |e| {
+            if (provider_names.providerNamesMatch(e.name, name)) return e.extra_body_params;
+        }
+        return null;
+    }
+
     fn isReservedRuntimeChannelName(runtime_name: []const u8) bool {
         inline for (std.meta.fields(config_types.ChannelsConfig)) |field| {
             if (std.mem.eql(u8, field.name, runtime_name)) return true;
@@ -1008,6 +1017,19 @@ pub const Config = struct {
                     if (entry.max_streaming_prompt_bytes) |mb| {
                         if (has_field) try w.print(", ", .{});
                         try w.print("\"max_streaming_prompt_bytes\": {d}", .{mb});
+                        has_field = true;
+                    }
+                }
+                if (comptime @hasField(ProviderEntry, "extra_body_params")) {
+                    if (entry.extra_body_params) |extra_body_params| {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"extra_body_params\": ", .{});
+                        if (std.json.parseFromSlice(std.json.Value, self.allocator, extra_body_params, .{})) |parsed_extra| {
+                            defer parsed_extra.deinit();
+                            try writePrettyJsonInline(self.allocator, w, parsed_extra.value, "");
+                        } else |_| {
+                            try writePrettyJsonInline(self.allocator, w, extra_body_params, "");
+                        }
                         has_field = true;
                     }
                 }
@@ -5146,6 +5168,49 @@ test "save omits max_streaming_prompt_bytes when null" {
     try std.testing.expect(std.mem.indexOf(u8, content, "max_streaming_prompt_bytes") == null);
 }
 
+test "save writes provider extra_body_params when set" {
+    // Regression: save() previously dropped extra_body_params entirely, so a
+    // config rewrite lost provider-specific request body overrides.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "groq",
+            .api_key = "gsk_test",
+            .extra_body_params = "{\"seed\":123,\"metadata\":{\"tier\":\"pro\"}}",
+        },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const models = parsed.value.object.get("models").?.object;
+    const providers = models.get("providers").?.object;
+    const groq = providers.get("groq").?.object;
+    const extra = groq.get("extra_body_params").?.object;
+
+    try std.testing.expectEqual(@as(i64, 123), extra.get("seed").?.integer);
+    try std.testing.expectEqualStrings("pro", extra.get("metadata").?.object.get("tier").?.string);
+}
+
 test "save writes provider api_mode when responses" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5242,6 +5307,52 @@ test "save and parseJson round-trip max_streaming_prompt_bytes" {
     try std.testing.expectEqual(@as(?usize, 131072), loaded.getProviderMaxStreamingPromptBytes("infini-ai"));
     // Provider without field → null survives round-trip.
     try std.testing.expectEqual(@as(?usize, null), loaded.getProviderMaxStreamingPromptBytes("openai"));
+}
+
+test "save and parseJson round-trip extra_body_params" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "groq",
+            .api_key = "gsk_test",
+            .extra_body_params = "{\"seed\":321,\"metadata\":{\"tier\":\"team\"}}",
+        },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    const extra_body_params = loaded.getProviderExtraBodyParams("groq") orelse return error.TestExpectedEqual;
+    const parsed_extra = try std.json.parseFromSlice(std.json.Value, allocator, extra_body_params, .{});
+    defer parsed_extra.deinit();
+
+    try std.testing.expectEqual(@as(i64, 321), parsed_extra.value.object.get("seed").?.integer);
+    try std.testing.expectEqualStrings("team", parsed_extra.value.object.get("metadata").?.object.get("tier").?.string);
 }
 
 test "save encrypts persisted api keys and parse decrypts them" {

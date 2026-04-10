@@ -485,6 +485,13 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
         return codex_support.loadCodexModels(allocator);
     }
 
+    // Tests must stay deterministic and must not depend on a developer's
+    // real ~/.nullclaw cache state.
+    if (builtin.is_test) {
+        return fetchModelsFromApi(allocator, canonical, api_key) catch
+            dupeFallbackModels(allocator, canonical);
+    }
+
     const config_dir = config_paths.defaultConfigDir(allocator) catch
         return dupeFallbackModels(allocator, provider);
     defer allocator.free(config_dir);

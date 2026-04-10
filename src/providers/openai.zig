@@ -21,14 +21,23 @@ pub const OpenAiProvider = struct {
     allocator: std.mem.Allocator,
     /// Optional User-Agent header for HTTP requests.
     user_agent: ?[]const u8 = null,
+    /// Optional compact JSON string of additional key-value pairs to merge into
+    /// request bodies.
+    extra_body_params: ?[]const u8 = null,
 
     const BASE_URL = "https://api.openai.com/v1/chat/completions";
 
-    pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8, user_agent: ?[]const u8) OpenAiProvider {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        api_key: ?[]const u8,
+        user_agent: ?[]const u8,
+        extra_body_params: ?[]const u8,
+    ) OpenAiProvider {
         return .{
             .api_key = api_key,
             .allocator = allocator,
             .user_agent = user_agent,
+            .extra_body_params = extra_body_params,
         };
     }
 
@@ -44,6 +53,8 @@ pub const OpenAiProvider = struct {
         message: []const u8,
         model: []const u8,
         temperature: f64,
+        session_id: ?[]const u8,
+        extra_body_params: ?[]const u8,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -66,6 +77,8 @@ pub const OpenAiProvider = struct {
 
         try buf.append(allocator, ']');
         try root.appendGenerationFields(&buf, allocator, model, temperature, null, null);
+        try root.appendOpenAiBodyExtraParams(&buf, allocator, session_id, extra_body_params);
+
         try buf.append(allocator, '}');
         return try buf.toOwnedSlice(allocator);
     }
@@ -218,7 +231,13 @@ pub const OpenAiProvider = struct {
         const self: *OpenAiProvider = @ptrCast(@alignCast(ptr));
         const api_key = self.api_key orelse return error.CredentialsNotSet;
 
-        const body = try buildStreamingChatRequestBody(allocator, request, model, temperature);
+        const body = try buildStreamingChatRequestBody(
+            allocator,
+            request,
+            model,
+            temperature,
+            self.extra_body_params,
+        );
         defer allocator.free(body);
 
         var auth_hdr_buf: [512]u8 = undefined;
@@ -254,7 +273,15 @@ pub const OpenAiProvider = struct {
         const self: *OpenAiProvider = @ptrCast(@alignCast(ptr));
         const api_key = self.api_key orelse return error.CredentialsNotSet;
 
-        const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
+        const body = try buildRequestBody(
+            allocator,
+            system_prompt,
+            message,
+            model,
+            temperature,
+            null,
+            self.extra_body_params,
+        );
         defer allocator.free(body);
 
         // Build headers (auth + optional User-Agent)
@@ -289,7 +316,13 @@ pub const OpenAiProvider = struct {
         const self: *OpenAiProvider = @ptrCast(@alignCast(ptr));
         const api_key = self.api_key orelse return error.CredentialsNotSet;
 
-        const body = try buildChatRequestBody(allocator, request, model, temperature);
+        const body = try buildChatRequestBody(
+            allocator,
+            request,
+            model,
+            temperature,
+            self.extra_body_params,
+        );
         defer allocator.free(body);
 
         // Build headers (auth + optional User-Agent)
@@ -334,6 +367,7 @@ pub const OpenAiProvider = struct {
         request: ChatRequest,
         model: []const u8,
         temperature: f64,
+        extra_body_params: ?[]const u8,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -366,7 +400,10 @@ pub const OpenAiProvider = struct {
             }
         }
 
-        try buf.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+        try buf.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true}");
+        try root.appendOpenAiBodyExtraParams(&buf, allocator, request.session_id, extra_body_params);
+
+        try buf.append(allocator, '}');
         return try buf.toOwnedSlice(allocator);
     }
 
@@ -376,6 +413,7 @@ pub const OpenAiProvider = struct {
         request: ChatRequest,
         model: []const u8,
         temperature: f64,
+        extra_body_params: ?[]const u8,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -407,6 +445,8 @@ pub const OpenAiProvider = struct {
                 try buf.appendSlice(allocator, ",\"tool_choice\":\"auto\"");
             }
         }
+
+        try root.appendOpenAiBodyExtraParams(&buf, allocator, request.session_id, extra_body_params);
 
         try buf.append(allocator, '}');
         return try buf.toOwnedSlice(allocator);
@@ -418,7 +458,7 @@ pub const OpenAiProvider = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "buildRequestBody without system" {
-    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-4o", 0.7);
+    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-4o", 0.7, null, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "gpt-4o") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
@@ -426,14 +466,14 @@ test "buildRequestBody without system" {
 }
 
 test "buildRequestBody with system" {
-    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, "You are helpful", "hello", "gpt-4o", 0.7);
+    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, "You are helpful", "hello", "gpt-4o", 0.7, null, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "You are helpful") != null);
 }
 
 test "buildRequestBody reasoning model omits temperature" {
-    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-5.2", 0.1);
+    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-5.2", 0.1, null, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
 }
@@ -485,7 +525,7 @@ test "parseNativeResponse with tool calls" {
 }
 
 test "supportsNativeTools returns true" {
-    var p = OpenAiProvider.init(std.testing.allocator, "key", null);
+    var p = OpenAiProvider.init(std.testing.allocator, "key", null, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
 }
@@ -574,9 +614,24 @@ test "parseNativeResponse tool_calls null does not crash" {
 }
 
 test "buildRequestBody includes temperature zero" {
-    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-4o", 0.0);
+    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-4o", 0.0, null, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "0.00") != null);
+}
+
+test "buildRequestBody with session_id and extra_body_params" {
+    const body = try OpenAiProvider.buildRequestBody(
+        std.testing.allocator,
+        null,
+        "hello",
+        "gpt-4o",
+        0.7,
+        "session-123",
+        "{\"seed\":123}",
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"user\":\"session-123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"seed\":123") != null);
 }
 
 test "buildChatRequestBody reasoning model uses max_completion_tokens" {
@@ -589,7 +644,7 @@ test "buildChatRequestBody reasoning model uses max_completion_tokens" {
         .temperature = 0.2,
         .max_tokens = 42,
     };
-    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-5.2", 0.2);
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-5.2", 0.2, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
@@ -606,7 +661,7 @@ test "buildStreamingChatRequestBody reasoning model uses max_completion_tokens" 
         .temperature = 0.2,
         .max_tokens = 64,
     };
-    const body = try OpenAiProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "gpt-5.2", 0.2);
+    const body = try OpenAiProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "gpt-5.2", 0.2, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":64") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
@@ -615,8 +670,54 @@ test "buildStreamingChatRequestBody reasoning model uses max_completion_tokens" 
     try std.testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
 }
 
+test "buildChatRequestBody appends session_id and extra_body_params" {
+    // Regression: openai chat requests previously ignored extra_body_params even
+    // though ProviderEntry exposes the setting generically.
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "gpt-4o",
+        .temperature = 0.7,
+        .session_id = "session-456",
+    };
+    const body = try OpenAiProvider.buildChatRequestBody(
+        std.testing.allocator,
+        req,
+        "gpt-4o",
+        0.7,
+        "{\"seed\":99}",
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"user\":\"session-456\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"seed\":99") != null);
+}
+
+test "buildStreamingChatRequestBody appends session_id and extra_body_params" {
+    const msgs = [_]root.ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = root.ChatRequest{
+        .messages = &msgs,
+        .model = "gpt-4o",
+        .temperature = 0.7,
+        .session_id = "session-789",
+    };
+    const body = try OpenAiProvider.buildStreamingChatRequestBody(
+        std.testing.allocator,
+        req,
+        "gpt-4o",
+        0.7,
+        "{\"seed\":77}",
+    );
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"user\":\"session-789\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"seed\":77") != null);
+}
+
 test "provider getName returns OpenAI" {
-    var p = OpenAiProvider.init(std.testing.allocator, "key", null);
+    var p = OpenAiProvider.init(std.testing.allocator, "key", null, null);
     const prov = p.provider();
     try std.testing.expectEqualStrings("OpenAI", prov.getName());
 }
@@ -647,7 +748,7 @@ test "isReasoningModel detects all reasoning prefixes" {
 }
 
 test "o3-mini omits temperature" {
-    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "o3-mini", 0.5);
+    const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "o3-mini", 0.5, null, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
 }
@@ -657,7 +758,7 @@ test "buildChatRequestBody without max_tokens omits it" {
         .{ .role = .user, .content = "hi" },
     };
     const req = root.ChatRequest{ .messages = &msgs, .model = "gpt-4o", .temperature = 0.7 };
-    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-4o", 0.7);
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-4o", 0.7, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":") == null);
@@ -674,7 +775,7 @@ test "o1 uses max_completion_tokens" {
         .temperature = 0.7,
         .max_tokens = 100,
     };
-    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "o1", 0.7);
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "o1", 0.7, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":100") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
@@ -692,7 +793,7 @@ test "reasoning model with reasoning_effort=none includes temperature" {
         .max_tokens = 200,
         .reasoning_effort = "none",
     };
-    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-5.1", 0.3);
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-5.1", 0.3, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.30") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":200") != null);
@@ -710,7 +811,7 @@ test "reasoning_effort emitted in request body" {
         .max_tokens = 50,
         .reasoning_effort = "high",
     };
-    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "o3-mini", 0.7);
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "o3-mini", 0.7, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
@@ -727,7 +828,7 @@ test "o4-mini omits temperature in streaming request" {
         .temperature = 0.7,
         .max_tokens = 80,
     };
-    const body = try OpenAiProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "o4-mini", 0.7);
+    const body = try OpenAiProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "o4-mini", 0.7, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":80") != null);
@@ -744,7 +845,7 @@ test "codex-mini uses max_completion_tokens" {
         .temperature = 0.5,
         .max_tokens = 60,
     };
-    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "codex-mini-latest", 0.5);
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "codex-mini-latest", 0.5, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_completion_tokens\":60") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":") == null);
@@ -762,7 +863,7 @@ test "reasoning_effort on non-reasoning model is not emitted" {
         .max_tokens = 100,
         .reasoning_effort = "high",
     };
-    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-4o", 0.7);
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "gpt-4o", 0.7, null);
     defer std.testing.allocator.free(body);
     // Non-reasoning model: reasoning_effort should NOT appear
     try std.testing.expect(std.mem.indexOf(u8, body, "reasoning_effort") == null);
@@ -781,7 +882,7 @@ test "reasoning_effort medium omits temperature" {
         .max_tokens = 50,
         .reasoning_effort = "medium",
     };
-    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "o3-mini", 0.5);
+    const body = try OpenAiProvider.buildChatRequestBody(std.testing.allocator, req, "o3-mini", 0.5, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"medium\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);

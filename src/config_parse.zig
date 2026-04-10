@@ -2331,6 +2331,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (val.object.get("max_streaming_prompt_bytes")) |mb| {
                             if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
                         }
+                        if (val.object.get("extra_body_params")) |eb| {
+                            if (eb == .object) {
+                                pe.extra_body_params = try std.json.Stringify.valueAlloc(self.allocator, eb, .{});
+                            }
+                        }
                         try prov_list.append(self.allocator, pe);
                     }
                     self.providers = try prov_list.toOwnedSlice(self.allocator);

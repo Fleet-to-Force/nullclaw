@@ -258,6 +258,36 @@ pub fn buildRequestBodyWithSystem(allocator: std.mem.Allocator, model: []const u
     return try buf.toOwnedSlice(allocator);
 }
 
+/// Append OpenAI-compatible request extras:
+/// - `user` sourced from the upstream session_id
+/// - arbitrary top-level JSON fields from `extra_body_params`
+///
+/// `extra_body_params` is expected to be a compact JSON object string such as
+/// `{"seed":123,"metadata":{"tier":"pro"}}`. Parsing happens at config-load
+/// time; request builders only splice the already-validated object body.
+pub fn appendOpenAiBodyExtraParams(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    session_id: ?[]const u8,
+    extra_body_params: ?[]const u8,
+) !void {
+    if (session_id) |sid| {
+        try buf.appendSlice(allocator, ",\"user\":");
+        try json_util.appendJsonString(buf, allocator, sid);
+    }
+
+    if (extra_body_params) |extra| {
+        const trimmed = std.mem.trim(u8, extra, " \t\r\n");
+        if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return;
+
+        const inner = std.mem.trim(u8, trimmed[1 .. trimmed.len - 1], " \t\r\n");
+        if (inner.len == 0) return;
+
+        try buf.append(allocator, ',');
+        try buf.appendSlice(allocator, inner);
+    }
+}
+
 /// Check if a model name indicates an OpenAI reasoning model
 /// (o1, o3, o4-mini, gpt-5*, codex-mini).
 pub fn isReasoningModel(model: []const u8) bool {

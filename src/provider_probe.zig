@@ -366,6 +366,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         cfg.getProviderApiMode(provider),
         cfg.getProviderMaxStreamingPromptBytes(provider),
         cfg.getProviderChatTemplateEnableThinkingParam(provider),
+        cfg.getProviderExtraBodyParams(provider),
     );
     defer holder.deinit();
 

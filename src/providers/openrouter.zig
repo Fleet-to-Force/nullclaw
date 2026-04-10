@@ -20,16 +20,18 @@ const TokenUsage = root.TokenUsage;
 pub const OpenRouterProvider = struct {
     api_key: ?[]const u8,
     allocator: std.mem.Allocator,
+    extra_body_params: ?[]const u8 = null,
 
     const BASE_URL = "https://openrouter.ai/api/v1/chat/completions";
     const WARMUP_URL = "https://openrouter.ai/api/v1/auth/key";
     const REFERER = "https://github.com/nullclaw/nullclaw";
     const TITLE = "nullclaw";
 
-    pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8) OpenRouterProvider {
+    pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8, extra_body_params: ?[]const u8) OpenRouterProvider {
         return .{
             .api_key = api_key,
             .allocator = allocator,
+            .extra_body_params = extra_body_params,
         };
     }
 
@@ -40,6 +42,8 @@ pub const OpenRouterProvider = struct {
         message: []const u8,
         model: []const u8,
         temperature: f64,
+        session_id: ?[]const u8,
+        extra_body_params: ?[]const u8,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -61,7 +65,12 @@ pub const OpenRouterProvider = struct {
         }
 
         try buf.append(allocator, ']');
+        if (session_id) |sid| {
+            try buf.appendSlice(allocator, ",\"session_id\":");
+            try root.appendJsonString(&buf, allocator, sid);
+        }
         try root.appendGenerationFields(&buf, allocator, model, temperature, null, null);
+        try root.appendOpenAiBodyExtraParams(&buf, allocator, session_id, extra_body_params);
         try buf.append(allocator, '}');
 
         return try buf.toOwnedSlice(allocator);
@@ -299,9 +308,19 @@ pub const OpenRouterProvider = struct {
         const msgs_json = try convertMessages(allocator, messages, system);
         defer allocator.free(msgs_json);
 
-        const body = try std.fmt.allocPrint(allocator,
-            \\{{"model":"{s}","messages":{s},"temperature":{d:.2}}}
-        , .{ model, msgs_json, temperature });
+        var body_buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer body_buf.deinit(allocator);
+        try body_buf.appendSlice(allocator, "{\"model\":");
+        try root.appendJsonString(&body_buf, allocator, model);
+        try body_buf.appendSlice(allocator, ",\"messages\":");
+        try body_buf.appendSlice(allocator, msgs_json);
+        try body_buf.appendSlice(allocator, ",\"temperature\":");
+        var temp_buf: [16]u8 = undefined;
+        const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
+        try body_buf.appendSlice(allocator, temp_str);
+        try root.appendOpenAiBodyExtraParams(&body_buf, allocator, null, self.extra_body_params);
+        try body_buf.append(allocator, '}');
+        const body = try body_buf.toOwnedSlice(allocator);
         defer allocator.free(body);
 
         var auth_hdr_buf: [512]u8 = undefined;
@@ -355,7 +374,7 @@ pub const OpenRouterProvider = struct {
         const self: *OpenRouterProvider = @ptrCast(@alignCast(ptr));
         const api_key = self.api_key orelse return error.CredentialsNotSet;
 
-        const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
+        const body = try buildRequestBody(allocator, system_prompt, message, model, temperature, null, self.extra_body_params);
         defer allocator.free(body);
 
         var auth_hdr_buf: [512]u8 = undefined;
@@ -383,7 +402,7 @@ pub const OpenRouterProvider = struct {
         const self: *OpenRouterProvider = @ptrCast(@alignCast(ptr));
         const api_key = self.api_key orelse return error.CredentialsNotSet;
 
-        const body = try buildChatRequestBody(allocator, request, model, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature, self.extra_body_params);
         defer allocator.free(body);
 
         var auth_hdr_buf: [512]u8 = undefined;
@@ -425,7 +444,7 @@ pub const OpenRouterProvider = struct {
         const self: *OpenRouterProvider = @ptrCast(@alignCast(ptr));
         const api_key = self.api_key orelse return error.CredentialsNotSet;
 
-        const body = try buildStreamingChatRequestBody(allocator, request, model, temperature);
+        const body = try buildStreamingChatRequestBody(allocator, request, model, temperature, self.extra_body_params);
         defer allocator.free(body);
 
         var auth_hdr_buf: [512]u8 = undefined;
@@ -452,6 +471,7 @@ pub const OpenRouterProvider = struct {
         request: ChatRequest,
         model: []const u8,
         temperature: f64,
+        extra_body_params: ?[]const u8,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -486,6 +506,7 @@ pub const OpenRouterProvider = struct {
             }
         }
 
+        try root.appendOpenAiBodyExtraParams(&buf, allocator, request.session_id, extra_body_params);
         try buf.append(allocator, '}');
         return try buf.toOwnedSlice(allocator);
     }
@@ -496,6 +517,7 @@ pub const OpenRouterProvider = struct {
         request: ChatRequest,
         model: []const u8,
         temperature: f64,
+        extra_body_params: ?[]const u8,
     ) ![]const u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(allocator);
@@ -530,6 +552,7 @@ pub const OpenRouterProvider = struct {
             }
         }
 
+        try root.appendOpenAiBodyExtraParams(&buf, allocator, request.session_id, extra_body_params);
         try buf.appendSlice(allocator, ",\"stream\":true}");
         return try buf.toOwnedSlice(allocator);
     }
@@ -604,11 +627,35 @@ test "buildRequestBody with system and user" {
         "Summarize this",
         "anthropic/claude-sonnet-4",
         0.5,
+        null,
+        null,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "anthropic/claude-sonnet-4") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
+}
+
+test "buildRequestBody appends session_id and extra_body_params" {
+    const body = try OpenRouterProvider.buildRequestBody(
+        std.testing.allocator,
+        null,
+        "hello",
+        "openai/gpt-4o",
+        0.7,
+        "session-123",
+        "{\"seed\":17}",
+    );
+    defer std.testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+
+    // Regression: single-turn OpenRouter requests must keep the provider-native
+    // session_id field in sync with the generic OpenAI-compatible user field.
+    try std.testing.expectEqualStrings("session-123", parsed.value.object.get("session_id").?.string);
+    try std.testing.expectEqualStrings("session-123", parsed.value.object.get("user").?.string);
+    try std.testing.expectEqual(@as(i64, 17), parsed.value.object.get("seed").?.integer);
 }
 
 test "parseTextResponse single choice" {
@@ -643,7 +690,7 @@ test "parseTextResponse classifies context errors" {
 }
 
 test "supportsNativeTools returns true" {
-    var p = OpenRouterProvider.init(std.testing.allocator, "key");
+    var p = OpenRouterProvider.init(std.testing.allocator, "key", null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
 }
@@ -767,12 +814,12 @@ test "convertTools with empty tools returns empty array" {
 }
 
 test "warmup does not crash without key" {
-    var p = OpenRouterProvider.init(std.testing.allocator, null);
+    var p = OpenRouterProvider.init(std.testing.allocator, null, null);
     p.warmup(); // Should return immediately, no crash
 }
 
 test "buildRequestBody reasoning model omits temperature" {
-    const body = try OpenRouterProvider.buildRequestBody(std.testing.allocator, null, "hello", "o3-mini", 0.5);
+    const body = try OpenRouterProvider.buildRequestBody(std.testing.allocator, null, "hello", "o3-mini", 0.5, null, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
 }
@@ -787,7 +834,7 @@ test "buildChatRequestBody o3 uses max_completion_tokens" {
         .temperature = 0.7,
         .max_tokens = 100,
     };
-    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "o3", 0.7);
+    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "o3", 0.7, null);
     defer std.testing.allocator.free(body);
     // Reasoning model: no temperature, uses max_completion_tokens
     try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":") == null);
@@ -804,7 +851,7 @@ test "buildChatRequestBody escapes OpenRouter reasoning effort value" {
         .model = "openrouter/custom",
         .reasoning_effort = "high\"},\"pwned\":true,\"x\":\"",
     };
-    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "openrouter/custom", 0.7);
+    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "openrouter/custom", 0.7, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -824,7 +871,7 @@ test "buildChatRequestBody includes session_id and include_reasoning" {
         .session_id = "telegram:chat123",
         .include_reasoning = true,
     };
-    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "moonshotai/kimi-k2.5", 0.7);
+    const body = try OpenRouterProvider.buildChatRequestBody(std.testing.allocator, req, "moonshotai/kimi-k2.5", 0.7, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -834,7 +881,7 @@ test "buildChatRequestBody includes session_id and include_reasoning" {
 }
 
 test "chatWithHistory fails without key" {
-    var p = OpenRouterProvider.init(std.testing.allocator, null);
+    var p = OpenRouterProvider.init(std.testing.allocator, null, null);
     const messages = &[_]ChatMessage{
         ChatMessage.user("hello"),
     };
@@ -859,7 +906,7 @@ test "buildStreamingChatRequestBody with stream flag" {
         .model = "test-model",
         .temperature = 0.7,
     };
-    const body = try OpenRouterProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "test-model", 0.7);
+    const body = try OpenRouterProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "test-model", 0.7, null);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
 }
@@ -872,7 +919,7 @@ test "buildStreamingChatRequestBody escapes tool_call_id" {
         .messages = &msgs,
         .model = "test-model",
     };
-    const body = try OpenRouterProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "test-model", 0.7);
+    const body = try OpenRouterProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "test-model", 0.7, null);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -881,27 +928,63 @@ test "buildStreamingChatRequestBody escapes tool_call_id" {
     try std.testing.expectEqualStrings("call_\"x\\y", msg.get("tool_call_id").?.string);
 }
 
-test "buildStreamingChatRequestBody includes session_id and include_reasoning" {
+test "buildChatRequestBody includes session_id include_reasoning and extra_body_params" {
     const msgs = [_]ChatMessage{
         .{ .role = .user, .content = "hello" },
     };
     const req = ChatRequest{
         .messages = &msgs,
         .model = "moonshotai/kimi-k2.5",
-        .session_id = "discord:dm42",
+        .temperature = 0.7,
+        .session_id = "session-456",
         .include_reasoning = true,
     };
-    const body = try OpenRouterProvider.buildStreamingChatRequestBody(std.testing.allocator, req, "moonshotai/kimi-k2.5", 0.7);
+    const body = try OpenRouterProvider.buildChatRequestBody(
+        std.testing.allocator,
+        req,
+        "moonshotai/kimi-k2.5",
+        0.7,
+        "{\"seed\":19}",
+    );
+    defer std.testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("session-456", parsed.value.object.get("session_id").?.string);
+    try std.testing.expect(parsed.value.object.get("include_reasoning").?.bool);
+    try std.testing.expectEqualStrings("session-456", parsed.value.object.get("user").?.string);
+    try std.testing.expectEqual(@as(i64, 19), parsed.value.object.get("seed").?.integer);
+}
+
+test "buildStreamingChatRequestBody includes session_id include_reasoning and extra_body_params" {
+    const msgs = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+    const req = ChatRequest{
+        .messages = &msgs,
+        .model = "moonshotai/kimi-k2.5",
+        .temperature = 0.7,
+        .session_id = "session-789",
+        .include_reasoning = true,
+    };
+    const body = try OpenRouterProvider.buildStreamingChatRequestBody(
+        std.testing.allocator,
+        req,
+        "moonshotai/kimi-k2.5",
+        0.7,
+        "{\"seed\":23}",
+    );
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("discord:dm42", parsed.value.object.get("session_id").?.string);
+    try std.testing.expectEqualStrings("session-789", parsed.value.object.get("session_id").?.string);
     try std.testing.expect(parsed.value.object.get("include_reasoning").?.bool);
+    try std.testing.expectEqualStrings("session-789", parsed.value.object.get("user").?.string);
+    try std.testing.expectEqual(@as(i64, 23), parsed.value.object.get("seed").?.integer);
 }
 
 test "streamChatImpl fails without key" {
-    var p = OpenRouterProvider.init(std.testing.allocator, null);
+    var p = OpenRouterProvider.init(std.testing.allocator, null, null);
     const provider = p.provider();
 
     const messages = [_]ChatMessage{
