@@ -33,7 +33,6 @@ pub const McpServer = struct {
     name: []const u8,
     config: McpServerConfig,
     child: ?std.process.Child,
-    child_env: ?std.process.EnvMap,
     http_client: ?std.http.Client,
     next_id: u32,
     mcp_session_id: ?[]u8,
@@ -44,7 +43,6 @@ pub const McpServer = struct {
             .name = config.name,
             .config = config,
             .child = null,
-            .child_env = null,
             .http_client = null,
             .next_id = 1,
             .mcp_session_id = null,
@@ -99,7 +97,7 @@ pub const McpServer = struct {
 
         // Build environment: inherit parent + config overrides
         var env = std.process.EnvMap.init(self.allocator);
-        errdefer env.deinit();
+        defer env.deinit();
         // Add PATH, HOME, etc. from parent
         const inherit_vars = [_][]const u8{
             "PATH",              "HOME",        "TERM",    "LANG",         "LC_ALL",
@@ -123,7 +121,6 @@ pub const McpServer = struct {
 
         try child.spawn();
         self.child = child;
-        self.child_env = env;
     }
 
     fn connectHttp(self: *McpServer) !void {
@@ -177,10 +174,6 @@ pub const McpServer = struct {
             _ = child.wait() catch {};
         }
         self.child = null;
-        if (self.child_env) |*env| {
-            env.deinit();
-            self.child_env = null;
-        }
     }
 
     // ── Internal I/O ────────────────────────────────────────────
@@ -635,6 +628,21 @@ test "McpServer init fields" {
     try std.testing.expectEqual(@as(u32, 1), server.next_id);
     try std.testing.expect(server.child == null);
     try std.testing.expectEqualStrings("/usr/bin/echo", server.config.command);
+}
+
+test "McpServer connectStdio deinit frees env map after spawn" {
+    var server = McpServer.init(std.testing.allocator, .{
+        .name = "cat",
+        .transport = "stdio",
+        .command = "sh",
+        .args = &.{ "-c", "cat" },
+        .env = &.{.{ .key = "NULLCLAW_TEST_ENV", .value = "1" }},
+    });
+    defer server.deinit();
+
+    // Regression: connectStdio used to leak its EnvMap when stdio servers had env overrides.
+    try server.connectStdio();
+    try std.testing.expect(server.child != null);
 }
 
 test "McpServer sendRequest requires http client for http transport" {
