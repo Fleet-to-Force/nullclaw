@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const log = std.log.scoped(.anthropic);
 const root = @import("root.zig");
 const sse = @import("sse.zig");
@@ -602,7 +603,7 @@ fn appendAnthropicThinkingConfig(
 
 /// HTTP POST with OAuth-specific headers (anthropic-beta, user-agent).
 fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8, auth_hdr: []const u8, version_hdr: []const u8) ![]u8 {
-    var argv = std.ArrayListUnmanaged([]const u8){};
+    var argv = std.ArrayListUnmanaged([]const u8).empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "curl", "-s", "-X", "POST" });
 
@@ -619,7 +620,7 @@ fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8
         url,
     });
 
-    var child = std.process.Child.init(argv.items, allocator);
+    var child = std_compat.process.Child.init(argv.items, allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -650,7 +651,7 @@ fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
+        .exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
     }
 

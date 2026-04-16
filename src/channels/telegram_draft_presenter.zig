@@ -96,7 +96,7 @@ fn draftTailSlice(text: []const u8, max_bytes: usize) []const u8 {
 fn appendElapsedSummary(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text_len: usize, started_at_ms: i64, now_ms: i64) !void {
     const elapsed_ms = if (started_at_ms > 0 and now_ms > started_at_ms) now_ms - started_at_ms else 0;
     const elapsed_secs = @divFloor(elapsed_ms, std.time.ms_per_s);
-    try buf.writer(allocator).print("Elapsed: {d}s\nCurrent size: {d} bytes", .{
+    try buf.print(allocator, "Elapsed: {d}s\nCurrent size: {d} bytes", .{
         elapsed_secs,
         text_len,
     });

@@ -4,6 +4,7 @@
 //! update path for binary installations.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 
 const log = std.log.scoped(.update);
@@ -106,8 +107,8 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
     }
 
     // Get executable path
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = try std.fs.selfExePath(&exe_buf);
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
 
     // Download and install
     try downloadAndInstall(allocator, download_url, exe_path, asset_name);
@@ -128,8 +129,8 @@ pub const InstallMethod = enum {
 };
 
 pub fn detectInstallMethod() !InstallMethod {
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = try std.fs.selfExePath(&exe_buf);
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
 
     // Check for nix
     if (std.mem.indexOf(u8, exe_path, "/nix/store/") != null) {
@@ -195,7 +196,7 @@ pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     const url = "https://api.github.com/repos/nullclaw/nullclaw/releases/latest";
 
     // Use curl subprocess approach (from http_util pattern)
-    const result = std.process.Child.run(.{
+    const result = std_compat.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "curl", "-sf", "--max-time", "30", url },
         .max_output_bytes = 10 * 1024 * 1024,
@@ -308,7 +309,7 @@ fn downloadAndInstall(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.partial", .{exe_path});
     defer allocator.free(tmp_path);
 
-    var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .read = true });
+    var tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{ .read = true });
     var tmp_closed = false;
     defer if (!tmp_closed) tmp_file.close();
     errdefer {
@@ -316,7 +317,7 @@ fn downloadAndInstall(
             tmp_file.close();
             tmp_closed = true;
         }
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
     }
 
     // Download directly to file (streaming, no memory buffer limit)
@@ -357,9 +358,9 @@ inline fn logDownloadToFileError(comptime fmt: []const u8, args: anytype) void {
     if (!builtin.is_test) log.err(fmt, args);
 }
 
-fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.File) !usize {
+fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std_compat.fs.File) !usize {
     const argv = &[_][]const u8{ "curl", "-sfL", "--max-time", "60", url };
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -399,7 +400,7 @@ fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.F
     };
 
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logDownloadToFileError("curl exited with code: {}", .{code});
             return error.CurlFailed;
         },
@@ -415,21 +416,21 @@ fn atomicReplace(tmp_path: []const u8, exe_path: []const u8) !void {
         const old_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.old", .{exe_path});
         defer std.heap.page_allocator.free(old_path);
 
-        std.fs.deleteFileAbsolute(old_path) catch {};
-        std.fs.renameAbsolute(exe_path, old_path) catch {};
+        std_compat.fs.deleteFileAbsolute(old_path) catch {};
+        std_compat.fs.renameAbsolute(exe_path, old_path) catch {};
 
-        try std.fs.renameAbsolute(tmp_path, exe_path);
-        std.fs.deleteFileAbsolute(old_path) catch {};
+        try std_compat.fs.renameAbsolute(tmp_path, exe_path);
+        std_compat.fs.deleteFileAbsolute(old_path) catch {};
     } else {
         // Unix: atomic rename on same filesystem
-        try std.fs.renameAbsolute(tmp_path, exe_path);
+        try std_compat.fs.renameAbsolute(tmp_path, exe_path);
     }
 }
 
 // ── User Input ────────────────────────────────────────────────────────
 
 fn readLine(allocator: std.mem.Allocator) ![]const u8 {
-    const stdin = std.fs.File.stdin();
+    const stdin = std_compat.fs.File.stdin();
 
     var buffer: [256]u8 = undefined;
     var pos: usize = 0;
@@ -441,7 +442,7 @@ fn readLine(allocator: std.mem.Allocator) ![]const u8 {
     }
 
     // Trim newline
-    const trimmed = std.mem.trimRight(u8, buffer[0..pos], "\r");
+    const trimmed = std_compat.mem.trimRight(u8, buffer[0..pos], "\r");
     return allocator.dupe(u8, trimmed);
 }
 
@@ -497,18 +498,18 @@ test "downloadToFile streams from local file URL" {
     const dst_name = "dst.bin";
     const payload = "hello-streaming-download";
 
-    var src_file = try tmp_dir.dir.createFile(src_name, .{});
+    var src_file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).createFile(src_name, .{});
     defer src_file.close();
     try src_file.writeAll(payload);
     try src_file.sync();
 
-    const src_abs = try tmp_dir.dir.realpathAlloc(allocator, src_name);
+    const src_abs = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, src_name);
     defer allocator.free(src_abs);
 
     const file_url = try std.fmt.allocPrint(allocator, "file://{s}", .{src_abs});
     defer allocator.free(file_url);
 
-    var dst_file = try tmp_dir.dir.createFile(dst_name, .{ .read = true });
+    var dst_file = try @import("compat").fs.Dir.wrap(tmp_dir.dir).createFile(dst_name, .{ .read = true });
     defer dst_file.close();
 
     const bytes_downloaded = downloadToFile(

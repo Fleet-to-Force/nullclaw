@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const bus = @import("bus.zig");
 
 pub const FLUSH_POLL_MS: u32 = 100;
@@ -115,7 +116,7 @@ pub const InboundDebouncer = struct {
 };
 
 pub fn nowMs() i64 {
-    return std.time.milliTimestamp();
+    return std_compat.time.milliTimestamp();
 }
 
 fn isDebounceEligible(msg: bus.InboundMessage) bool {

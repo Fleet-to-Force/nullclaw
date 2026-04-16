@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 
 /// Format bytes as human-readable string (e.g. "3.4 MB")
 pub fn formatBytes(bytes: u64) struct { value: f64, unit: []const u8 } {
@@ -13,7 +14,7 @@ pub fn formatBytes(bytes: u64) struct { value: f64, unit: []const u8 } {
 
 /// Get current timestamp as ISO 8601 string
 pub fn timestamp(buf: []u8) []const u8 {
-    const epoch = std.time.timestamp();
+    const epoch = std_compat.time.timestamp();
     const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(epoch) };
     const day = epoch_seconds.getEpochDay();
     const year_day = day.calculateYearDay();

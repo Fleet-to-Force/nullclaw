@@ -6,6 +6,7 @@
 //!   POST /chats/{chatId}/actions, POST /uploads.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const url_percent = @import("../url_percent.zig");
@@ -76,23 +77,22 @@ pub const Client = struct {
     ///   buildUrl(buf, "/me", null)         → "https://platform-api.max.ru/me"
     ///   buildUrl(buf, "/messages", "chat_id=123") → ".../messages?chat_id=123"
     pub fn buildUrl(buf: []u8, path: []const u8, query: ?[]const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(BASE_URL);
         try w.writeAll(path);
         if (query) |q| {
             try w.writeByte('?');
             try w.writeAll(q);
         }
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     // ── Auth header helper ──────────────────────────────────────────────
 
     fn authHeader(self: Client, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("Authorization: {s}", .{self.bot_token});
-        return fbs.getWritten();
+        var writer: std.Io.Writer = .fixed(buf);
+        try writer.print("Authorization: {s}", .{self.bot_token});
+        return writer.buffered();
     }
 
     // ── Bot info ────────────────────────────────────────────────────────
@@ -170,9 +170,9 @@ pub const Client = struct {
         const encoded_chat_id = try url_percent.encode(allocator, chat_id);
         defer allocator.free(encoded_chat_id);
         var query_buf: [256]u8 = undefined;
-        var query_fbs = std.io.fixedBufferStream(&query_buf);
-        try query_fbs.writer().print("chat_id={s}", .{encoded_chat_id});
-        const url = try buildUrl(&url_buf, "/messages", query_fbs.getWritten());
+        var query_writer: std.Io.Writer = .fixed(&query_buf);
+        try query_writer.print("chat_id={s}", .{encoded_chat_id});
+        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
@@ -206,9 +206,9 @@ pub const Client = struct {
         const encoded_message_id = try url_percent.encode(allocator, message_id);
         defer allocator.free(encoded_message_id);
         var query_buf: [256]u8 = undefined;
-        var query_fbs = std.io.fixedBufferStream(&query_buf);
-        try query_fbs.writer().print("message_id={s}", .{encoded_message_id});
-        const url = try buildUrl(&url_buf, "/messages", query_fbs.getWritten());
+        var query_writer: std.Io.Writer = .fixed(&query_buf);
+        try query_writer.print("message_id={s}", .{encoded_message_id});
+        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
@@ -221,9 +221,9 @@ pub const Client = struct {
         const encoded_message_id = try url_percent.encode(allocator, message_id);
         defer allocator.free(encoded_message_id);
         var query_buf: [256]u8 = undefined;
-        var query_fbs = std.io.fixedBufferStream(&query_buf);
-        try query_fbs.writer().print("message_id={s}", .{encoded_message_id});
-        const url = try buildUrl(&url_buf, "/messages", query_fbs.getWritten());
+        var query_writer: std.Io.Writer = .fixed(&query_buf);
+        try query_writer.print("message_id={s}", .{encoded_message_id});
+        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
@@ -248,9 +248,9 @@ pub const Client = struct {
         const encoded_callback_id = try url_percent.encode(allocator, callback_id);
         defer allocator.free(encoded_callback_id);
         var query_buf: [384]u8 = undefined;
-        var query_fbs = std.io.fixedBufferStream(&query_buf);
-        try query_fbs.writer().print("callback_id={s}", .{encoded_callback_id});
-        const url = try buildUrl(&url_buf, "/answers", query_fbs.getWritten());
+        var query_writer: std.Io.Writer = .fixed(&query_buf);
+        try query_writer.print("callback_id={s}", .{encoded_callback_id});
+        const url = try buildUrl(&url_buf, "/answers", query_writer.buffered());
 
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(allocator);
@@ -282,15 +282,14 @@ pub const Client = struct {
         }
         var url_buf: [512]u8 = undefined;
         var query_buf: [1024]u8 = undefined;
-        var query_fbs = std.io.fixedBufferStream(&query_buf);
-        const qw = query_fbs.writer();
+        var qw: std.Io.Writer = .fixed(&query_buf);
         try qw.print("timeout={s}&types={s}", .{ timeout, UPDATE_TYPES });
         if (marker) |m| {
             const encoded_marker = try url_percent.encode(allocator, m);
             defer allocator.free(encoded_marker);
             try qw.print("&marker={s}", .{encoded_marker});
         }
-        const url = try buildUrl(&url_buf, "/updates", query_fbs.getWritten());
+        const url = try buildUrl(&url_buf, "/updates", qw.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
@@ -342,9 +341,9 @@ pub const Client = struct {
         const encoded_url = try url_percent.encode(allocator, webhook_url);
         defer allocator.free(encoded_url);
         var query_buf: [1024]u8 = undefined;
-        var query_fbs = std.io.fixedBufferStream(&query_buf);
-        try query_fbs.writer().print("url={s}", .{encoded_url});
-        const url = try buildUrl(&url_buf, "/subscriptions", query_fbs.getWritten());
+        var query_writer: std.Io.Writer = .fixed(&query_buf);
+        try query_writer.print("url={s}", .{encoded_url});
+        const url = try buildUrl(&url_buf, "/subscriptions", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
@@ -359,9 +358,9 @@ pub const Client = struct {
         const encoded_chat_id = try url_percent.encode(allocator, chat_id);
         defer allocator.free(encoded_chat_id);
         var path_buf: [512]u8 = undefined;
-        var path_fbs = std.io.fixedBufferStream(&path_buf);
-        try path_fbs.writer().print("/chats/{s}/actions", .{encoded_chat_id});
-        const url = try buildUrl(&url_buf, path_fbs.getWritten(), null);
+        var path_writer: std.Io.Writer = .fixed(&path_buf);
+        try path_writer.print("/chats/{s}/actions", .{encoded_chat_id});
+        const url = try buildUrl(&url_buf, path_writer.buffered(), null);
 
         const body = "{\"action\":\"typing_on\"}";
         var auth_buf: [512]u8 = undefined;
@@ -380,9 +379,9 @@ pub const Client = struct {
         const encoded_file_type = try url_percent.encode(allocator, file_type);
         defer allocator.free(encoded_file_type);
         var query_buf: [128]u8 = undefined;
-        var query_fbs = std.io.fixedBufferStream(&query_buf);
-        try query_fbs.writer().print("type={s}", .{encoded_file_type});
-        const url = try buildUrl(&url_buf, "/uploads", query_fbs.getWritten());
+        var query_writer: std.Io.Writer = .fixed(&query_buf);
+        try query_writer.print("type={s}", .{encoded_file_type});
+        const url = try buildUrl(&url_buf, "/uploads", query_writer.buffered());
 
         var auth_buf: [512]u8 = undefined;
         const auth = try self.authHeader(&auth_buf);
@@ -472,7 +471,7 @@ fn curlDelete(allocator: std.mem.Allocator, url: []const u8, auth_header: []cons
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
     try child.spawn();
@@ -486,7 +485,7 @@ fn curlDelete(allocator: std.mem.Allocator, url: []const u8, auth_header: []cons
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0) return error.CurlFailed,
+        .exited => |code| if (code != 0) return error.CurlFailed,
         else => return error.CurlFailed,
     }
 }
@@ -499,9 +498,9 @@ fn curlMultipartUpload(
     file_path: []const u8,
 ) ![]u8 {
     var file_arg_buf: [1024]u8 = undefined;
-    var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
-    try file_fbs.writer().print("data=@{s}", .{file_path});
-    const file_arg = file_fbs.getWritten();
+    var file_writer: std.Io.Writer = .fixed(&file_arg_buf);
+    try file_writer.print("data=@{s}", .{file_path});
+    const file_arg = file_writer.buffered();
 
     var argv_buf: [18][]const u8 = undefined;
     var argc: usize = 0;
@@ -532,7 +531,7 @@ fn curlMultipartUpload(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
     try child.spawn();
@@ -543,7 +542,7 @@ fn curlMultipartUpload(
         return error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             allocator.free(stdout);
             return error.CurlFailed;
         },
@@ -565,15 +564,18 @@ fn curlMultipartUpload(
 pub fn buildTextMessageBody(allocator: std.mem.Allocator, text: []const u8, format: ?[]const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
-    try buf.appendSlice(allocator, "{\"text\":");
-    try root.appendJsonStringW(buf.writer(allocator), text);
+    try w.writeAll("{\"text\":");
+    try root.appendJsonStringW(w, text);
     if (format) |fmt| {
-        try buf.appendSlice(allocator, ",\"format\":");
-        try root.appendJsonStringW(buf.writer(allocator), fmt);
+        try w.writeAll(",\"format\":");
+        try root.appendJsonStringW(w, fmt);
     }
-    try buf.appendSlice(allocator, "}");
+    try w.writeAll("}");
 
+    buf = buf_writer.toArrayList();
     return allocator.dupe(u8, buf.items);
 }
 
@@ -584,15 +586,18 @@ pub fn buildTextMessageBodyClearingAttachments(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
-    try buf.appendSlice(allocator, "{\"text\":");
-    try root.appendJsonStringW(buf.writer(allocator), text);
+    try w.writeAll("{\"text\":");
+    try root.appendJsonStringW(w, text);
     if (format) |fmt| {
-        try buf.appendSlice(allocator, ",\"format\":");
-        try root.appendJsonStringW(buf.writer(allocator), fmt);
+        try w.writeAll(",\"format\":");
+        try root.appendJsonStringW(w, fmt);
     }
-    try buf.appendSlice(allocator, ",\"attachments\":[]}");
+    try w.writeAll(",\"attachments\":[]}");
 
+    buf = buf_writer.toArrayList();
     return allocator.dupe(u8, buf.items);
 }
 
@@ -601,17 +606,20 @@ pub fn buildTextMessageBodyClearingAttachments(
 pub fn buildTextWithKeyboardBody(allocator: std.mem.Allocator, text: []const u8, keyboard_json: []const u8, format: ?[]const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
-    try buf.appendSlice(allocator, "{\"text\":");
-    try root.appendJsonStringW(buf.writer(allocator), text);
+    try w.writeAll("{\"text\":");
+    try root.appendJsonStringW(w, text);
     if (format) |fmt| {
-        try buf.appendSlice(allocator, ",\"format\":");
-        try root.appendJsonStringW(buf.writer(allocator), fmt);
+        try w.writeAll(",\"format\":");
+        try root.appendJsonStringW(w, fmt);
     }
-    try buf.appendSlice(allocator, ",\"attachments\":[{\"type\":\"inline_keyboard\",\"payload\":");
-    try buf.appendSlice(allocator, keyboard_json);
-    try buf.appendSlice(allocator, "}]}");
+    try w.writeAll(",\"attachments\":[{\"type\":\"inline_keyboard\",\"payload\":");
+    try w.writeAll(keyboard_json);
+    try w.writeAll("}]}");
 
+    buf = buf_writer.toArrayList();
     return allocator.dupe(u8, buf.items);
 }
 
@@ -636,19 +644,22 @@ pub fn buildInlineKeyboardButtonsJson(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
-    try buf.appendSlice(allocator, "{\"buttons\":[");
+    try w.writeAll("{\"buttons\":[");
     for (buttons, 0..) |button, i| {
-        if (i > 0) try buf.appendSlice(allocator, ",");
-        try buf.appendSlice(allocator, "[{\"type\":\"callback\",\"text\":");
-        try root.appendJsonStringW(buf.writer(allocator), button.text);
-        try buf.appendSlice(allocator, ",\"payload\":");
-        try root.appendJsonStringW(buf.writer(allocator), button.payload);
-        try buf.appendSlice(allocator, ",\"intent\":\"default\"");
-        try buf.appendSlice(allocator, "}]");
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("[{\"type\":\"callback\",\"text\":");
+        try root.appendJsonStringW(w, button.text);
+        try w.writeAll(",\"payload\":");
+        try root.appendJsonStringW(w, button.payload);
+        try w.writeAll(",\"intent\":\"default\"");
+        try w.writeAll("}]");
     }
-    try buf.appendSlice(allocator, "]}");
+    try w.writeAll("]}");
 
+    buf = buf_writer.toArrayList();
     return allocator.dupe(u8, buf.items);
 }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const Config = @import("config.zig").Config;
 const config_paths = @import("config_paths.zig");
 const config_types = @import("config_types.zig");
@@ -321,7 +322,7 @@ pub fn applyBindingUpdate(
 }
 
 fn loadConfigFromPath(allocator: std.mem.Allocator, config_path: []const u8) !Config {
-    const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidConfigPath;
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse return error.InvalidConfigPath;
     const workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
     var cfg = Config{
@@ -330,7 +331,7 @@ fn loadConfigFromPath(allocator: std.mem.Allocator, config_path: []const u8) !Co
         .allocator = allocator,
     };
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 2 * 1024 * 1024);
     try cfg.parseJson(content);
@@ -530,7 +531,7 @@ test "persistBindingUpdate skips rewriting config when binding is unchanged" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -569,7 +570,7 @@ test "persistBindingUpdate skips rewriting config when binding is unchanged" {
     ;
 
     {
-        const file = try std.fs.createFileAbsolute(config_path, .{});
+        const file = try std_compat.fs.createFileAbsolute(config_path, .{});
         defer file.close();
         try file.writeAll(initial_content);
     }
@@ -583,7 +584,7 @@ test "persistBindingUpdate skips rewriting config when binding is unchanged" {
 
     try std.testing.expect(result.status == .unchanged);
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const persisted = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(persisted);

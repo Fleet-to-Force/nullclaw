@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 
 const DEFAULT_MAX_API_ERROR_CHARS: usize = 200;
@@ -26,7 +27,7 @@ pub fn setApiErrorLimitOverride(limit: ?u32) ApiErrorLimitOverrideError!void {
 }
 
 fn readMaxApiErrorCharsFromEnv() usize {
-    if (std.process.getEnvVarOwned(std.heap.page_allocator, "NULLCLAW_MAX_ERROR_CHARS")) |env_val| {
+    if (std_compat.process.getEnvVarOwned(std.heap.page_allocator, "NULLCLAW_MAX_ERROR_CHARS")) |env_val| {
         defer std.heap.page_allocator.free(env_val);
         const val = std.fmt.parseInt(usize, env_val, 10) catch DEFAULT_MAX_API_ERROR_CHARS;
         return if (val < MIN_MAX_API_ERROR_CHARS)

@@ -4,6 +4,8 @@
 //! Designed for distributed memory sharing across multiple nullclaw instances.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const std_compat = @import("compat");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -148,7 +150,7 @@ pub const RedisConfig = struct {
 
 pub const RedisMemory = struct {
     allocator: std.mem.Allocator,
-    stream: ?std.net.Stream = null,
+    stream: ?std_compat.net.Stream = null,
     host: []const u8,
     port: u16,
     password: ?[]const u8,
@@ -187,8 +189,8 @@ pub const RedisMemory = struct {
     }
 
     fn connect(self: *Self) anyerror!void {
-        const addr = try std.net.Address.resolveIp(self.host, self.port);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        const addr = try std_compat.net.Address.resolveIp(self.host, self.port);
+        const stream = try std_compat.net.tcpConnectToAddress(addr);
         self.stream = stream;
 
         // AUTH if password set (stream is already connected, ensureConnected is a no-op)
@@ -290,14 +292,14 @@ pub const RedisMemory = struct {
     // ── Timestamp / ID helpers ─────────────────────────────────────
 
     fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.timestamp();
+        const ts = std_compat.time.timestamp();
         return std.fmt.allocPrint(allocator, "{d}", .{ts});
     }
 
     fn generateId(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.nanoTimestamp();
+        const ts = std_compat.time.nanoTimestamp();
         var rand_buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&rand_buf);
+        std_compat.crypto.random.bytes(&rand_buf);
         const hi = std.mem.readInt(u64, rand_buf[0..8], .little);
         const lo = std.mem.readInt(u64, rand_buf[8..16], .little);
         return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, hi, lo });
@@ -983,8 +985,13 @@ test "formatCommand roundtrip with parseResp" {
 
 // Integration tests — guarded by Redis availability
 fn canConnectToRedis() bool {
-    const addr = std.net.Address.resolveIp("127.0.0.1", 6379) catch return false;
-    const stream = std.net.tcpConnectToAddress(addr) catch return false;
+    // Windows CI does not provide Redis, and Zig 0.16's AFD connect path can
+    // emit noisy unexpected NTSTATUS traces for a simple connection-refused
+    // probe before the error is caught here.
+    if (builtin.os.tag == .windows) return false;
+
+    const addr = std_compat.net.Address.resolveIp("127.0.0.1", 6379) catch return false;
+    const stream = std_compat.net.tcpConnectToAddress(addr) catch return false;
     stream.close();
     return true;
 }

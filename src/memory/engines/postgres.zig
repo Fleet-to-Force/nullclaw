@@ -4,6 +4,7 @@
 //! When disabled, this file provides only pure-logic helpers and their tests.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -66,14 +67,14 @@ pub fn buildQuery(allocator: std.mem.Allocator, template: []const u8, schema_q: 
 }
 
 fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
-    const ts = std.time.timestamp();
+    const ts = std_compat.time.timestamp();
     return std.fmt.allocPrint(allocator, "{d}", .{ts});
 }
 
 fn generateId(allocator: std.mem.Allocator) ![]u8 {
-    const ts = std.time.nanoTimestamp();
+    const ts = std_compat.time.nanoTimestamp();
     var buf: [16]u8 = undefined;
-    std.crypto.random.bytes(&buf);
+    std_compat.crypto.random.bytes(&buf);
     const rand_hi = std.mem.readInt(u64, buf[0..8], .little);
     const rand_lo = std.mem.readInt(u64, buf[8..16], .little);
     return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, rand_hi, rand_lo });

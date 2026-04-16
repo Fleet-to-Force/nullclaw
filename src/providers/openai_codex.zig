@@ -5,6 +5,7 @@
 //! Plus/Pro subscriptions can use this without separate API tokens.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const auth = @import("../auth.zig");
@@ -186,7 +187,7 @@ pub const OpenAiCodexProvider = struct {
         const token = self.access_token orelse return error.CredentialsNotSet;
 
         // Check if token needs refresh
-        if (self.expires_at != 0 and std.time.timestamp() + 300 >= self.expires_at) {
+        if (self.expires_at != 0 and std_compat.time.timestamp() + 300 >= self.expires_at) {
             const rt = self.refresh_token orelse return error.TokenExpired;
             const new_token = try auth.refreshAccessToken(
                 self.allocator,
@@ -417,7 +418,7 @@ fn codexStreamRequest(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -542,7 +543,7 @@ fn codexStreamRequest(
         return error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeCodexStreamResult(allocator, accumulated.items);
@@ -775,7 +776,7 @@ fn extractCompletedToolCalls(allocator: std.mem.Allocator, root_obj: std.json.Ob
 /// - "response.completed" / "response.done" → done
 /// - "error" / "response.failed" → error
 pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !CodexSseResult {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
 
@@ -784,7 +785,7 @@ pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !Codex
 
     const prefix = "data:";
     if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
-    const data = std.mem.trimLeft(u8, trimmed[prefix.len..], " ");
+    const data = std.mem.trimStart(u8, trimmed[prefix.len..], " ");
     if (std.mem.eql(u8, data, "[DONE]")) return .done;
 
     // Parse JSON

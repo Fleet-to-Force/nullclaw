@@ -7,6 +7,7 @@
 //! This backend is append-only: forget() is a no-op to preserve audit trail.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -108,7 +109,7 @@ pub const MarkdownMemory = struct {
     }
 
     fn dailyPath(self: *const Self, allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.timestamp();
+        const ts = std_compat.time.timestamp();
         const epoch: u64 = @intCast(ts);
         const es = std.time.epoch.EpochSeconds{ .secs = epoch };
         const day = es.getEpochDay().calculateYearDay();
@@ -123,8 +124,8 @@ pub const MarkdownMemory = struct {
     }
 
     fn ensureDir(path: []const u8) !void {
-        if (std.fs.path.dirname(path)) |dir| {
-            std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        if (std_compat.fs.path.dirname(path)) |dir| {
+            std_compat.fs.makeDirAbsolute(dir) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return err,
             };
@@ -137,7 +138,7 @@ pub const MarkdownMemory = struct {
         // Open (or create) without truncation and seek to end to append.
         // This avoids the read-concat-rewrite pattern which loses data if
         // the process crashes between truncation and write completion.
-        const file = try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
+        const file = try fs_compat.createPath(path, .{ .truncate = false, .read = true });
         defer file.close();
 
         const stat = try fs_compat.stat(file);
@@ -248,13 +249,13 @@ pub const MarkdownMemory = struct {
             defer allocator.free(root_path);
 
             // Open file, get its stat, then read content in one go.
-            const file = std.fs.cwd().openFile(root_path, .{}) catch continue;
+            const file = fs_compat.openPath(root_path, .{}) catch continue;
             defer file.close();
             const stat = fs_compat.stat(file) catch continue;
             const content = file.readToEndAlloc(allocator, 1024 * 1024) catch continue;
             defer allocator.free(content);
 
-            const canonical = std.fs.realpathAlloc(allocator, root_path) catch
+            const canonical = std_compat.fs.realpathAlloc(allocator, root_path) catch
                 try allocator.dupe(u8, root_path);
             errdefer allocator.free(canonical);
             if (seen_root_paths.contains(canonical)) {
@@ -280,7 +281,7 @@ pub const MarkdownMemory = struct {
 
         const md = try self.memoryDir(allocator);
         defer allocator.free(md);
-        if (std.fs.cwd().openDir(md, .{ .iterate = true })) |*dir_handle| {
+        if (fs_compat.openDirPath(md, .{ .iterate = true })) |*dir_handle| {
             var dir = dir_handle.*;
             defer dir.close();
             var it = dir.iterate();
@@ -289,7 +290,7 @@ pub const MarkdownMemory = struct {
                 const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ md, entry.name });
                 defer allocator.free(fpath);
 
-                const file = std.fs.cwd().openFile(fpath, .{}) catch continue;
+                const file = fs_compat.openPath(fpath, .{}) catch continue;
                 defer file.close();
                 const stat = fs_compat.stat(file) catch continue;
                 const content = file.readToEndAlloc(allocator, 1024 * 1024) catch continue;
@@ -606,7 +607,7 @@ test "markdown parseEntries preserves category" {
 test "markdown accepts session_id param" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var mem = try MarkdownMemory.init(std.testing.allocator, base);
@@ -632,7 +633,7 @@ test "markdown accepts session_id param" {
 test "markdown getScoped returns entry inside isolated workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var mem = try MarkdownMemory.init(std.testing.allocator, base);
@@ -649,11 +650,11 @@ test "markdown getScoped returns entry inside isolated workspace" {
 test "markdown reads memory.md when MEMORY.md is absent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "memory.md",
         .data = "- legacy-memory-entry",
     });
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var mem = try MarkdownMemory.init(std.testing.allocator, base);
@@ -674,13 +675,13 @@ test "markdown reads both MEMORY.md and memory.md when distinct" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "MEMORY.md",
         .data = "- primary-entry",
     });
 
     var has_distinct_case_files = true;
-    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+    const alt = @import("compat").fs.Dir.wrap(tmp.dir).createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
         error.PathAlreadyExists => blk: {
             has_distinct_case_files = false;
             break :blk null;
@@ -694,7 +695,7 @@ test "markdown reads both MEMORY.md and memory.md when distinct" {
 
     if (!has_distinct_case_files) return;
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var mem = try MarkdownMemory.init(std.testing.allocator, base);
@@ -721,7 +722,7 @@ test "markdown reads both MEMORY.md and memory.md when distinct" {
 test "markdown get returns latest matching entry for duplicate key" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var mem = try MarkdownMemory.init(std.testing.allocator, base);

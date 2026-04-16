@@ -70,6 +70,7 @@ fn extractToolNameAndArgs(
     name: []const u8,
     arguments: std.json.Value,
 ) struct { name: []const u8, args: std.json.Value } {
+    _ = allocator;
     const stripped_name = stripToolPrefixes(name);
 
     // Pattern 1: Nested tool_call wrapper
@@ -81,7 +82,7 @@ fn extractToolNameAndArgs(
         if (arguments == .object) {
             if (arguments.object.get("name")) |nested_name_val| {
                 if (nested_name_val == .string) {
-                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+                    const nested_args = if (arguments.object.get("arguments")) |a| a else std.json.Value{ .object = .empty };
                     return .{ .name = normalizeToolName(nested_name_val.string), .args = nested_args };
                 }
             }

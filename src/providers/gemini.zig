@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const log = std.log.scoped(.gemini);
 const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
@@ -117,7 +118,7 @@ pub fn extractGeminiUsageMetadata(allocator: std.mem.Allocator, json_str: []cons
 }
 
 fn extractGeminiUsageFromSseLine(allocator: std.mem.Allocator, line: []const u8) !?root.TokenUsage {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
     if (trimmed.len == 0 or trimmed[0] == ':') return null;
 
     const prefix = "data: ";
@@ -189,7 +190,7 @@ pub const GeminiCliCredentials = struct {
     /// If expires_at is null, the token is treated as never-expiring.
     pub fn isExpired(self: GeminiCliCredentials) bool {
         const expiry = self.expires_at orelse return false;
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const buffer_seconds: i64 = 5 * 60; // 5-minute safety buffer
         return now >= (expiry - buffer_seconds);
     }
@@ -338,7 +339,7 @@ pub fn writeCredentialsJson(allocator: std.mem.Allocator, creds: GeminiCliCreden
 
     try buf.append(allocator, '}');
 
-    const file = std.fs.createFileAbsolute(path, .{ .mode = 0o600 }) catch return error.FileWriteError;
+    const file = std_compat.fs.createFileAbsolute(path, .{ .permissions = std_compat.fs.permissionsFromMode(0o600) }) catch return error.FileWriteError;
     defer file.close();
     try file.writeAll(buf.items);
 }
@@ -354,10 +355,10 @@ pub fn tryLoadGeminiCliToken(allocator: std.mem.Allocator) ?GeminiCliCredentials
     const home = platform.getHomeDir(allocator) catch return null;
     defer allocator.free(home);
 
-    const path = std.fs.path.join(allocator, &.{ home, ".gemini", "oauth_creds.json" }) catch return null;
+    const path = std_compat.fs.path.join(allocator, &.{ home, ".gemini", "oauth_creds.json" }) catch return null;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
 
     const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
@@ -371,7 +372,7 @@ pub fn tryLoadGeminiCliToken(allocator: std.mem.Allocator) ?GeminiCliCredentials
         if (creds.refresh_token) |rt| {
             if (refreshOAuthToken(allocator, rt)) |refreshed_resp| {
                 // Build refreshed credentials
-                const now = std.time.timestamp();
+                const now = std_compat.time.timestamp();
                 const ttl: i64 = if (refreshed_resp.expires_in > 0) refreshed_resp.expires_in else 3600;
                 const new_expires_at = std.math.add(i64, now, ttl) catch std.math.maxInt(i64);
 
@@ -510,7 +511,7 @@ pub const GeminiProvider = struct {
     }
 
     fn loadNonEmptyEnv(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-        if (std.process.getEnvVarOwned(allocator, name)) |value| {
+        if (std_compat.process.getEnvVarOwned(allocator, name)) |value| {
             defer allocator.free(value);
             const trimmed = std.mem.trim(u8, value, " \t\r\n");
             if (trimmed.len > 0) {
@@ -712,7 +713,7 @@ pub const GeminiProvider = struct {
     /// - Empty lines, comments (`:`) → `.skip`
     /// - No `[DONE]` sentinel - stream ends when connection closes
     pub fn parseGeminiSseLine(allocator: std.mem.Allocator, line: []const u8) !GeminiSseResult {
-        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
         if (trimmed.len == 0) return .skip;
         if (trimmed[0] == ':') return .skip;
@@ -832,7 +833,7 @@ pub const GeminiProvider = struct {
         argv_buf[argc] = url;
         argc += 1;
 
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
@@ -935,7 +936,7 @@ pub const GeminiProvider = struct {
             return error.CurlWaitError;
         };
         switch (term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                     log.warn("curlStreamGemini exit code {d} after partial stream output; returning accumulated output", .{code});
                     callback(ctx, root.StreamChunk.finalChunk());
@@ -1549,7 +1550,7 @@ test "streamChatImpl fails without credentials" {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "GeminiCliCredentials isExpired with future timestamp returns false" {
-    const future: i64 = std.time.timestamp() + 3600; // 1 hour from now
+    const future: i64 = std_compat.time.timestamp() + 3600; // 1 hour from now
     const creds = GeminiCliCredentials{
         .access_token = "ya29.test-token",
         .refresh_token = null,
@@ -1559,7 +1560,7 @@ test "GeminiCliCredentials isExpired with future timestamp returns false" {
 }
 
 test "GeminiCliCredentials isExpired with past timestamp returns true" {
-    const past: i64 = std.time.timestamp() - 3600; // 1 hour ago
+    const past: i64 = std_compat.time.timestamp() - 3600; // 1 hour ago
     const creds = GeminiCliCredentials{
         .access_token = "ya29.test-token",
         .refresh_token = null,
@@ -1579,7 +1580,7 @@ test "GeminiCliCredentials isExpired with null expires_at returns false" {
 
 test "GeminiCliCredentials isExpired with 5-min buffer edge case" {
     // Token expires in exactly 4 minutes — within the 5-minute buffer, so should be expired
-    const almost_expired: i64 = std.time.timestamp() + 4 * 60;
+    const almost_expired: i64 = std_compat.time.timestamp() + 4 * 60;
     const creds_soon = GeminiCliCredentials{
         .access_token = "ya29.test-token",
         .refresh_token = null,
@@ -1588,7 +1589,7 @@ test "GeminiCliCredentials isExpired with 5-min buffer edge case" {
     try std.testing.expect(creds_soon.isExpired());
 
     // Token expires in exactly 6 minutes — outside the 5-minute buffer, so should NOT be expired
-    const still_valid: i64 = std.time.timestamp() + 6 * 60;
+    const still_valid: i64 = std_compat.time.timestamp() + 6 * 60;
     const creds_valid = GeminiCliCredentials{
         .access_token = "ya29.test-token",
         .refresh_token = null,
@@ -1897,10 +1898,10 @@ test "writeCredentialsJson produces valid JSON" {
     defer temp_dir.cleanup();
 
     // Create placeholder file so realpathAlloc works
-    const tmp_file = try temp_dir.dir.createFile("creds.json", .{});
+    const tmp_file = try @import("compat").fs.Dir.wrap(temp_dir.dir).createFile("creds.json", .{});
     tmp_file.close();
 
-    const path = try temp_dir.dir.realpathAlloc(alloc, "creds.json");
+    const path = try @import("compat").fs.Dir.wrap(temp_dir.dir).realpathAlloc(alloc, "creds.json");
     defer alloc.free(path);
 
     const creds = GeminiCliCredentials{
@@ -1912,7 +1913,7 @@ test "writeCredentialsJson produces valid JSON" {
     try writeCredentialsJson(alloc, creds, path);
 
     // Read back and verify valid JSON
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
 
     const content = try file.readToEndAlloc(alloc, 4096);
@@ -1940,10 +1941,10 @@ test "writeCredentialsJson without refresh token" {
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
 
-    const tmp_file = try temp_dir.dir.createFile("creds2.json", .{});
+    const tmp_file = try @import("compat").fs.Dir.wrap(temp_dir.dir).createFile("creds2.json", .{});
     tmp_file.close();
 
-    const path = try temp_dir.dir.realpathAlloc(alloc, "creds2.json");
+    const path = try @import("compat").fs.Dir.wrap(temp_dir.dir).realpathAlloc(alloc, "creds2.json");
     defer alloc.free(path);
 
     const creds = GeminiCliCredentials{
@@ -1954,7 +1955,7 @@ test "writeCredentialsJson without refresh token" {
 
     try writeCredentialsJson(alloc, creds, path);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
 
     const content = try file.readToEndAlloc(alloc, 4096);
@@ -1974,10 +1975,10 @@ test "writeCredentialsJson escapes token strings" {
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
 
-    const tmp_file = try temp_dir.dir.createFile("creds-escaped.json", .{});
+    const tmp_file = try @import("compat").fs.Dir.wrap(temp_dir.dir).createFile("creds-escaped.json", .{});
     tmp_file.close();
 
-    const path = try temp_dir.dir.realpathAlloc(alloc, "creds-escaped.json");
+    const path = try @import("compat").fs.Dir.wrap(temp_dir.dir).realpathAlloc(alloc, "creds-escaped.json");
     defer alloc.free(path);
 
     const access_token = "tok\"en\\line\nbreak";
@@ -1990,7 +1991,7 @@ test "writeCredentialsJson escapes token strings" {
 
     try writeCredentialsJson(alloc, creds, path);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(alloc, 4096);
     defer alloc.free(content);

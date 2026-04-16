@@ -5,6 +5,7 @@
 //! `joinZ` logic that was previously duplicated across 6 entry points.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const config_types = @import("../../config_types.zig");
 const root = @import("../root.zig");
@@ -253,15 +254,16 @@ pub fn engineTokenForBackend(name: []const u8) ?[]const u8 {
 pub fn formatEnabledBackends(allocator: std.mem.Allocator) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
 
     for (&all, 0..) |desc, i| {
-        if (i != 0) try w.writeAll(", ");
-        try w.writeAll(desc.name);
+        if (i != 0) try out_writer.writer.writeAll(", ");
+        try out_writer.writer.writeAll(desc.name);
     }
     if (all.len == 0) {
-        try w.writeAll("(none)");
+        try out_writer.writer.writeAll("(none)");
     }
+    out = out_writer.toArrayList();
     return out.toOwnedSlice(allocator);
 }
 
@@ -277,7 +279,7 @@ pub fn resolvePaths(
     clickhouse_cfg: ?config_types.MemoryClickHouseConfig,
 ) !BackendConfig {
     const db_path: ?[*:0]const u8 = if (desc.needs_db_path)
-        try std.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" })
+        try std_compat.fs.path.joinZ(allocator, &.{ workspace_dir, "memory.db" })
     else
         null;
     errdefer if (db_path) |p| allocator.free(std.mem.span(p));

@@ -10,6 +10,7 @@
 //! - KV store for settings
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -51,7 +52,7 @@ pub fn shouldUseWal(path: [*:0]const u8) bool {
 /// Returns `false` if the fs is 9p/nfs/cifs/smb3, `true` for others,
 /// `null` if mountinfo is unavailable or unparseable.
 fn checkMountinfo(path: []const u8) ?bool {
-    const file = std.fs.openFileAbsolute("/proc/self/mountinfo", .{}) catch return null;
+    const file = std_compat.fs.openFileAbsolute("/proc/self/mountinfo", .{}) catch return null;
     defer file.close();
 
     var best_len: usize = 0;
@@ -174,8 +175,8 @@ fn checkStatfs(path: [*:0]const u8) bool {
     const path_span = std.mem.span(path);
     if (path_span.len == 0 or std.mem.eql(u8, path_span, ":memory:")) return true;
 
-    const dir_path = std.fs.path.dirname(path_span) orelse ".";
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = std_compat.fs.path.dirname(path_span) orelse ".";
+    var dir_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
     if (dir_path.len + 1 > dir_buf.len) return true;
     @memcpy(dir_buf[0..dir_path.len], dir_path);
     dir_buf[dir_path.len] = 0;
@@ -1322,14 +1323,14 @@ pub const SqliteMemory = struct {
     }
 
     fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.timestamp();
+        const ts = std_compat.time.timestamp();
         return std.fmt.allocPrint(allocator, "{d}", .{ts});
     }
 
     fn generateId(allocator: std.mem.Allocator) ![]u8 {
-        const ts = std.time.nanoTimestamp();
+        const ts = std_compat.time.nanoTimestamp();
         var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf);
+        std_compat.crypto.random.bytes(&buf);
         const rand_hi = std.mem.readInt(u64, buf[0..8], .little);
         const rand_lo = std.mem.readInt(u64, buf[8..16], .little);
         return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, rand_hi, rand_lo });

@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -36,20 +38,20 @@ pub const FileDeleteTool = struct {
         const path = root.getString(args, "path") orelse
             return ToolResult.fail("Missing 'path' parameter");
 
-        if (std.fs.path.isAbsolute(path) or !isPathSafe(path))
+        if (std_compat.fs.path.isAbsolute(path) or !isPathSafe(path))
             return ToolResult.fail("Path not allowed: use a workspace-relative BOOTSTRAP.md path");
 
         if (!std.mem.eql(u8, path, "BOOTSTRAP.md"))
             return ToolResult.fail("Only BOOTSTRAP.md can be deleted with this tool");
 
-        const full_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, path });
+        const full_path = try std_compat.fs.path.join(allocator, &.{ self.workspace_dir, path });
         defer allocator.free(full_path);
 
-        const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+        const ws_resolved: ?[]const u8 = fs_compat.realpathAllocPath(allocator, self.workspace_dir) catch null;
         defer if (ws_resolved) |wr| allocator.free(wr);
         const ws_path = ws_resolved orelse "";
 
-        const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
+        const parent_to_check = std_compat.fs.path.dirname(full_path) orelse full_path;
         const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to resolve path: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -66,7 +68,7 @@ pub const FileDeleteTool = struct {
             false;
 
         const removed_from_disk = blk: {
-            std.fs.deleteFileAbsolute(full_path) catch |err| switch (err) {
+            std_compat.fs.deleteFileAbsolute(full_path) catch |err| switch (err) {
                 error.FileNotFound => break :blk false,
                 else => {
                     const msg = try std.fmt.allocPrint(allocator, "Failed to delete file: {}", .{err});
@@ -97,7 +99,7 @@ test "file_delete rejects non-bootstrap paths" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileDeleteTool{ .workspace_dir = ws_path };
@@ -115,7 +117,7 @@ test "file_delete removes sqlite bootstrap and marks onboarding complete" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var lru = @import("../memory/root.zig").InMemoryLruMemory.init(std.testing.allocator, 16);
@@ -141,9 +143,9 @@ test "file_delete removes sqlite bootstrap and marks onboarding complete" {
     try std.testing.expectEqualStrings("Deleted BOOTSTRAP.md", result.output);
     try std.testing.expect(!provider.exists("BOOTSTRAP.md"));
 
-    const state_path = try std.fs.path.join(std.testing.allocator, &.{ ws_path, ".nullclaw", "workspace-state.json" });
+    const state_path = try std_compat.fs.path.join(std.testing.allocator, &.{ ws_path, ".nullclaw", "workspace-state.json" });
     defer std.testing.allocator.free(state_path);
-    const file = try std.fs.openFileAbsolute(state_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(state_path, .{});
     defer file.close();
     const state_raw = try file.readToEndAlloc(std.testing.allocator, 4096);
     defer std.testing.allocator.free(state_raw);
@@ -154,10 +156,10 @@ test "file_delete removes sqlite bootstrap disk fallback when DB entry is absent
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "BOOTSTRAP.md", .data = "legacy bootstrap" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "BOOTSTRAP.md", .data = "legacy bootstrap" });
 
     var lru = @import("../memory/root.zig").InMemoryLruMemory.init(std.testing.allocator, 16);
     defer lru.deinit();
@@ -180,17 +182,17 @@ test "file_delete removes sqlite bootstrap disk fallback when DB entry is absent
     try std.testing.expect(result.success);
     try std.testing.expectEqualStrings("Deleted BOOTSTRAP.md", result.output);
     try std.testing.expect(!provider.exists("BOOTSTRAP.md"));
-    try std.testing.expectError(error.FileNotFound, tmp_dir.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp_dir.dir).openFile("BOOTSTRAP.md", .{}));
 }
 
 test "file_delete removes sqlite bootstrap from DB and disk fallback together" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "BOOTSTRAP.md", .data = "legacy bootstrap" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "BOOTSTRAP.md", .data = "legacy bootstrap" });
 
     var lru = @import("../memory/root.zig").InMemoryLruMemory.init(std.testing.allocator, 16);
     defer lru.deinit();
@@ -213,5 +215,5 @@ test "file_delete removes sqlite bootstrap from DB and disk fallback together" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(!provider.exists("BOOTSTRAP.md"));
-    try std.testing.expectError(error.FileNotFound, tmp_dir.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp_dir.dir).openFile("BOOTSTRAP.md", .{}));
 }

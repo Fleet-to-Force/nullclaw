@@ -4,6 +4,7 @@
 //! dependencies.  Ideal for testing, CI, and ephemeral sessions.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("../root.zig");
 const key_codec = @import("../vector/key_codec.zig");
 const Memory = root.Memory;
@@ -86,7 +87,7 @@ pub const InMemoryLruMemory = struct {
     }
 
     fn nowTimestamp(self: *Self) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "{d}", .{std.time.timestamp()});
+        return std.fmt.allocPrint(self.allocator, "{d}", .{std_compat.time.timestamp()});
     }
 
     fn dupCategory(self: *Self, cat: MemoryCategory) !MemoryCategory {

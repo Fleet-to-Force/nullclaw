@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -10,9 +11,9 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.slack);
 
-const SocketFd = std.net.Stream.Handle;
+const SocketFd = std_compat.net.Stream.Handle;
 const invalid_socket: SocketFd = switch (builtin.os.tag) {
-    .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+    .windows => std_compat.net.invalidHandle(SocketFd),
     else => -1,
 };
 
@@ -60,7 +61,7 @@ pub const CallbackSelection = union(enum) {
     invalid_option,
 };
 
-var shared_interactions_mu: std.Thread.Mutex = .{};
+var shared_interactions_mu: std_compat.sync.Mutex = .{};
 var shared_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty;
 var shared_interaction_seq: Atomic(u64) = Atomic(u64).init(1);
 
@@ -553,7 +554,8 @@ pub const SlackChannel = struct {
 
         var metadata: std.ArrayListUnmanaged(u8) = .empty;
         defer metadata.deinit(self.allocator);
-        const mw = metadata.writer(self.allocator);
+        var metadata_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &metadata);
+        const mw = &metadata_writer.writer;
         try mw.writeByte('{');
         try mw.writeAll("\"account_id\":");
         try root.appendJsonStringW(mw, self.account_id);
@@ -570,6 +572,7 @@ pub const SlackChannel = struct {
             try root.appendJsonStringW(mw, tts);
         }
         try mw.writeByte('}');
+        metadata = metadata_writer.toArrayList();
 
         const inbound = try bus_mod.makeInboundFull(
             self.allocator,
@@ -593,11 +596,10 @@ pub const SlackChannel = struct {
 
     fn pollChannelHistory(self: *SlackChannel, channel_id: []const u8) !void {
         var url_buf: [1024]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&url_buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(&url_buf);
         const oldest = self.channelLastTs(channel_id);
         try w.print("{s}/conversations.history?channel={s}&oldest={s}&inclusive=false&limit=100", .{ API_BASE, channel_id, oldest });
-        const url = fbs.getWritten();
+        const url = w.buffered();
 
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.normalizedBotToken()});
         defer self.allocator.free(auth_header);
@@ -669,7 +671,7 @@ pub const SlackChannel = struct {
 
             var slept: u64 = 0;
             while (slept < POLL_INTERVAL_SECS and self.running.load(.acquire)) : (slept += 1) {
-                std.Thread.sleep(std.time.ns_per_s);
+                std_compat.thread.sleep(std.time.ns_per_s);
             }
         }
     }
@@ -730,19 +732,18 @@ pub const SlackChannel = struct {
 
     fn parseSocketConnectParts(
         socket_url: []const u8,
-        host_buf: []u8,
+        host_buf: *[std.Io.net.HostName.max_len]u8,
         path_buf: []u8,
     ) !struct { host: []const u8, port: u16, path: []const u8 } {
         const uri = std.Uri.parse(socket_url) catch return error.SlackApiError;
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "wss")) return error.SlackApiError;
 
-        const host = uri.getHost(host_buf) catch return error.SlackApiError;
+        const host = (uri.getHost(host_buf) catch return error.SlackApiError).bytes;
         const port = uri.port orelse 443;
         const raw_path = componentAsSlice(uri.path);
         const query = if (uri.query) |q| componentAsSlice(q) else "";
 
-        var fbs = std.io.fixedBufferStream(path_buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(path_buf);
         if (raw_path.len == 0) {
             try w.writeByte('/');
         } else {
@@ -756,7 +757,7 @@ pub const SlackChannel = struct {
         return .{
             .host = host,
             .port = port,
-            .path = fbs.getWritten(),
+            .path = w.buffered(),
         };
     }
 
@@ -780,12 +781,11 @@ pub const SlackChannel = struct {
 
     fn ackSocketEnvelope(self: *SlackChannel, ws: *websocket.WsClient, envelope_id: []const u8) !void {
         var buf: [512]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(&buf);
         try w.writeAll("{\"envelope_id\":");
-        try root.appendJsonStringW(w, envelope_id);
+        try root.appendJsonStringW(&w, envelope_id);
         try w.writeAll("}");
-        try ws.writeText(fbs.getWritten());
+        try ws.writeText(w.buffered());
         _ = self;
     }
 
@@ -833,7 +833,7 @@ pub const SlackChannel = struct {
         const ws_url = try self.openSocketUrl();
         defer self.allocator.free(ws_url);
 
-        var host_buf: [512]u8 = undefined;
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         var path_buf: [2048]u8 = undefined;
         const parts = try parseSocketConnectParts(ws_url, &host_buf, &path_buf);
         var ws = try websocket.WsClient.connect(self.allocator, parts.host, parts.port, parts.path, &.{});
@@ -890,7 +890,7 @@ pub const SlackChannel = struct {
 
             var slept: u64 = 0;
             while (slept < RECONNECT_DELAY_NS and self.running.load(.acquire)) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
                 slept += 100 * std.time.ns_per_ms;
             }
         }
@@ -1122,9 +1122,9 @@ pub const SlackChannel = struct {
 
         // Build auth header: "Authorization: Bearer xoxb-..."
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
             log.err("Slack API POST failed: {}", .{err});
@@ -1152,9 +1152,9 @@ pub const SlackChannel = struct {
         try self.appendInteractivePostMessageBody(&body_list, actual_channel, payload.text, token, payload.choices);
 
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, API_BASE ++ "/chat.postMessage", body_list.items, &.{auth_header}) catch |err| {
             log.err("Slack API POST failed: {}", .{err});
@@ -1179,7 +1179,9 @@ pub const SlackChannel = struct {
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
 
-        const bw = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const bw = &body_writer.writer;
         bw.writeAll("{\"channel_id\":") catch return;
         root.appendJsonStringW(bw, channel_id) catch return;
         bw.writeAll(",\"thread_ts\":") catch return;
@@ -1189,9 +1191,9 @@ pub const SlackChannel = struct {
         bw.writeByte('}') catch return;
 
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()}) catch return;
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()}) catch return;
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch return;
         self.allocator.free(resp);
@@ -1273,11 +1275,7 @@ pub const SlackChannel = struct {
 
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
-            if (comptime builtin.os.tag == .windows) {
-                _ = std.os.windows.ws2_32.closesocket(fd);
-            } else {
-                std.posix.close(fd);
-            }
+            (std_compat.net.Stream{ .handle = fd }).close();
             self.ws_fd.store(invalid_socket, .release);
         }
 
@@ -2317,7 +2315,7 @@ test "normalizeWebhookPath falls back for invalid values" {
 }
 
 test "parseSocketConnectParts extracts host port and path" {
-    var host_buf: [128]u8 = undefined;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     var path_buf: [512]u8 = undefined;
     const parts = try SlackChannel.parseSocketConnectParts(
         "wss://wss-primary.slack.com/link/?ticket=abc123",

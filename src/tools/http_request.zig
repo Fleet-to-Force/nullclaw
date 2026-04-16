@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
@@ -98,7 +99,7 @@ pub const HttpRequestTool = struct {
 
         // Parse custom headers from ObjectMap
         const headers_val = root.getValue(args, "headers");
-        var header_list: std.ArrayList([2][]const u8) = .{};
+        var header_list: std.ArrayList([2][]const u8) = .empty;
         errdefer {
             for (header_list.items) |h| {
                 allocator.free(h[0]);
@@ -306,7 +307,7 @@ fn runCurlRequestWithStatus(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = if (body != null) .Pipe else .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -316,7 +317,7 @@ fn runCurlRequestWithStatus(
     const cancel_flag = http_util.currentThreadInterruptFlag();
     const AtomicBool = std.atomic.Value(bool);
     const CancelCtx = struct {
-        child: *std.process.Child,
+        child: *std_compat.process.Child,
         cancel_flag: *const AtomicBool,
         done: *AtomicBool,
     };
@@ -325,13 +326,13 @@ fn runCurlRequestWithStatus(
             while (!ctx.done.load(.acquire)) {
                 if (ctx.cancel_flag.load(.acquire)) {
                     if (comptime @import("builtin").os.tag == .windows) {
-                        std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
+                        _ = ctx.child.kill() catch {};
                     } else {
                         std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
                     }
                     break;
                 }
-                std.Thread.sleep(20 * std.time.ns_per_ms);
+                std_compat.thread.sleep(20 * std.time.ns_per_ms);
             }
         }
     }.run;
@@ -383,7 +384,7 @@ fn runCurlRequestWithStatus(
 
     const term = child.wait() catch return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0 and !(cancel_flag != null and cancel_flag.?.load(.acquire))) {
+        .exited => |code| if (code != 0 and !(cancel_flag != null and cancel_flag.?.load(.acquire))) {
             if (stderr_out) |out| {
                 out.* = stderr_copy;
                 stderr_copy = null;
@@ -494,7 +495,7 @@ fn parseHeaders(allocator: std.mem.Allocator, headers_json: ?[]const u8) ![]cons
     const json = headers_json orelse return &.{};
     if (json.len < 2) return &.{};
 
-    var list: std.ArrayList([2][]const u8) = .{};
+    var list: std.ArrayList([2][]const u8) = .empty;
     errdefer {
         for (list.items) |h| {
             allocator.free(h[0]);
@@ -543,7 +544,7 @@ fn parseHeaders(allocator: std.mem.Allocator, headers_json: ?[]const u8) ![]cons
 fn redactHeadersForDisplay(allocator: std.mem.Allocator, headers: []const [2][]const u8) ![]const u8 {
     if (headers.len == 0) return allocator.dupe(u8, "");
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     for (headers, 0..) |h, i| {

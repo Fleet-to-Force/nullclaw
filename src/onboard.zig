@@ -9,6 +9,7 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const config_paths = @import("config_paths.zig");
@@ -496,11 +497,11 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
         return dupeFallbackModels(allocator, provider);
     defer allocator.free(config_dir);
 
-    const state_dir = try std.fs.path.join(allocator, &.{ config_dir, "state" });
+    const state_dir = try std_compat.fs.path.join(allocator, &.{ config_dir, "state" });
     defer allocator.free(state_dir);
 
     // Ensure state directory exists
-    std.fs.makeDirAbsolute(state_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(state_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return dupeFallbackModels(allocator, provider),
     };
@@ -772,7 +773,7 @@ fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8,
 const CACHE_TTL_SECS: i64 = 12 * 3600; // 12 hours
 
 fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provider: []const u8) ![][]const u8 {
-    const file = std.fs.openFileAbsolute(cache_path, .{}) catch return error.CacheNotFound;
+    const file = std_compat.fs.openFileAbsolute(cache_path, .{}) catch return error.CacheNotFound;
     defer file.close();
 
     const content = file.readToEndAlloc(allocator, 256 * 1024) catch return error.CacheReadError;
@@ -791,7 +792,7 @@ fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
         else => return error.CacheParseError,
     };
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     if (now - fetched_at > CACHE_TTL_SECS) return error.CacheExpired;
 
     // Get provider's model list
@@ -822,7 +823,7 @@ fn saveCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
 
     try buf.appendSlice(allocator, "{\n  \"fetched_at\": ");
     var ts_buf: [24]u8 = undefined;
-    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.timestamp()}) catch return;
+    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp()}) catch return;
     try buf.appendSlice(allocator, ts_str);
     try buf.appendSlice(allocator, ",\n  \"");
     try buf.appendSlice(allocator, provider);
@@ -837,7 +838,7 @@ fn saveCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
 
     try buf.appendSlice(allocator, "]\n}\n");
 
-    const file = std.fs.createFileAbsolute(cache_path, .{}) catch return;
+    const file = std_compat.fs.createFileAbsolute(cache_path, .{}) catch return;
     defer file.close();
     file.writeAll(buf.items) catch {};
 }
@@ -895,7 +896,7 @@ pub fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
 /// Non-interactive setup: generates a sensible default config.
 pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, model: ?[]const u8, memory_backend: ?[]const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     try stdout.writeAll(BANNER);
     try stdout.writeAll("  Quick Setup -- generating config with sensible defaults...\n\n");
@@ -939,13 +940,13 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     }
 
     // Ensure parent config directory and workspace directory exist
-    if (std.fs.path.dirname(cfg.workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(cfg.workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -988,7 +989,7 @@ fn ensureSecretsEncryptionEnabled(cfg: *const Config) Config.ValidationError!voi
 /// Reconfigure channels and allowlists only (preserves existing config).
 pub fn runChannelsOnly(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
     var input_buf: [512]u8 = undefined;
     resetStdinLineReader();
@@ -1030,7 +1031,7 @@ const StdinLineReader = struct {
     }
 
     fn copyLineToOut(out: []u8, raw_line: []const u8) []const u8 {
-        const trimmed = std.mem.trimRight(u8, raw_line, "\r");
+        const trimmed = std_compat.mem.trimRight(u8, raw_line, "\r");
         const copy_len = @min(out.len, trimmed.len);
         @memcpy(out[0..copy_len], trimmed[0..copy_len]);
         return out[0..copy_len];
@@ -1064,7 +1065,7 @@ fn resetStdinLineReader() void {
 /// Read a line from stdin, trimming trailing newline/carriage return.
 /// Returns null on EOF (Ctrl+D).
 fn readLine(buf: []u8) ?[]const u8 {
-    const stdin = std.fs.File.stdin();
+    const stdin = std_compat.fs.File.stdin();
     while (true) {
         if (stdin_line_reader.popLine(buf)) |line| return line;
 
@@ -1735,7 +1736,7 @@ fn configureExternalChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: 
         return false;
     };
 
-    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse ".";
     const account_segment = try sanitizeStatePathSegment(cfg.allocator, account_id);
     defer cfg.allocator.free(account_segment);
     const runtime_segment = try sanitizeStatePathSegment(cfg.allocator, runtime_name);
@@ -1751,7 +1752,7 @@ fn configureExternalChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: 
             .timeout_ms = timeout_ms,
         },
         .plugin_config_json = plugin_config_json.?,
-        .state_dir = try std.fs.path.join(cfg.allocator, &.{ config_dir, "state", "external", runtime_segment, account_segment }),
+        .state_dir = try std_compat.fs.path.join(cfg.allocator, &.{ config_dir, "state", "external", runtime_segment, account_segment }),
     };
     cfg.channels.external = accounts;
     committed = true;
@@ -1876,7 +1877,7 @@ fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pre
     }
 
     const secrets = @import("security/secrets.zig");
-    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const config_dir = std_compat.fs.path.dirname(cfg.config_path) orelse ".";
     const store = secrets.SecretStore.init(config_dir, cfg.secrets.encrypt);
     const encrypted_key = try store.encryptSecret(cfg.allocator, bot_privkey_hex.?);
 
@@ -1994,7 +1995,7 @@ fn configureMaxChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []con
 
 /// Run a nak subprocess, capture stdout, trim whitespace, return owned slice or null on failure.
 fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
     child.spawn() catch return null;
@@ -2018,7 +2019,7 @@ fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
         return null;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             out.deinit(allocator);
             return null;
         },
@@ -2028,7 +2029,7 @@ fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
         },
     }
     const raw = out.toOwnedSlice(allocator) catch return null;
-    const trimmed = std.mem.trimRight(u8, raw, " \t\r\n");
+    const trimmed = std_compat.mem.trimRight(u8, raw, " \t\r\n");
     if (trimmed.len == raw.len) return raw;
     defer allocator.free(raw);
     return allocator.dupe(u8, trimmed) catch null;
@@ -2037,7 +2038,7 @@ fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
 /// Interactive wizard entry point — runs the full setup interactively.
 pub fn runWizard(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const out = &bw.interface;
     resetStdinLineReader();
     try out.writeAll(BANNER);
@@ -2405,13 +2406,13 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
 
     // ── Apply ──
     // Ensure parent config directory and workspace directory exist
-    if (std.fs.path.dirname(cfg.workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(cfg.workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -2460,7 +2461,7 @@ const catalog_providers = [_]ModelsCatalogProvider{
 /// Saves results to models_cache.json in the config directory.
 pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const out = &bw.interface;
     try out.writeAll("Refreshing model catalog...\n");
     try out.flush();
@@ -2477,7 +2478,7 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     const cache_dir = config_dir;
 
     // Ensure directory exists
-    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => {
             try out.writeAll("Could not create config directory.\n");
@@ -2498,7 +2499,7 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
         try out.flush();
 
         // Run curl to fetch models list
-        const result = std.process.Child.run(.{
+        const result = std_compat.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ "curl", "-sf", "--max-time", "10", cp.url },
         }) catch {
@@ -2567,7 +2568,7 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
     try results_buf.appendSlice(allocator, "\n}\n");
 
     // Write cache file
-    const file = std.fs.createFileAbsolute(cache_path, .{}) catch {
+    const file = std_compat.fs.createFileAbsolute(cache_path, .{}) catch {
         try out.writeAll("Could not write cache file.\n");
         try out.flush();
         return;
@@ -2621,13 +2622,13 @@ pub fn scaffoldWorkspace(
     ctx: *const ProjectContext,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
 ) !void {
-    if (std.fs.path.dirname(workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -2686,13 +2687,13 @@ pub fn resetWorkspacePromptFiles(
     options: ResetWorkspacePromptFilesOptions,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
 ) !ResetWorkspacePromptFilesReport {
-    if (std.fs.path.dirname(workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -2756,12 +2757,12 @@ fn overwriteWorkspaceFile(
     content: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
+    const path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) return true;
 
-    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    const file = try std_compat.fs.createFileAbsolute(path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(content);
     return true;
@@ -2773,14 +2774,14 @@ fn removeWorkspaceFileIfExists(
     filename: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
+    const path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) {
         return fileExistsAbsolute(path);
     }
 
-    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+    std_compat.fs.deleteFileAbsolute(path) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return err,
     };
@@ -2788,11 +2789,11 @@ fn removeWorkspaceFileIfExists(
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ dir, filename });
+    const path = try std_compat.fs.path.join(allocator, &.{ dir, filename });
     defer allocator.free(path);
 
     // Only write if file doesn't exist
-    if (std.fs.openFileAbsolute(path, .{})) |f| {
+    if (std_compat.fs.openFileAbsolute(path, .{})) |f| {
         f.close();
         return;
     } else |err| switch (err) {
@@ -2800,7 +2801,7 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
         else => return err,
     }
 
-    const file = std.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
+    const file = std_compat.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
         error.PathAlreadyExists => return,
         else => return err,
     };
@@ -2836,7 +2837,7 @@ fn ensureBootstrapLifecycle(
     had_legacy_user_content: bool,
     bp: ?bootstrap_mod.BootstrapProvider,
 ) !void {
-    const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
+    const bootstrap_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
     defer allocator.free(bootstrap_path);
 
     var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
@@ -2887,9 +2888,9 @@ fn isLegacyOnboardingCompleted(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !bool {
-    const identity_path = try std.fs.path.join(allocator, &.{ workspace_dir, "IDENTITY.md" });
+    const identity_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "IDENTITY.md" });
     defer allocator.free(identity_path);
-    const user_path = try std.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
+    const user_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
     defer allocator.free(user_path);
 
     var templates_diverged = false;
@@ -2909,7 +2910,7 @@ fn isLegacyOnboardingCompleted(
 }
 
 fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE });
+    return std_compat.fs.path.join(allocator, &.{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE });
 }
 
 fn readWorkspaceOnboardingState(
@@ -2919,7 +2920,7 @@ fn readWorkspaceOnboardingState(
     const path = try workspaceStatePath(allocator, workspace_dir);
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return .{},
         else => return err,
     };
@@ -2983,8 +2984,8 @@ fn writeWorkspaceOnboardingState(
     const path = try workspaceStatePath(allocator, workspace_dir);
     defer allocator.free(path);
 
-    if (std.fs.path.dirname(path)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(path)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -3010,21 +3011,21 @@ fn writeWorkspaceOnboardingState(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
     errdefer tmp_file.close();
     try tmp_file.writeAll(buf.items);
     tmp_file.close();
 
-    std.fs.renameAbsolute(tmp_path, path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
-        const file = try std.fs.createFileAbsolute(path, .{});
+    std_compat.fs.renameAbsolute(tmp_path, path) catch {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(buf.items);
     };
 }
 
 fn readFileIfPresent(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) !?[]u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };
@@ -3033,22 +3034,22 @@ fn readFileIfPresent(allocator: std.mem.Allocator, path: []const u8, max_bytes: 
 }
 
 fn fileExistsAbsolute(path: []const u8) bool {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return false;
     file.close();
     return true;
 }
 
 fn pathExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std_compat.fs.accessAbsolute(path, .{}) catch return false;
     return true;
 }
 
 fn hasLegacyUserContentIndicators(allocator: std.mem.Allocator, workspace_dir: []const u8) !bool {
-    const memory_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, "memory" });
+    const memory_dir_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "memory" });
     defer allocator.free(memory_dir_path);
-    const memory_file_path = try std.fs.path.join(allocator, &.{ workspace_dir, "MEMORY.md" });
+    const memory_file_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, "MEMORY.md" });
     defer allocator.free(memory_file_path);
-    const git_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, ".git" });
+    const git_dir_path = try std_compat.fs.path.join(allocator, &.{ workspace_dir, ".git" });
     defer allocator.free(git_dir_path);
 
     return pathExistsAbsolute(memory_dir_path) or
@@ -3507,28 +3508,28 @@ test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const ctx = ProjectContext{};
     try scaffoldWorkspace(std.testing.allocator, base, &ctx, null);
 
     // Verify core files were created
-    const agents = try tmp.dir.openFile("AGENTS.md", .{});
+    const agents = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("AGENTS.md", .{});
     defer agents.close();
     const agents_content = try agents.readToEndAlloc(std.testing.allocator, 16 * 1024);
     defer std.testing.allocator.free(agents_content);
     try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
 
     // OpenClaw-style scaffold keeps MEMORY.md optional (created on demand by memory writes).
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("MEMORY.md", .{}));
 }
 
 test "scaffoldWorkspace is idempotent" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const ctx = ProjectContext{};
@@ -3542,17 +3543,17 @@ test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll("custom-agents-content");
     }
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("custom-user-content");
     }
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{}, null);
@@ -3575,13 +3576,13 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("MEMORY.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("MEMORY.md", .{});
         defer f.close();
         try f.writeAll("custom-memory");
     }
 
     var has_distinct_case_memory_file = true;
-    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+    const alt = @import("compat").fs.Dir.wrap(tmp.dir).createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
         error.PathAlreadyExists => blk: {
             has_distinct_case_memory_file = false;
             break :blk null;
@@ -3593,7 +3594,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
         try f.writeAll("custom-memory-lower");
     }
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const dry_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
@@ -3602,7 +3603,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     }, null);
     try std.testing.expectEqual(@as(usize, 7), dry_report.rewritten_files);
     try std.testing.expect(dry_report.removed_files >= 1);
-    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    const memory_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("MEMORY.md", .{});
     memory_file.close();
 
     const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
@@ -3610,9 +3611,9 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     }, null);
     try std.testing.expectEqual(@as(usize, 7), reset_report.rewritten_files);
     try std.testing.expect(reset_report.removed_files >= 1);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("MEMORY.md", .{}));
     if (has_distinct_case_memory_file) {
-        try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("memory.md", .{}));
+        try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("memory.md", .{}));
     }
 }
 
@@ -3620,7 +3621,7 @@ test "resetWorkspacePromptFiles creates missing workspace directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
     const nested = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/workspace", .{base});
     defer std.testing.allocator.free(nested);
@@ -3630,7 +3631,7 @@ test "resetWorkspacePromptFiles creates missing workspace directory" {
 
     const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
     defer std.testing.allocator.free(agents_path);
-    const agents_file = try std.fs.openFileAbsolute(agents_path, .{});
+    const agents_file = try std_compat.fs.openFileAbsolute(agents_path, .{});
     agents_file.close();
 }
 
@@ -3638,12 +3639,12 @@ test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    const bootstrap_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{});
     bootstrap_file.close();
 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
@@ -3656,29 +3657,29 @@ test "scaffoldWorkspace does not recreate BOOTSTRAP after onboarding completion"
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     {
-        const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("IDENTITY.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("custom identity");
     }
     {
-        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("custom user");
     }
 
-    try tmp.dir.deleteFile("BOOTSTRAP.md");
-    try tmp.dir.deleteFile("TOOLS.md");
+    try @import("compat").fs.Dir.wrap(tmp.dir).deleteFile("BOOTSTRAP.md");
+    try @import("compat").fs.Dir.wrap(tmp.dir).deleteFile("TOOLS.md");
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
-    const tools_file = try tmp.dir.openFile("TOOLS.md", .{});
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
+    const tools_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("TOOLS.md", .{});
     tools_file.close();
 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
@@ -3691,22 +3692,22 @@ test "scaffoldWorkspace does not seed BOOTSTRAP for legacy completed workspace" 
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("IDENTITY.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("IDENTITY.md", .{});
         defer f.close();
         try f.writeAll("custom identity");
     }
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("custom user");
     }
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
     defer state.deinit(std.testing.allocator);
@@ -3718,26 +3719,26 @@ test "scaffoldWorkspace treats memory-backed workspace as existing and skips BOO
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("memory");
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("memory");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "memory/2026-02-25.md",
         .data = "# Daily log\nSome notes",
     });
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "MEMORY.md",
         .data = "# Long-term memory\nImportant stuff",
     });
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
+    const identity_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("IDENTITY.md", .{});
     identity_file.close();
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
-    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    const memory_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("MEMORY.md", .{});
     defer memory_file.close();
     const memory_content = try memory_file.readToEndAlloc(std.testing.allocator, 4 * 1024);
     defer std.testing.allocator.free(memory_content);
@@ -3752,20 +3753,20 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath(".git");
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath(".git");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = ".git/HEAD",
         .data = "ref: refs/heads/main\n",
     });
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
-    const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
+    const identity_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("IDENTITY.md", .{});
     identity_file.close();
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
     var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
     defer state.deinit(std.testing.allocator);
@@ -3778,19 +3779,19 @@ test "scaffoldWorkspace handles trailing native separator on Windows paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const workspace_with_sep = try std.fmt.allocPrint(
         std.testing.allocator,
         "{s}{s}",
-        .{ base, std.fs.path.sep_str },
+        .{ base, std_compat.fs.path.sep_str },
     );
     defer std.testing.allocator.free(workspace_with_sep);
 
     try scaffoldWorkspace(std.testing.allocator, workspace_with_sep, &ProjectContext{}, null);
 
-    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    const bootstrap_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{});
     bootstrap_file.close();
 }
 
@@ -3798,7 +3799,7 @@ test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3807,15 +3808,15 @@ test "scaffoldWorkspaceForConfig stores sqlite bootstrap docs outside workspace 
 
     var cfg = Config{
         .workspace_dir = try allocator.dupe(u8, base),
-        .config_path = try std.fs.path.join(allocator, &.{ base, "config.json" }),
+        .config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" }),
         .allocator = allocator,
     };
     cfg.memory.backend = "sqlite";
 
     try scaffoldWorkspaceForConfig(std.testing.allocator, &cfg, &ProjectContext{});
 
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("AGENTS.md", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("AGENTS.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
     var mem_rt = memory_root.initRuntime(std.testing.allocator, &cfg.memory, cfg.workspace_dir) orelse
         return error.TestUnexpectedResult;
@@ -3844,12 +3845,12 @@ test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touch
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "AGENTS.md",
         .data = "disk-agents-before",
     });
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     var mem_rt = memory_root.initRuntime(std.testing.allocator, &.{ .backend = "sqlite" }, base) orelse
@@ -3877,7 +3878,7 @@ test "resetWorkspacePromptFiles with sqlite rewrites provider docs without touch
     const disk_agents = try fs_compat.readFileAlloc(tmp.dir, std.testing.allocator, "AGENTS.md", 64 * 1024);
     defer std.testing.allocator.free(disk_agents);
     try std.testing.expectEqualStrings("disk-agents-before", disk_agents);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openFile("BOOTSTRAP.md", .{}));
 
     const stored_agents = try bootstrap_provider.load(std.testing.allocator, "AGENTS.md") orelse
         return error.TestUnexpectedResult;
@@ -3901,7 +3902,7 @@ test "bootstrap lifecycle stays equivalent across markdown hybrid and sqlite bac
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
 
-        const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+        const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
         defer std.testing.allocator.free(workspace);
 
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -3910,7 +3911,7 @@ test "bootstrap lifecycle stays equivalent across markdown hybrid and sqlite bac
 
         var cfg = Config{
             .workspace_dir = try allocator.dupe(u8, workspace),
-            .config_path = try std.fs.path.join(allocator, &.{ workspace, "config.json" }),
+            .config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" }),
             .allocator = allocator,
         };
         cfg.memory.backend = backend;
@@ -4219,11 +4220,11 @@ test "scaffoldWorkspace does not create memory subdirectory by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("memory", .{}));
+    try std.testing.expectError(error.FileNotFound, @import("compat").fs.Dir.wrap(tmp.dir).openDir("memory", .{}));
 }
 
 test "BANNER is non-empty and contains nullclaw branding" {
@@ -4389,7 +4390,7 @@ test "scaffoldWorkspace creates core prompt.zig files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
@@ -4402,7 +4403,7 @@ test "scaffoldWorkspace creates core prompt.zig files" {
         "HEARTBEAT.md", "BOOTSTRAP.md",
     };
     for (files) |filename| {
-        const file = tmp.dir.openFile(filename, .{}) catch |err| {
+        const file = @import("compat").fs.Dir.wrap(tmp.dir).openFile(filename, .{}) catch |err| {
             std.debug.print("Missing file: {s} (error: {})\n", .{ filename, err });
             return err;
         };
@@ -4587,9 +4588,9 @@ test "cache read returns error for missing file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const missing_path = try std.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-cache-12345.json" });
+    const missing_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-cache-12345.json" });
     defer std.testing.allocator.free(missing_path);
 
     const result = readCachedModels(std.testing.allocator, missing_path, "openai");
@@ -4600,9 +4601,9 @@ test "cache round-trip: write then read fresh cache" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     // Write cache
@@ -4630,19 +4631,19 @@ test "cache read sorts stale model ordering on load" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     const cache_json = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"fetched_at\": {d}, \"openrouter\": [\"z-model\", \"a-model:free\", \"m-model\"]}}",
-        .{std.time.timestamp()},
+        .{std_compat.time.timestamp()},
     );
     defer std.testing.allocator.free(cache_json);
 
-    const file = try tmp.dir.createFile("models_cache.json", .{});
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
     defer file.close();
     try file.writeAll(cache_json);
 
@@ -4662,9 +4663,9 @@ test "cache read returns error for wrong provider" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     const models = [_][]const u8{"model-a"};
@@ -4679,14 +4680,14 @@ test "cache read returns error for expired cache" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     // Write a cache with old timestamp
     const old_json = "{\"fetched_at\": 1000000, \"myprov\": [\"old-model\"]}";
-    const file = try tmp.dir.createFile("models_cache.json", .{});
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
     defer file.close();
     try file.writeAll(old_json);
 
@@ -4712,19 +4713,19 @@ test "loadModelsWithCache keeps public and native cache entries separate" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
     defer std.testing.allocator.free(cache_path);
 
     const cache_json = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"fetched_at\": {d}, \"openai\": [\"gpt-native\"], \"openai@models.dev\": [\"gpt-public\"]}}",
-        .{std.time.timestamp()},
+        .{std_compat.time.timestamp()},
     );
     defer std.testing.allocator.free(cache_json);
 
-    const file = try tmp.dir.createFile("models_cache.json", .{});
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
     defer file.close();
     try file.writeAll(cache_json);
 
@@ -4749,9 +4750,9 @@ test "loadModelsWithCache falls back on fetch failure" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const nonexistent = try std.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-dir-xyz" });
+    const nonexistent = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-dir-xyz" });
     defer std.testing.allocator.free(nonexistent);
 
     // openai without api key will fail fetch, falling back to hardcoded list
@@ -4768,7 +4769,7 @@ test "loadModelsWithCache returns models for anthropic" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const models = try loadModelsWithCache(std.testing.allocator, base, "anthropic", null);
@@ -4836,7 +4837,7 @@ test "fetchModels returns models for anthropic (no network)" {
 
     const env_name = try std.testing.allocator.dupeZ(u8, "NULLCLAW_HOME");
     defer std.testing.allocator.free(env_name);
-    const previous_home = std.process.getEnvVarOwned(std.testing.allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+    const previous_home = std_compat.process.getEnvVarOwned(std.testing.allocator, "NULLCLAW_HOME") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => return err,
     };
@@ -4853,9 +4854,9 @@ test "fetchModels returns models for anthropic (no network)" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
-    const test_home = try std.fs.path.join(std.testing.allocator, &.{ base, "nullclaw-home" });
+    const test_home = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "nullclaw-home" });
     defer std.testing.allocator.free(test_home);
     const test_home_z = try std.testing.allocator.dupeZ(u8, test_home);
     defer std.testing.allocator.free(test_home_z);

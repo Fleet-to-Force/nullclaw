@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const probe = @import("probe.zig");
 const Sandbox = @import("sandbox.zig").Sandbox;
 
 /// Maximum supported workspace path length for the mount argument buffer.
@@ -64,19 +66,9 @@ pub const DockerSandbox = struct {
         return buf[0..total];
     }
 
-    fn isAvailable(ptr: *anyopaque) bool {
-        const self = resolve(ptr);
-        // Check if docker binary is actually reachable
-        var child = std.process.Child.init(&.{ "docker", "--version" }, self.allocator);
-        child.stderr_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stdin_behavior = .Ignore;
-        child.spawn() catch return false;
-        const term = child.wait() catch return false;
-        return switch (term) {
-            .Exited => |code| code == 0,
-            else => false,
-        };
+    fn isAvailable(_: *anyopaque) bool {
+        // Probe daemon reachability without pulling the configured image.
+        return probe.runQuietCommand(&.{ "docker", "info" });
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -184,7 +176,7 @@ pub fn validateWorkspaceMount(path: []const u8, allowed_roots: ?[]const []const 
     if (path[0] != '/') return .not_absolute;
 
     // 4. Root check — normalize trailing slashes: treat "///" the same as "/"
-    const trimmed = std.mem.trimRight(u8, path, "/");
+    const trimmed = std_compat.mem.trimRight(u8, path, "/");
     if (trimmed.len == 0) return .is_root;
 
     // 5. Traversal check — look for ".." as a path component
@@ -235,7 +227,7 @@ fn isDangerousMount(trimmed: []const u8) bool {
 
 /// Check if `path` is equal to or under `root`.
 fn isUnderRoot(path: []const u8, root: []const u8) bool {
-    const trimmed_root = std.mem.trimRight(u8, root, "/");
+    const trimmed_root = std_compat.mem.trimRight(u8, root, "/");
     if (trimmed_root.len == 0) return false; // don't allow root "/" as an allowed root
     if (std.mem.eql(u8, path, trimmed_root)) return true;
     if (path.len > trimmed_root.len and
@@ -258,7 +250,7 @@ test "docker sandbox name" {
 test "docker sandbox isAvailable returns bool" {
     var dk = createDockerSandbox(std.testing.allocator, "/tmp/workspace", null);
     const sb = dk.sandbox();
-    // isAvailable now checks for real docker binary; result depends on environment
+    // isAvailable now checks Docker daemon reachability; result depends on environment.
     _ = sb.isAvailable();
 }
 

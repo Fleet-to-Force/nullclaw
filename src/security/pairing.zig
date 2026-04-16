@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const crypto = @import("../security/secrets.zig");
 const platform = @import("../platform.zig");
 const policy = @import("policy.zig");
@@ -140,7 +141,7 @@ pub const PairingGuard = struct {
         // Check brute force lockout
         if (self.failed_count >= MAX_PAIR_ATTEMPTS) {
             if (self.lockout_time) |locked_at| {
-                const elapsed = std.time.nanoTimestamp() - locked_at;
+                const elapsed = std_compat.time.nanoTimestamp() - locked_at;
                 if (elapsed < PAIR_LOCKOUT_NS) {
                     return error.LockedOut;
                 }
@@ -173,7 +174,7 @@ pub const PairingGuard = struct {
         // Increment failed attempts
         self.failed_count += 1;
         if (self.failed_count >= MAX_PAIR_ATTEMPTS) {
-            self.lockout_time = std.time.nanoTimestamp();
+            self.lockout_time = std_compat.time.nanoTimestamp();
         }
 
         return null;
@@ -208,7 +209,7 @@ pub const PairingGuard = struct {
 /// Generate a 6-digit numeric pairing code using cryptographic randomness.
 fn generateCode() [6]u8 {
     var bytes: [4]u8 = undefined;
-    std.crypto.random.bytes(&bytes);
+    std_compat.crypto.random.bytes(&bytes);
     const raw = std.mem.readInt(u32, &bytes, .little);
     // Rejection sampling to avoid modulo bias
     const upper_bound: u32 = 1_000_000;
@@ -216,7 +217,7 @@ fn generateCode() [6]u8 {
     const val = if (raw < reject_threshold) raw % upper_bound else blk: {
         // Extremely rare case; just re-draw
         var retry_bytes: [4]u8 = undefined;
-        std.crypto.random.bytes(&retry_bytes);
+        std_compat.crypto.random.bytes(&retry_bytes);
         break :blk std.mem.readInt(u32, &retry_bytes, .little) % upper_bound;
     };
     var buf: [6]u8 = undefined;
@@ -227,7 +228,7 @@ fn generateCode() [6]u8 {
 /// Generate a bearer token with 256-bit entropy.
 fn generateToken() [67]u8 {
     var random_bytes: [32]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    std_compat.crypto.random.bytes(&random_bytes);
     var buf: [67]u8 = undefined; // "zc_" (3) + 64 hex chars
     @memcpy(buf[0..3], "zc_");
     const hex = std.fmt.bytesToHex(random_bytes, .lower);
@@ -289,12 +290,12 @@ fn isLoopbackBindHost(host: []const u8) bool {
 
     if (std.ascii.eqlIgnoreCase(normalized, "localhost")) return true;
 
-    if (std.net.Address.parseIp4(normalized, 0)) |ip4| {
+    if (std_compat.net.Address.parseIp4(normalized, 0)) |ip4| {
         const octets: *const [4]u8 = @ptrCast(&ip4.in.sa.addr);
         return octets[0] == 127;
     } else |_| {}
 
-    if (std.net.Address.parseIp6(normalized, 0)) |ip6| {
+    if (std_compat.net.Address.parseIp6(normalized, 0)) |ip6| {
         const bytes = ip6.in6.sa.addr;
         return std.mem.eql(u8, bytes[0..15], &[_]u8{0} ** 15) and bytes[15] == 1;
     } else |_| {}
@@ -564,7 +565,7 @@ test "regenerate pairing code creates new code and resets lockout counters" {
     @memcpy(&first_copy, first);
 
     guard.failed_count = 5;
-    guard.lockout_time = std.time.nanoTimestamp();
+    guard.lockout_time = std_compat.time.nanoTimestamp();
 
     const second = guard.regeneratePairingCode() orelse return error.TestUnexpectedResult;
     try std.testing.expect(second.len == 6);
@@ -578,7 +579,7 @@ test "set pairing code enforces provided 6-digit value" {
     defer guard.deinit();
 
     guard.failed_count = 3;
-    guard.lockout_time = std.time.nanoTimestamp();
+    guard.lockout_time = std_compat.time.nanoTimestamp();
 
     const fixed = try guard.setPairingCode("123456");
     try std.testing.expectEqualStrings("123456", fixed);

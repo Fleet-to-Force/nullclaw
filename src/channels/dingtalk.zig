@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -12,9 +13,9 @@ const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.dingtalk);
 
-const SocketFd = std.net.Stream.Handle;
+const SocketFd = std_compat.net.Stream.Handle;
 const invalid_socket: SocketFd = switch (builtin.os.tag) {
-    .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+    .windows => std_compat.net.invalidHandle(SocketFd),
     else => -1,
 };
 
@@ -126,7 +127,7 @@ const StreamSession = struct {
 const ReplyTargetCache = struct {
     map: std.StringHashMapUnmanaged(SessionReplyTarget) = .empty,
     order: std.ArrayListUnmanaged([]u8) = .empty,
-    mu: std.Thread.Mutex = .{},
+    mu: std_compat.sync.Mutex = .{},
 
     fn deinit(self: *ReplyTargetCache, allocator: std.mem.Allocator) void {
         self.mu.lock();
@@ -259,7 +260,7 @@ fn message_type_summary(msg_type: []const u8, file_name: ?[]const u8) []const u8
 
 fn attachment_extension_from_type(msg_type: []const u8, file_name: ?[]const u8) []const u8 {
     if (file_name) |name| {
-        if (std.fs.path.extension(name).len > 0) return std.fs.path.extension(name);
+        if (std_compat.fs.path.extension(name).len > 0) return std_compat.fs.path.extension(name);
     }
     if (std.mem.eql(u8, msg_type, "picture")) return ".png";
     if (std.mem.eql(u8, msg_type, "audio")) return ".mp3";
@@ -271,17 +272,17 @@ fn attachment_extension_from_type(msg_type: []const u8, file_name: ?[]const u8) 
 fn attachment_cache_dir_path(allocator: std.mem.Allocator) ![]u8 {
     const tmp_dir = try platform.getTempDir(allocator);
     defer allocator.free(tmp_dir);
-    return std.fs.path.join(allocator, &.{ tmp_dir, ATTACHMENT_CACHE_SUBDIR });
+    return std_compat.fs.path.join(allocator, &.{ tmp_dir, ATTACHMENT_CACHE_SUBDIR });
 }
 
 fn ensure_attachment_cache_dir(cache_dir: []const u8) !void {
-    std.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cache_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => try fs_compat.makePath(cache_dir),
     };
 }
 
-fn append_query_escaped(writer: anytype, value: []const u8) !void {
+fn append_query_escaped(writer: *std.Io.Writer, value: []const u8) !void {
     for (value) |ch| {
         if (std.ascii.isAlphanumeric(ch) or ch == '-' or ch == '_' or ch == '.' or ch == '~') {
             try writer.writeByte(ch);
@@ -294,19 +295,18 @@ fn append_query_escaped(writer: anytype, value: []const u8) !void {
 fn parse_endpoint_url(
     endpoint: []const u8,
     ticket: []const u8,
-    host_buf: []u8,
+    host_buf: *[std.Io.net.HostName.max_len]u8,
     path_buf: []u8,
 ) !struct { host: []const u8, port: u16, path: []const u8 } {
     const uri = std.Uri.parse(endpoint) catch return error.DingTalkApiError;
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "wss")) return error.DingTalkApiError;
 
-    const host = uri.getHost(host_buf) catch return error.DingTalkApiError;
+    const host = (uri.getHost(host_buf) catch return error.DingTalkApiError).bytes;
     const port = uri.port orelse 443;
     const raw_path = component_as_slice(uri.path);
     const raw_query = if (uri.query) |q| component_as_slice(q) else "";
 
-    var fbs = std.io.fixedBufferStream(path_buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(path_buf);
     if (raw_path.len == 0) {
         try w.writeByte('/');
     } else {
@@ -319,12 +319,12 @@ fn parse_endpoint_url(
         try w.writeByte('&');
     }
     try w.writeAll("ticket=");
-    try append_query_escaped(w, ticket);
+    try append_query_escaped(&w, ticket);
 
     return .{
         .host = host,
         .port = port,
-        .path = fbs.getWritten(),
+        .path = w.buffered(),
     };
 }
 
@@ -373,7 +373,7 @@ fn build_ack_json(
     var body: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body.deinit(allocator);
 
-    try body.writer(allocator).print("{{\"code\":{d},\"headers\":{{\"contentType\":\"application/json\",\"messageId\":", .{code});
+    try body.print(allocator, "{{\"code\":{d},\"headers\":{{\"contentType\":\"application/json\",\"messageId\":", .{code});
     try root.json_util.appendJsonString(&body, allocator, message_id);
     try body.appendSlice(allocator, "},\"message\":");
     try root.json_util.appendJsonString(&body, allocator, message);
@@ -593,14 +593,14 @@ fn download_bytes_to_local(
     ensure_attachment_cache_dir(cache_dir) catch return null;
 
     const ext = attachment_extension_from_type(msg_type, file_name);
-    const ts: u64 = @intCast(@max(std.time.timestamp(), 0));
-    const nonce = std.crypto.random.int(u64);
+    const ts: u64 = @intCast(@max(std_compat.time.timestamp(), 0));
+    const nonce = std_compat.crypto.random.int(u64);
 
     var file_buf: [128]u8 = undefined;
     const file_name_part = std.fmt.bufPrint(&file_buf, "dingtalk_{d}_{x}{s}", .{ ts, nonce, ext }) catch return null;
-    const local_path = try std.fs.path.join(allocator, &.{ cache_dir, file_name_part });
+    const local_path = try std_compat.fs.path.join(allocator, &.{ cache_dir, file_name_part });
 
-    const file = std.fs.createFileAbsolute(local_path, .{ .read = false, .truncate = true }) catch {
+    const file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false, .truncate = true }) catch {
         allocator.free(local_path);
         return null;
     };
@@ -627,12 +627,12 @@ pub const DingTalkChannel = struct {
     connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ws_thread: ?std.Thread = null,
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
-    token_mu: std.Thread.Mutex = .{},
+    token_mu: std_compat.sync.Mutex = .{},
     access_token: ?[]u8 = null,
     token_expires_at: i64 = 0,
     reply_targets: ReplyTargetCache = .{},
     stream_sessions: std.StringHashMapUnmanaged(StreamSession) = .empty,
-    stream_mu: std.Thread.Mutex = .{},
+    stream_mu: std_compat.sync.Mutex = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -719,7 +719,7 @@ pub const DingTalkChannel = struct {
     }
 
     fn postJson(self: *DingTalkChannel, webhook_url: []const u8, body: []const u8) !void {
-        var client = std.http.Client{ .allocator = self.allocator };
+        var client = std.http.Client{ .allocator = self.allocator, .io = std_compat.io() };
         defer client.deinit();
         const result = client.fetch(.{
             .location = .{ .url = webhook_url },
@@ -738,8 +738,7 @@ pub const DingTalkChannel = struct {
         } else false;
 
         var text_buf: [8192]u8 = undefined;
-        var text_fbs = std.io.fixedBufferStream(&text_buf);
-        const text_writer = text_fbs.writer();
+        var text_writer: std.Io.Writer = .fixed(&text_buf);
         if (payload.text.len > 0) {
             try text_writer.print("{s}\n\n", .{payload.text});
         }
@@ -747,16 +746,15 @@ pub const DingTalkChannel = struct {
             if (section.title.len > 0) try text_writer.print("### {s}\n", .{section.title});
             try text_writer.print("{s}\n\n", .{section.body});
         }
-        const body_text = text_fbs.getWritten();
+        const body_text = text_writer.buffered();
         const title = if (payload.card_title.len > 0) payload.card_title else "NullClaw";
 
-        var json_fbs = std.io.fixedBufferStream(buf);
-        const writer = json_fbs.writer();
+        var writer: std.Io.Writer = .fixed(buf);
         if (has_buttons) {
             try writer.writeAll("{\"msgtype\":\"actionCard\",\"actionCard\":{\"title\":");
-            try root.appendJsonStringW(writer, title);
+            try root.appendJsonStringW(&writer, title);
             try writer.writeAll(",\"text\":");
-            try root.appendJsonStringW(writer, body_text);
+            try root.appendJsonStringW(&writer, body_text);
             try writer.writeAll(",\"btnOrientation\":\"0\",\"btns\":[");
             var first = true;
             for (payload.action_groups) |group| {
@@ -764,7 +762,7 @@ pub const DingTalkChannel = struct {
                     if (!first) try writer.writeByte(',');
                     first = false;
                     try writer.writeAll("{\"title\":");
-                    try root.appendJsonStringW(writer, button.label);
+                    try root.appendJsonStringW(&writer, button.label);
                     // DingTalk session webhooks do not deliver button callbacks.
                     try writer.writeAll(",\"actionURL\":\"dingtalk://dingtalkclient/page/close\"}");
                 }
@@ -772,19 +770,18 @@ pub const DingTalkChannel = struct {
             try writer.writeAll("]}}");
         } else {
             var markdown_buf: [8192]u8 = undefined;
-            var markdown_fbs = std.io.fixedBufferStream(&markdown_buf);
-            const markdown_writer = markdown_fbs.writer();
+            var markdown_writer: std.Io.Writer = .fixed(&markdown_buf);
             if (payload.card_title.len > 0) try markdown_writer.print("## {s}\n\n", .{payload.card_title});
             try markdown_writer.writeAll(body_text);
 
             try writer.writeAll("{\"msgtype\":\"markdown\",\"markdown\":{\"title\":");
-            try root.appendJsonStringW(writer, title);
+            try root.appendJsonStringW(&writer, title);
             try writer.writeAll(",\"text\":");
-            try root.appendJsonStringW(writer, markdown_fbs.getWritten());
+            try root.appendJsonStringW(&writer, markdown_writer.buffered());
             try writer.writeAll("}}");
         }
 
-        return json_fbs.getWritten();
+        return writer.buffered();
     }
 
     pub fn sendRichMessage(self: *DingTalkChannel, target: []const u8, payload: root.Channel.OutboundPayload) !void {
@@ -808,7 +805,7 @@ pub const DingTalkChannel = struct {
             owned_reply_target.deinit(self.allocator);
         }
 
-        if (reply_target.expires_at_ms > 0 and std.time.timestamp() >= @divTrunc(reply_target.expires_at_ms, 1000)) {
+        if (reply_target.expires_at_ms > 0 and std_compat.time.timestamp() >= @divTrunc(reply_target.expires_at_ms, 1000)) {
             const fallback = try payload.toPlainText(self.allocator);
             defer self.allocator.free(fallback);
             return self.sendMessage(trimmed_target, fallback, &.{});
@@ -894,7 +891,7 @@ pub const DingTalkChannel = struct {
         self.token_mu.lock();
         defer self.token_mu.unlock();
 
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         if (self.access_token) |token| {
             if (now < self.token_expires_at - TOKEN_REFRESH_MARGIN_SECS) {
                 return self.allocator.dupe(u8, token);
@@ -1026,7 +1023,7 @@ pub const DingTalkChannel = struct {
         try root.json_util.appendJsonString(&body, allocator, sender_id);
         try body.appendSlice(allocator, ",\"sender_staff_id\":");
         try root.json_util.appendJsonString(&body, allocator, sender_staff_id);
-        try body.writer(allocator).print(",\"session_webhook_expires_at\":{d}}}", .{session_webhook_expires_at});
+        try body.print(allocator, ",\"session_webhook_expires_at\":{d}}}", .{session_webhook_expires_at});
         return body.toOwnedSlice(allocator);
     }
 
@@ -1536,7 +1533,7 @@ pub const DingTalkChannel = struct {
         var connection = try self.openStreamConnection();
         defer connection.deinit(self.allocator);
 
-        var host_buf: [256]u8 = undefined;
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         var path_buf: [2048]u8 = undefined;
         const endpoint = try parse_endpoint_url(connection.endpoint, connection.ticket, &host_buf, &path_buf);
 
@@ -1580,7 +1577,7 @@ pub const DingTalkChannel = struct {
                 }
             };
             if (!self.running.load(.acquire)) break;
-            std.Thread.sleep(RECONNECT_DELAY_NS);
+            std_compat.thread.sleep(RECONNECT_DELAY_NS);
         }
     }
 
@@ -1597,7 +1594,7 @@ pub const DingTalkChannel = struct {
                 owned_reply_target.deinit(self.allocator);
             }
 
-            if (reply_target.expires_at_ms > 0 and std.time.timestamp() >= @divTrunc(reply_target.expires_at_ms, 1000)) {
+            if (reply_target.expires_at_ms > 0 and std_compat.time.timestamp() >= @divTrunc(reply_target.expires_at_ms, 1000)) {
                 if (proactiveFallbackTarget(reply_target)) |proactive_target| {
                     return self.sendViaAiInteraction(proactive_target, text);
                 }
@@ -1636,11 +1633,7 @@ pub const DingTalkChannel = struct {
 
         const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
         if (fd != invalid_socket) {
-            if (comptime builtin.os.tag == .windows) {
-                _ = std.os.windows.ws2_32.closesocket(fd);
-            } else {
-                std.posix.close(fd);
-            }
+            (std_compat.net.Stream{ .handle = fd }).close();
         }
 
         if (self.ws_thread) |t| {
@@ -1731,7 +1724,7 @@ test "parse_open_connection_response extracts endpoint and ticket" {
 }
 
 test "parse_endpoint_url appends encoded ticket" {
-    var host_buf: [128]u8 = undefined;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     var path_buf: [256]u8 = undefined;
     const parsed = try parse_endpoint_url(
         "wss://wss-open-connection.dingtalk.com:443/connect?foo=bar",
@@ -2009,7 +2002,6 @@ test "parseCallbackPayload rolls back reply target cache on allocation failure" 
                     found_late_oom = true;
                     break :blk null;
                 },
-                else => return err,
             }
         };
         if (found_late_oom) break;

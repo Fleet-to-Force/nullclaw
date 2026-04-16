@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const auth = @import("auth.zig");
@@ -127,7 +128,7 @@ pub fn resolveCodexCommand(allocator: std.mem.Allocator) ?[]u8 {
         ".npm-global/bin",
     };
     for (home_candidates) |candidate_dir| {
-        const candidate = std.fs.path.join(allocator, &.{ home, candidate_dir, binary_name }) catch continue;
+        const candidate = std_compat.fs.path.join(allocator, &.{ home, candidate_dir, binary_name }) catch continue;
         if (fileExists(candidate)) {
             return candidate;
         }
@@ -154,7 +155,7 @@ fn loadCodexModelsInner(allocator: std.mem.Allocator) ![][]const u8 {
     const path = try resolveCodexStatePath(allocator, "models_cache.json");
     defer allocator.free(path);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
 
     const bytes = try file.readToEndAlloc(allocator, 4 * 1024 * 1024);
@@ -205,7 +206,7 @@ pub fn loadCodexCliToken(allocator: std.mem.Allocator) ?auth.OAuthToken {
     const path = resolveCodexStatePath(allocator, "auth.json") catch return null;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
 
     const bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
@@ -240,7 +241,7 @@ fn parseCodexCliTokenFromBytes(allocator: std.mem.Allocator, bytes: []const u8) 
     errdefer if (refresh_token) |rt| allocator.free(rt);
 
     const expires_at = decodeJwtExp(allocator, access_token);
-    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at and refresh_token == null) {
+    if (expires_at != 0 and std_compat.time.timestamp() + 300 >= expires_at and refresh_token == null) {
         allocator.free(access_token);
         if (refresh_token) |rt| allocator.free(rt);
         return null;
@@ -267,7 +268,7 @@ fn resolveCodexStatePath(allocator: std.mem.Allocator, filename: []const u8) ![]
 fn resolveHomeRelativePath(allocator: std.mem.Allocator, dir_name: []const u8, filename: []const u8) ![]u8 {
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, dir_name, filename });
+    return std_compat.fs.path.join(allocator, &.{ home, dir_name, filename });
 }
 
 fn decodeJwtExp(allocator: std.mem.Allocator, token: []const u8) i64 {
@@ -302,14 +303,14 @@ fn decodeJwtExp(allocator: std.mem.Allocator, token: []const u8) i64 {
 }
 
 fn resolveFromPath(allocator: std.mem.Allocator, binary_name: []const u8) ?[]u8 {
-    const env_path = std.process.getEnvVarOwned(allocator, "PATH") catch return null;
+    const env_path = std_compat.process.getEnvVarOwned(allocator, "PATH") catch return null;
     defer allocator.free(env_path);
 
     const separator: u8 = if (builtin.os.tag == .windows) ';' else ':';
     var path_it = std.mem.splitScalar(u8, env_path, separator);
     while (path_it.next()) |entry| {
         if (entry.len == 0) continue;
-        const candidate = std.fs.path.join(allocator, &.{ entry, binary_name }) catch continue;
+        const candidate = std_compat.fs.path.join(allocator, &.{ entry, binary_name }) catch continue;
         if (fileExists(candidate)) return candidate;
         allocator.free(candidate);
     }
@@ -317,12 +318,12 @@ fn resolveFromPath(allocator: std.mem.Allocator, binary_name: []const u8) ?[]u8 
 }
 
 fn fileExists(path: []const u8) bool {
-    if (std.fs.path.isAbsolute(path)) {
-        const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    if (std_compat.fs.path.isAbsolute(path)) {
+        const file = std_compat.fs.openFileAbsolute(path, .{}) catch return false;
         file.close();
         return true;
     }
-    std.fs.cwd().access(path, .{}) catch return false;
+    @import("fs_compat.zig").accessPath(path, .{}) catch return false;
     return true;
 }
 
@@ -333,7 +334,7 @@ fn runCommand(allocator: std.mem.Allocator, command: []const u8, args: []const [
     try argv.append(allocator, command);
     try argv.appendSlice(allocator, args);
 
-    const result = try std.process.Child.run(.{
+    const result = try std_compat.process.Child.run(.{
         .allocator = allocator,
         .argv = argv.items,
     });
@@ -341,7 +342,7 @@ fn runCommand(allocator: std.mem.Allocator, command: []const u8, args: []const [
         .stdout = result.stdout,
         .stderr = result.stderr,
         .success = switch (result.term) {
-            .Exited => |code| code == 0,
+            .exited => |code| code == 0,
             else => false,
         },
     };

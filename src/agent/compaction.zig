@@ -4,7 +4,9 @@
 //! passed by the caller; no dependency on the Agent struct.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const log = std.log.scoped(.agent);
 const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
@@ -337,7 +339,7 @@ const HeadingInfo = struct {
 };
 
 fn parseHeadingLine(line: []const u8) ?HeadingInfo {
-    const trimmed_left = std.mem.trimLeft(u8, line, " \t");
+    const trimmed_left = std.mem.trimStart(u8, line, " \t");
     if (trimmed_left.len < 4) return null;
 
     var level: u8 = 0;
@@ -384,7 +386,7 @@ fn extractNamedSection(
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
-        const left_trimmed = std.mem.trimLeft(u8, line, " \t");
+        const left_trimmed = std.mem.trimStart(u8, line, " \t");
         if (std.mem.startsWith(u8, left_trimmed, "```")) {
             in_code_block = !in_code_block;
             if (in_section) {
@@ -462,21 +464,21 @@ fn extractSections(
 fn openWorkspaceAgentsFileGuarded(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
-) ?std.fs.File {
-    const workspace_root = std.fs.cwd().realpathAlloc(allocator, workspace_dir) catch return null;
+) ?std_compat.fs.File {
+    const workspace_root = fs_compat.realpathAllocPath(allocator, workspace_dir) catch return null;
     defer allocator.free(workspace_root);
 
-    const agents_candidate = std.fs.path.join(allocator, &.{ workspace_root, "AGENTS.md" }) catch return null;
+    const agents_candidate = std_compat.fs.path.join(allocator, &.{ workspace_root, "AGENTS.md" }) catch return null;
     defer allocator.free(agents_candidate);
 
-    const agents_canonical = std.fs.cwd().realpathAlloc(allocator, agents_candidate) catch |err| switch (err) {
+    const agents_canonical = fs_compat.realpathAllocPath(allocator, agents_candidate) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return null,
     };
     defer allocator.free(agents_canonical);
 
     if (!pathStartsWith(agents_canonical, workspace_root)) return null;
-    return std.fs.openFileAbsolute(agents_canonical, .{}) catch null;
+    return std_compat.fs.openFileAbsolute(agents_canonical, .{}) catch null;
 }
 
 fn readWorkspaceContextForSummary(
@@ -746,7 +748,7 @@ test "readWorkspaceContextForSummary wraps AGENTS critical sections" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("AGENTS.md", .{});
         defer f.close();
         try f.writeAll(
             \\## Session Startup
@@ -758,7 +760,7 @@ test "readWorkspaceContextForSummary wraps AGENTS critical sections" {
         );
     }
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
@@ -773,7 +775,7 @@ test "readWorkspaceContextForSummary returns empty when AGENTS missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
@@ -790,7 +792,7 @@ test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    try outside_tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{
         .sub_path = "outside-agents.md",
         .data =
         \\## Session Startup
@@ -801,14 +803,14 @@ test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
         ,
     });
 
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
-    const outside_agents = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
+    const outside_agents = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "outside-agents.md" });
     defer std.testing.allocator.free(outside_agents);
 
-    try ws_tmp.dir.symLink(outside_agents, "AGENTS.md", .{});
+    try @import("compat").fs.Dir.wrap(ws_tmp.dir).symLink(outside_agents, "AGENTS.md", .{});
 
-    const workspace = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);

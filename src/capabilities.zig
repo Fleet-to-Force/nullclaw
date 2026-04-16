@@ -174,10 +174,12 @@ fn collectRuntimeToolNames(
 fn joinNames(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const w = &out_writer.writer;
 
     if (names.len == 0) {
         try w.writeAll("(none)");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(allocator);
     }
 
@@ -185,6 +187,7 @@ fn joinNames(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
         if (i != 0) try w.writeAll(", ");
         try w.writeAll(name);
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(allocator);
 }
 
@@ -216,7 +219,8 @@ pub fn buildManifestJson(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const w = &out_writer.writer;
 
     try w.writeAll("{\n");
     try w.print("  \"version\": {f},\n", .{std.json.fmt(build_options.version, .{})});
@@ -278,6 +282,7 @@ pub fn buildManifestJson(
     try w.writeAll("\n  }\n");
 
     try w.writeAll("}\n");
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(allocator);
 }
 

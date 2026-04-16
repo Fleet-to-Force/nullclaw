@@ -33,6 +33,7 @@
 //!     signal-cli --account +1234567890 daemon --http 127.0.0.1:8080
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -144,7 +145,7 @@ pub const SignalChannel = struct {
     sse_next_retry_at: i64 = 0,
 
     /// Typing indicator management (mirrors Discord implementation).
-    typing_mu: std.Thread.Mutex = .{},
+    typing_mu: std_compat.sync.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
 
     const TypingTask = struct {
@@ -199,17 +200,15 @@ pub const SignalChannel = struct {
 
     /// Build the JSON-RPC URL.
     pub fn rpcUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.http_url);
         try w.writeAll(SIGNAL_RPC_ENDPOINT);
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Build the SSE events URL (with account query param).
     pub fn sseUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.http_url);
         try w.writeAll(SIGNAL_SSE_ENDPOINT);
         try w.writeAll("?account=");
@@ -220,22 +219,20 @@ pub const SignalChannel = struct {
                 try w.writeByte(c);
             }
         }
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Build REST send URL.
     pub fn sendUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.http_url);
         try w.writeAll(SIGNAL_REST_SEND_ENDPOINT);
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Build REST receive polling URL.
     pub fn receivePollUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.http_url);
         try w.writeAll(SIGNAL_REST_RECEIVE_ENDPOINT);
         try w.writeAll(self.account);
@@ -244,16 +241,15 @@ pub const SignalChannel = struct {
         try w.writeAll(if (self.ignore_attachments) "true" else "false");
         try w.writeAll("&ignore_stories=");
         try w.writeAll(if (self.ignore_stories) "true" else "false");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Build the health check URL.
     pub fn healthUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.http_url);
         try w.writeAll(if (self.use_rest_api) SIGNAL_REST_HEALTH_ENDPOINT else SIGNAL_HEALTH_ENDPOINT);
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     // ── Allowlist Checking ──────────────────────────────────────────
@@ -483,12 +479,11 @@ pub const SignalChannel = struct {
         try std.base64.standard.Decoder.decode(decoded, base64_data);
 
         // Generate temp file
-        var rand = std.crypto.random;
-        const rand_id = rand.int(u64);
+        const rand_id = std_compat.crypto.random.int(u64);
         var path_buf: [1024]u8 = undefined;
         const local_path = try std.fmt.bufPrint(&path_buf, "/tmp/signal_{x}.dat", .{rand_id});
 
-        var file = std.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
+        var file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
         defer file.close();
         try file.writeAll(decoded);
 
@@ -599,15 +594,15 @@ pub const SignalChannel = struct {
                 if (path.len == 1) {
                     return try allocator.dupe(u8, home);
                 }
-                return try std.fs.path.join(allocator, &.{ home, path[2..] });
+                return try std_compat.fs.path.join(allocator, &.{ home, path[2..] });
             }
         }
-        if (std.fs.path.isAbsolute(path)) {
+        if (std_compat.fs.path.isAbsolute(path)) {
             return try allocator.dupe(u8, path);
         }
         // Try to resolve relative path, but if it fails (file doesn't exist),
         // just return the path as-is and let signal-cli handle the error
-        return std.fs.cwd().realpathAlloc(allocator, path) catch try allocator.dupe(u8, path);
+        return std_compat.fs.cwd().realpathAlloc(allocator, path) catch try allocator.dupe(u8, path);
     }
 
     /// Parse [IMAGE:path] markers from message text.
@@ -631,7 +626,7 @@ pub const SignalChannel = struct {
             };
 
             // Trim trailing whitespace before the marker
-            const before = std.mem.trimRight(u8, text[cursor..open_pos], " \t\n\r");
+            const before = std_compat.mem.trimRight(u8, text[cursor..open_pos], " \t\n\r");
             try remaining.appendSlice(allocator, before);
 
             const close_pos = std.mem.indexOfPos(u8, text, open_pos + 7, "]") orelse {
@@ -801,7 +796,7 @@ pub const SignalChannel = struct {
         }
 
         for (attachments) |path| {
-            const file_data = fs_compat.readFileAlloc(std.fs.cwd(), self.allocator, path, 10 * 1024 * 1024) catch |err| {
+            const file_data = fs_compat.readFileAlloc(std_compat.fs.cwd(), self.allocator, path, 10 * 1024 * 1024) catch |err| {
                 log.warn("Signal: failed to read attachment {s}: {}", .{ path, err });
                 continue;
             };
@@ -937,7 +932,7 @@ pub const SignalChannel = struct {
             task.channel.sendTypingIndicator(task.target);
             var elapsed: u64 = 0;
             while (elapsed < TYPING_INTERVAL_NS and !task.stop_requested.load(.acquire)) {
-                std.Thread.sleep(TYPING_SLEEP_STEP_NS);
+                std_compat.thread.sleep(TYPING_SLEEP_STEP_NS);
                 elapsed += TYPING_SLEEP_STEP_NS;
             }
         }
@@ -1220,7 +1215,7 @@ pub const SignalChannel = struct {
         // Initialize SSE connection on first poll.
         // Retry is rate-limited with backoff, but each poll call stays bounded.
         if (self.sse_conn == null) {
-            const now = std.time.timestamp();
+            const now = std_compat.time.timestamp();
             if (now < self.sse_next_retry_at) return &.{};
 
             var url_buf: [1024]u8 = undefined;
@@ -1398,7 +1393,7 @@ pub const SignalChannel = struct {
 };
 
 fn envFlagEnabled(allocator: std.mem.Allocator, name: []const u8) bool {
-    const value = std.process.getEnvVarOwned(allocator, name) catch return false;
+    const value = std_compat.process.getEnvVarOwned(allocator, name) catch return false;
     defer allocator.free(value);
     return std.mem.eql(u8, value, "1") or
         std.ascii.eqlIgnoreCase(value, "true") or

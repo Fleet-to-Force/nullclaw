@@ -273,7 +273,7 @@ pub fn defaultToolsWithPaths(
     workspace_dir: []const u8,
     allowed_paths: []const []const u8,
 ) ![]Tool {
-    var list: std.ArrayList(Tool) = .{};
+    var list: std.ArrayList(Tool) = .empty;
     errdefer {
         for (list.items) |t| {
             t.deinit(allocator);
@@ -336,7 +336,7 @@ pub fn allTools(
         sandbox_enabled: bool = true,
     },
 ) ![]Tool {
-    var list: std.ArrayList(Tool) = .{};
+    var list: std.ArrayList(Tool) = .empty;
     errdefer {
         for (list.items) |t| {
             t.deinit(allocator);
@@ -632,7 +632,7 @@ pub fn subagentTools(
         backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
-    var list: std.ArrayList(Tool) = .{};
+    var list: std.ArrayList(Tool) = .empty;
     errdefer {
         for (list.items) |t| {
             t.deinit(allocator);
@@ -998,7 +998,7 @@ test "all tools wire bootstrap provider into bootstrap-aware file tools for sqli
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var lru = memory_mod.InMemoryLruMemory.init(std.testing.allocator, 16);
@@ -1144,7 +1144,7 @@ test "subagent tools wire bootstrap provider into bootstrap-aware file tools for
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var lru = memory_mod.InMemoryLruMemory.init(std.testing.allocator, 16);

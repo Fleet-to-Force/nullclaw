@@ -261,20 +261,20 @@ test "buildSubagentSystemPrompt includes installed skills before tool instructio
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/commit");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/commit");
 
     {
-        const f = try tmp.dir.createFile("skills/commit/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/commit/skill.json", .{});
         defer f.close();
         try f.writeAll("{\"name\": \"commit\", \"description\": \"Git commit helper\", \"always\": true}");
     }
     {
-        const f = try tmp.dir.createFile("skills/commit/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/commit/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Always stage before committing.");
     }
 
-    const workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_dir);
 
     const no_tools = [_]tools_mod.Tool{};

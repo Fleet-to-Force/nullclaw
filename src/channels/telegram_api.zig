@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 
 pub const SentMessageMeta = struct {
@@ -24,9 +25,9 @@ pub const Client = struct {
     proxy: ?[]const u8,
 
     pub fn apiUrl(self: Client, buf: []u8, method: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("https://api.telegram.org/bot{s}/{s}", .{ self.bot_token, method });
-        return fbs.getWritten();
+        var w: std.Io.Writer = .fixed(buf);
+        try w.print("https://api.telegram.org/bot{s}/{s}", .{ self.bot_token, method });
+        return w.buffered();
     }
 
     pub fn getMe(self: Client, allocator: std.mem.Allocator) ![]u8 {
@@ -272,20 +273,20 @@ pub const Client = struct {
         const url = try self.apiUrl(&url_buf, method);
 
         var file_arg_buf: [1024]u8 = undefined;
-        var file_fbs = std.io.fixedBufferStream(&file_arg_buf);
+        var file_writer: std.Io.Writer = .fixed(&file_arg_buf);
         if (std.mem.startsWith(u8, media_path, "http://") or
             std.mem.startsWith(u8, media_path, "https://"))
         {
-            try file_fbs.writer().print("{s}={s}", .{ field_name, media_path });
+            try file_writer.print("{s}={s}", .{ field_name, media_path });
         } else {
-            try file_fbs.writer().print("{s}=@{s}", .{ field_name, media_path });
+            try file_writer.print("{s}=@{s}", .{ field_name, media_path });
         }
-        const file_arg = file_fbs.getWritten();
+        const file_arg = file_writer.buffered();
 
         var chatid_arg_buf: [128]u8 = undefined;
-        var chatid_fbs = std.io.fixedBufferStream(&chatid_arg_buf);
-        try chatid_fbs.writer().print("chat_id={s}", .{chat_id});
-        const chatid_arg = chatid_fbs.getWritten();
+        var chatid_writer: std.Io.Writer = .fixed(&chatid_arg_buf);
+        try chatid_writer.print("chat_id={s}", .{chat_id});
+        const chatid_arg = chatid_writer.buffered();
 
         var argv_buf: [24][]const u8 = undefined;
         var argc: usize = 0;
@@ -312,11 +313,11 @@ pub const Client = struct {
 
         var thread_arg_buf: [128]u8 = undefined;
         if (message_thread_id) |thread_id| {
-            var thread_fbs = std.io.fixedBufferStream(&thread_arg_buf);
-            try thread_fbs.writer().print("message_thread_id={d}", .{thread_id});
+            var thread_writer: std.Io.Writer = .fixed(&thread_arg_buf);
+            try thread_writer.print("message_thread_id={d}", .{thread_id});
             argv_buf[argc] = "-F";
             argc += 1;
-            argv_buf[argc] = thread_fbs.getWritten();
+            argv_buf[argc] = thread_writer.buffered();
             argc += 1;
         }
 
@@ -327,18 +328,18 @@ pub const Client = struct {
 
         var caption_arg_buf: [1024]u8 = undefined;
         if (caption) |cap| {
-            var cap_fbs = std.io.fixedBufferStream(&caption_arg_buf);
-            try cap_fbs.writer().print("caption={s}", .{cap});
+            var caption_writer: std.Io.Writer = .fixed(&caption_arg_buf);
+            try caption_writer.print("caption={s}", .{cap});
             argv_buf[argc] = "-F";
             argc += 1;
-            argv_buf[argc] = cap_fbs.getWritten();
+            argv_buf[argc] = caption_writer.buffered();
             argc += 1;
         }
 
         argv_buf[argc] = url;
         argc += 1;
 
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
         try child.spawn();
@@ -346,7 +347,7 @@ pub const Client = struct {
         _ = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
         const term = child.wait() catch return error.CurlWaitError;
         switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
+            .exited => |code| if (code != 0) return error.CurlFailed,
             else => return error.CurlFailed,
         }
     }
@@ -358,9 +359,9 @@ pub const Client = struct {
     }
 
     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ self.bot_token, file_path });
-        return fbs.getWritten();
+        var w: std.Io.Writer = .fixed(buf);
+        try w.print("https://api.telegram.org/file/bot{s}/{s}", .{ self.bot_token, file_path });
+        return w.buffered();
     }
 };
 

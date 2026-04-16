@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -116,7 +117,7 @@ pub const FileEditHashedTool = struct {
 
         const ws_path = path_info.workspacePath();
 
-        const resolved = std.fs.cwd().realpathAlloc(allocator, path_info.full_path) catch |err| {
+        const resolved = fs_compat.realpathAllocPath(allocator, path_info.full_path) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -126,7 +127,7 @@ pub const FileEditHashedTool = struct {
             return ToolResult.fail("Path is outside allowed areas");
         }
 
-        const file = std.fs.openFileAbsolute(resolved, .{}) catch |err| {
+        const file = std_compat.fs.openFileAbsolute(resolved, .{}) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to open file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -151,7 +152,7 @@ pub const FileEditHashedTool = struct {
         };
         defer allocator.free(contents);
 
-        var lines: std.ArrayList(LineInfo) = .{};
+        var lines: std.ArrayList(LineInfo) = .empty;
         defer lines.deinit(allocator);
         try collectLines(allocator, contents, &lines);
 
@@ -201,7 +202,7 @@ pub const FileEditHashedTool = struct {
         const new_contents = try std.mem.concat(allocator, u8, &.{ prefix, new_text, separator, suffix });
         defer allocator.free(new_contents);
 
-        const out_file = std.fs.createFileAbsolute(resolved, .{ .truncate = true }) catch |err| {
+        const out_file = std_compat.fs.createFileAbsolute(resolved, .{ .truncate = true }) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to write file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -224,14 +225,14 @@ test "file_edit_hashed replaces line when hash matches with shift" {
     defer tmp_dir.cleanup();
 
     const content = "line one\nline two\nline three";
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = content });
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = content });
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     const h2 = generateLineHash("line one", "line two");
 
     // Now insert a line at the top manually to cause a shift
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "new top line\nline one\nline two\nline three" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "new top line\nline one\nline two\nline three" });
 
     var args_buf: [128]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"path\": \"test.txt\", \"target\": \"L2:{s}\", \"new_text\": \"NEW LINE\"}}", .{h2});
@@ -256,15 +257,15 @@ test "file_edit_hashed rejects ambiguous collision during shift" {
     defer tmp_dir.cleanup();
 
     const content = "line one\nline two\nline three";
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = content });
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = content });
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     const h2 = generateLineHash("line one", "line two");
 
     // "bms" collides with the target hash when paired with "line one".
     const shifted = "bms\nline one\nline two\nline three";
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = shifted });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = shifted });
 
     var args_buf: [128]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"path\": \"test.txt\", \"target\": \"L2:{s}\", \"new_text\": \"NEW LINE\"}}", .{h2});
@@ -287,8 +288,8 @@ test "file_edit_hashed fails when hash mismatches" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "wrong content" });
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "wrong content" });
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileEditHashedTool{ .workspace_dir = ws_path };
@@ -305,8 +306,8 @@ test "file_edit_hashed preserves missing trailing newline at eof" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "line one\nline two" });
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "line one\nline two" });
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     const h2 = generateLineHash("line one", "line two");
@@ -332,13 +333,13 @@ test "file_edit_hashed rejects absolute path outside allowed areas" {
     var outside_tmp = std.testing.tmpDir(.{});
     defer outside_tmp.cleanup();
 
-    const ws_path = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(ws_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
-    const outside_path = try outside_tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const outside_path = try @import("compat").fs.Dir.wrap(outside_tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(outside_path);
 
-    try outside_tmp.dir.writeFile(.{ .sub_path = "test.txt", .data = "outside-before" });
-    const outside_file = try std.fs.path.join(std.testing.allocator, &.{ outside_path, "test.txt" });
+    try @import("compat").fs.Dir.wrap(outside_tmp.dir).writeFile(.{ .sub_path = "test.txt", .data = "outside-before" });
+    const outside_file = try std_compat.fs.path.join(std.testing.allocator, &.{ outside_path, "test.txt" });
     defer std.testing.allocator.free(outside_file);
 
     var escaped_buf: [1024]u8 = undefined;

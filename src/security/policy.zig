@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 pub const RateTracker = @import("tracker.zig").RateTracker;
 
 /// How much autonomy the agent has
@@ -490,7 +491,7 @@ fn skipEnvAssignments(s: []const u8) []const u8 {
 
 /// Extract basename from a path (everything after last separator)
 fn extractBasename(path: []const u8) []const u8 {
-    return std.fs.path.basename(path);
+    return std_compat.fs.path.basename(path);
 }
 
 /// Check if a command basename is in the high-risk set
@@ -567,7 +568,7 @@ fn isSafeGitChangeDirArg(self: *const SecurityPolicy, raw_arg: []const u8) bool 
     if (!self.workspace_only) return true;
 
     // Keep git `-C` scoped to the workspace when workspace_only is enabled.
-    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (std_compat.fs.path.isAbsolute(trimmed)) return false;
     if (hasParentTraversalSegment(trimmed)) return false;
     return true;
 }
@@ -653,7 +654,7 @@ fn isSafeBootstrapDeleteTarget(raw_arg: []const u8) bool {
     if (trimmed.len == 0) return false;
 
     // No absolute paths, traversal, or globs.
-    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (std_compat.fs.path.isAbsolute(trimmed)) return false;
     if (containsStr(trimmed, "..")) return false;
     if (containsStr(trimmed, "*") or containsStr(trimmed, "?") or
         containsStr(trimmed, "[") or containsStr(trimmed, "]"))

@@ -4,6 +4,7 @@
 //! Provides host extraction, localhost detection, and allowlist matching.
 
 const std = @import("std");
+const std_compat = @import("compat");
 
 /// Extract the hostname from an HTTP(S) URL, stripping port, path, query, fragment.
 pub fn extractHost(url: []const u8) ?[]const u8 {
@@ -135,7 +136,7 @@ pub fn resolveConnectHost(
         });
     }
 
-    const addr_list = std.net.getAddressList(allocator, bare, port) catch |err| switch (err) {
+    const addr_list = std_compat.net.getAddressList(allocator, bare, port) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.HostResolutionFailed,
     };
@@ -226,7 +227,7 @@ pub fn hostResolvesToLocal(allocator: std.mem.Allocator, host: []const u8, port:
     if (parseIpv6(unscoped)) |segs| return isNonGlobalV6(segs);
 
     // Fail closed: if we cannot verify DNS resolution safety, treat host as local.
-    const addr_list = std.net.getAddressList(allocator, bare, port) catch return true;
+    const addr_list = std_compat.net.getAddressList(allocator, bare, port) catch return true;
     defer addr_list.deinit();
 
     for (addr_list.addrs) |addr| {

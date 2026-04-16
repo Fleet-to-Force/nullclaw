@@ -89,7 +89,9 @@ pub const ParsedWeChatMessage = struct {
 };
 
 fn appendActiveTextPayload(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), to_user: []const u8, text: []const u8) !void {
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, out);
+    defer out.* = out_writer.toArrayList();
+    const w = &out_writer.writer;
     try w.writeAll("{\"touser\":");
     try root.appendJsonStringW(w, to_user);
     try w.writeAll(",\"msgtype\":\"text\",\"text\":{\"content\":");

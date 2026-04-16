@@ -98,7 +98,8 @@ pub const CronUpdateTool = struct {
         // Build summary of what changed
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+        const w = &buf_writer.writer;
         try w.print("Updated job {s}", .{job_id});
         if (expression) |expr| try w.print(" | expression={s}", .{expr});
         if (command) |cmd| try w.print(" | command={s}", .{cmd});
@@ -107,6 +108,7 @@ pub const CronUpdateTool = struct {
         if (session_target) |value| try w.print(" | session_target={s}", .{value.asStr()});
         if (enabled) |ena| try w.print(" | enabled={s}", .{if (ena) "true" else "false"});
 
+        buf = buf_writer.toArrayList();
         return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 };

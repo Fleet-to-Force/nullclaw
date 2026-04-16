@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const Atomic = @import("portable_atomic.zig").Atomic;
 const fs_compat = @import("fs_compat.zig");
 
@@ -266,7 +267,7 @@ pub const VerboseObserver = struct {
 
     fn verboseRecordEvent(_: *anyopaque, event: *const ObserverEvent) void {
         var buf: [4096]u8 = undefined;
-        var bw = std.fs.File.stderr().writer(&buf);
+        var bw = std_compat.fs.File.stderr().writer(&buf);
         const stderr = &bw.interface;
         switch (event.*) {
             .llm_request => |e| {
@@ -381,7 +382,7 @@ pub const MultiObserver = struct {
 
 // ── FileObserver ─────────────────────────────────────────────────────
 
-var file_observer_mutex: std.Thread.Mutex = .{};
+var file_observer_mutex: std_compat.sync.Mutex = .{};
 
 /// Appends events as JSONL to a log file.
 pub const FileObserver = struct {
@@ -412,27 +413,14 @@ pub const FileObserver = struct {
         defer file_observer_mutex.unlock();
 
         self.ensureParentDirExists();
-
-        const file = std.fs.cwd().openFile(self.path, .{ .mode = .write_only }) catch {
-            // Try creating the file if it doesn't exist
-            const new_file = std.fs.cwd().createFile(self.path, .{ .truncate = false }) catch return;
-            defer new_file.close();
-            new_file.seekFromEnd(0) catch return;
-            new_file.writeAll(line) catch {};
-            new_file.writeAll("\n") catch {};
-            return;
-        };
-        defer file.close();
-        file.seekFromEnd(0) catch return;
-        file.writeAll(line) catch {};
-        file.writeAll("\n") catch {};
+        fs_compat.appendLine(self.path, line) catch return;
     }
 
     fn ensureParentDirExists(self: *FileObserver) void {
-        const parent = std.fs.path.dirname(self.path) orelse return;
+        const parent = std_compat.fs.path.dirname(self.path) orelse return;
         if (parent.len == 0) return;
 
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => fs_compat.makePath(parent) catch {},
         };
@@ -590,7 +578,7 @@ pub const OtelObserver = struct {
     headers: []const []const u8,
     spans: std.ArrayListUnmanaged(OtelSpan),
     trace_contexts: std.AutoHashMapUnmanaged(std.Thread.Id, TraceContext),
-    mutex: std.Thread.Mutex,
+    mutex: std_compat.sync.Mutex,
     requests_total: Atomic(u64),
     errors_total: Atomic(u64),
 
@@ -677,7 +665,7 @@ pub const OtelObserver = struct {
     fn randomHex(buf: []u8) void {
         var raw: [16]u8 = undefined;
         const needed = buf.len / 2;
-        std.crypto.random.bytes(raw[0..needed]);
+        std_compat.crypto.random.bytes(raw[0..needed]);
         const hex = "0123456789abcdef";
         for (0..needed) |i| {
             buf[i * 2] = hex[raw[i] >> 4];
@@ -686,7 +674,7 @@ pub const OtelObserver = struct {
     }
 
     fn nowNs() u64 {
-        return @intCast(std.time.nanoTimestamp());
+        return @intCast(std_compat.time.nanoTimestamp());
     }
 
     fn contextForCurrentThread(self: *OtelObserver, now: u64) ?*TraceContext {
@@ -1023,7 +1011,8 @@ pub const OtelObserver = struct {
     pub fn serializeSpans(self: *OtelObserver) ![]u8 {
         var buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &buf);
+        const w = &buf_writer.writer;
 
         try w.writeAll("{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"");
         try w.writeAll(self.service_name);
@@ -1056,6 +1045,7 @@ pub const OtelObserver = struct {
 
         try w.writeAll("]}]}]}");
 
+        buf = buf_writer.toArrayList();
         return buf.toOwnedSlice(self.allocator);
     }
 
@@ -1398,9 +1388,9 @@ test "FileObserver tool_call detail is persisted as JSON string" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/obs_tool_detail.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_tool_detail.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1413,7 +1403,7 @@ test "FileObserver tool_call detail is persisted as JSON string" {
     } };
     obs.recordEvent(&event);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);
@@ -1427,9 +1417,9 @@ test "FileObserver serializes concurrent appends" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/obs_parallel.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_parallel.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1454,7 +1444,7 @@ test "FileObserver serializes concurrent appends" {
     thread_a.join();
     thread_b.join();
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 16 * 1024);
     defer allocator.free(content);
@@ -1471,9 +1461,9 @@ test "FileObserver creates parent directories on first write" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/nested/diagnostics/obs.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "nested", "diagnostics", "obs.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1481,7 +1471,7 @@ test "FileObserver creates parent directories on first write" {
     const event = ObserverEvent{ .heartbeat_tick = {} };
     obs.recordEvent(&event);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);
@@ -1494,9 +1484,9 @@ test "FileObserver emits valid escaped JSONL" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/obs_escaped.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_escaped.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1507,12 +1497,12 @@ test "FileObserver emits valid escaped JSONL" {
     } };
     obs.recordEvent(&event);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);
 
-    const line = std.mem.trimRight(u8, content, "\n");
+    const line = std_compat.mem.trimRight(u8, content, "\n");
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, line, .{});
     defer parsed.deinit();
 
@@ -1527,9 +1517,9 @@ test "FileObserver persists task details for subagent and cron events" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const path = try std.fmt.allocPrint(allocator, "{s}/obs_task_events.jsonl", .{base});
+    const path = try std_compat.fs.path.join(allocator, &.{ base, "obs_task_events.jsonl" });
     defer allocator.free(path);
 
     var file_obs = FileObserver{ .path = path };
@@ -1546,7 +1536,7 @@ test "FileObserver persists task details for subagent and cron events" {
     obs.recordEvent(&subagent);
     obs.recordEvent(&cron);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
+    const file = try std_compat.fs.openFileAbsolute(path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);

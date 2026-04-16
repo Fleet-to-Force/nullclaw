@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
 const model_refs = @import("model_refs.zig");
@@ -27,7 +28,7 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
 }
 
 fn decryptSecretField(allocator: std.mem.Allocator, config_path: []const u8, value: []const u8) ![]u8 {
-    const config_dir = std.fs.path.dirname(config_path) orelse ".";
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
     const store = secrets.SecretStore.init(config_dir, true);
     return try store.decryptSecret(allocator, value);
 }
@@ -262,9 +263,9 @@ fn parseNamedAgentObject(
     if (item.object.get("system_prompt")) |sp| {
         if (sp == .string) {
             const val = sp.string;
-            if (std.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
+            if (std_compat.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
                 const file_content = blk: {
-                    const file = std.fs.openFileAbsolute(val, .{}) catch |err| {
+                    const file = std_compat.fs.openFileAbsolute(val, .{}) catch |err| {
                         std.log.warn("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
                         break :blk null;
                     };

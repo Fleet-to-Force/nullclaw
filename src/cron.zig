@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const config_paths = @import("config_paths.zig");
 const platform = @import("platform.zig");
@@ -555,7 +556,7 @@ pub const CronScheduler = struct {
 
         // Validate expression
         _ = try normalizeExpression(expression);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const next_run_secs = try nextRunForCronExpression(expression, now);
 
         const id = try self.allocateJobId("job");
@@ -576,7 +577,7 @@ pub const CronScheduler = struct {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         const delay_secs = try parseDuration(delay);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
 
         const id = try self.allocateJobId("once");
         errdefer self.allocator.free(id);
@@ -600,7 +601,7 @@ pub const CronScheduler = struct {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         _ = try normalizeExpression(expression);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         const next_run_secs = try nextRunForCronExpression(expression, now);
 
         const id = try self.allocateJobId("agent");
@@ -639,7 +640,7 @@ pub const CronScheduler = struct {
         if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
 
         const delay_secs = try parseDuration(delay);
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
 
         const id = try self.allocateJobId("agent-once");
         errdefer self.allocator.free(id);
@@ -701,7 +702,7 @@ pub const CronScheduler = struct {
     pub fn updateJob(self: *CronScheduler, allocator: std.mem.Allocator, id: []const u8, patch: CronJobPatch) bool {
         const job = self.getMutableJob(id) orelse return false;
         if (patch.expression) |expr| {
-            const next_run_secs = nextRunForCronExpression(expr, std.time.timestamp()) catch return false;
+            const next_run_secs = nextRunForCronExpression(expr, std_compat.time.timestamp()) catch return false;
             const new_expr = allocator.dupe(u8, expr) catch return false;
             allocator.free(job.expression);
             job.expression = new_expr;
@@ -857,9 +858,9 @@ pub const CronScheduler = struct {
         const poll_ns: u64 = poll_secs * std.time.ns_per_s;
 
         while (true) {
-            const now = std.time.timestamp();
+            const now = std_compat.time.timestamp();
             _ = self.tick(now, out_bus);
-            std.Thread.sleep(poll_ns);
+            std_compat.thread.sleep(poll_ns);
         }
     }
 
@@ -888,7 +889,7 @@ pub const CronScheduler = struct {
             switch (job.job_type) {
                 .shell => {
                     // Execute shell command via child process
-                    const result = std.process.Child.run(.{
+                    const result = std_compat.process.Child.run(.{
                         .allocator = self.allocator,
                         .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
                         .cwd = self.shell_cwd,
@@ -906,7 +907,7 @@ pub const CronScheduler = struct {
                     defer self.allocator.free(result.stderr);
 
                     const success = switch (result.term) {
-                        .Exited => |code| code == 0,
+                        .exited => |code| code == 0,
                         else => false,
                     };
                     job.last_run_secs = now;
@@ -1019,58 +1020,102 @@ fn pathAgentExecutableName() []const u8 {
 fn hasTimeoutExpired(start_ns: i128, timeout_secs: u64) bool {
     if (timeout_secs == 0) return false;
     const timeout_ns = @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s;
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = std_compat.time.nanoTimestamp();
     return now_ns - start_ns >= timeout_ns;
 }
 
 fn collectChildOutputWithTimeout(
-    child: *std.process.Child,
+    child: *std_compat.process.Child,
     allocator: std.mem.Allocator,
     stdout: *std.ArrayList(u8),
     stderr: *std.ArrayList(u8),
     timeout_secs: u64,
     start_ns: i128,
 ) !bool {
-    var poller = std.Io.poll(allocator, enum { stdout, stderr }, .{
-        .stdout = child.stdout.?,
-        .stderr = child.stderr.?,
-    });
-    defer poller.deinit();
-
-    const stdout_r = poller.reader(.stdout);
-    stdout_r.buffer = stdout.allocatedSlice();
-    stdout_r.seek = 0;
-    stdout_r.end = stdout.items.len;
-
-    const stderr_r = poller.reader(.stderr);
-    stderr_r.buffer = stderr.allocatedSlice();
-    stderr_r.seek = 0;
-    stderr_r.end = stderr.items.len;
-
-    defer {
-        stdout.* = .{
-            .items = stdout_r.buffer[0..stdout_r.end],
-            .capacity = stdout_r.buffer.len,
-        };
-        stderr.* = .{
-            .items = stderr_r.buffer[0..stderr_r.end],
-            .capacity = stderr_r.buffer.len,
-        };
-        stdout_r.buffer = &.{};
-        stderr_r.buffer = &.{};
-    }
-
+    const stdout_file = child.stdout.?;
+    const stderr_file = child.stderr.?;
+    var stdout_open = true;
+    var stderr_open = true;
     var timed_out = false;
+    var read_buf: [4096]u8 = undefined;
     while (true) {
-        const keep_polling = if (timeout_secs == 0 or timed_out)
-            try poller.poll()
-        else
-            try poller.pollTimeout(AGENT_POLL_STEP_NS);
+        if (!stdout_open and !stderr_open) break;
 
-        if (stdout_r.bufferedLen() > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
-        if (stderr_r.bufferedLen() > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+        if (comptime builtin.os.tag == .windows) {
+            if (stdout_open) {
+                const n = stdout_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stdout_open = false;
+                } else {
+                    try stdout.appendSlice(allocator, read_buf[0..n]);
+                    if (stdout.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                }
+            }
 
-        if (!keep_polling) break;
+            if (stderr_open) {
+                const n = stderr_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stderr_open = false;
+                } else {
+                    try stderr.appendSlice(allocator, read_buf[0..n]);
+                    if (stderr.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                }
+            }
+
+            if (stdout_open or stderr_open) {
+                std_compat.thread.sleep(AGENT_POLL_STEP_NS);
+            }
+        } else {
+            const poll_ms: i32 = if (timeout_secs == 0 or timed_out)
+                -1
+            else
+                @intCast(@divTrunc(AGENT_POLL_STEP_NS, std.time.ns_per_ms));
+            var poll_fds = [_]std.posix.pollfd{
+                .{
+                    .fd = if (stdout_open) stdout_file.handle else -1,
+                    .events = if (stdout_open) std.posix.POLL.IN | std.posix.POLL.HUP else 0,
+                    .revents = 0,
+                },
+                .{
+                    .fd = if (stderr_open) stderr_file.handle else -1,
+                    .events = if (stderr_open) std.posix.POLL.IN | std.posix.POLL.HUP else 0,
+                    .revents = 0,
+                },
+            };
+            _ = try std.posix.poll(&poll_fds, poll_ms);
+
+            if (stdout_open and (poll_fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+                const n = stdout_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stdout_open = false;
+                } else {
+                    try stdout.appendSlice(allocator, read_buf[0..n]);
+                    if (stdout.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                }
+            }
+
+            if (stderr_open and (poll_fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+                const n = stderr_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stderr_open = false;
+                } else {
+                    try stderr.appendSlice(allocator, read_buf[0..n]);
+                    if (stderr.items.len > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                }
+            }
+        }
 
         if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
             try terminateAgentChildHard(child);
@@ -1081,12 +1126,9 @@ fn collectChildOutputWithTimeout(
     return timed_out;
 }
 
-fn terminateAgentChildHard(child: *std.process.Child) !void {
+fn terminateAgentChildHard(child: *std_compat.process.Child) !void {
     if (comptime builtin.os.tag == .windows) {
-        _ = child.killWindows(1) catch |err| switch (err) {
-            error.AlreadyTerminated => return,
-            else => return err,
-        };
+        _ = child.kill() catch return;
         return;
     }
     if (comptime builtin.os.tag == .wasi) return error.UnsupportedOperation;
@@ -1132,7 +1174,7 @@ fn runAgentJob(
     model: ?[]const u8,
     timeout_secs: u64,
 ) !AgentRunResult {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std_compat.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
 
     var exec_path = preferAgentExecPath(exe_path);
@@ -1144,7 +1186,7 @@ fn runAgentJob(
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
 
-    var child: std.process.Child = undefined;
+    var child: std_compat.process.Child = undefined;
     spawn_loop: while (true) {
         argv.clearRetainingCapacity();
         try argv.append(allocator, exec_path);
@@ -1156,7 +1198,7 @@ fn runAgentJob(
         try argv.append(allocator, "-m");
         try argv.append(allocator, prompt);
 
-        child = std.process.Child.init(argv.items, allocator);
+        child = std_compat.process.Child.init(argv.items, allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -1205,7 +1247,7 @@ fn runAgentJob(
         _ = child.wait() catch {};
     }
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = std_compat.time.nanoTimestamp();
 
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
@@ -1223,7 +1265,7 @@ fn runAgentJob(
 
     const term = try child.wait();
     const success = !timed_out and switch (term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
     const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
@@ -1239,7 +1281,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
     const path = try cronJsonPath(scheduler.allocator);
     defer scheduler.allocator.free(path);
 
-    const content = fs_compat.readFileAlloc(std.fs.cwd(), scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
+    const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), scheduler.allocator, path, 1024 * 1024) catch |err| switch (err) {
         error.FileNotFound => return,
         else => switch (policy) {
             .best_effort => return,
@@ -1295,7 +1337,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             if (obj.get("next_run_secs")) |v| {
                 if (v == .integer) break :blk v.integer;
             }
-            break :blk std.time.timestamp() + 60;
+            break :blk std_compat.time.timestamp() + 60;
         };
         const last_run_secs: ?i64 = blk: {
             if (obj.get("last_run_secs")) |v| {
@@ -1678,7 +1720,7 @@ fn cronJsonPath(allocator: std.mem.Allocator) ![]const u8 {
 fn ensureCronDir(allocator: std.mem.Allocator) !void {
     const dir = try config_paths.defaultConfigDir(allocator);
     defer allocator.free(dir);
-    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -1837,14 +1879,14 @@ fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
     errdefer tmp_file.close();
     try tmp_file.writeAll(data);
     tmp_file.close();
 
-    std.fs.renameAbsolute(tmp_path, path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
-        const file = try std.fs.createFileAbsolute(path, .{});
+    std_compat.fs.renameAbsolute(tmp_path, path) catch {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(data);
     };
@@ -1870,7 +1912,7 @@ pub const GatewayRequest = union(enum) {
 };
 
 fn trimOwnedRight(allocator: std.mem.Allocator, raw: []u8) ?[]u8 {
-    const trimmed = std.mem.trimRight(u8, raw, " \t\r\n");
+    const trimmed = std_compat.mem.trimRight(u8, raw, " \t\r\n");
     if (trimmed.len == raw.len) return raw;
 
     const owned = allocator.dupe(u8, trimmed) catch {
@@ -1889,7 +1931,7 @@ fn readGatewayUrl(allocator: std.mem.Allocator) ?[]const u8 {
     const state_path = config_paths.pathFromConfigDir(allocator, dir, "daemon_state.json") catch return null;
     defer allocator.free(state_path);
 
-    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, state_path, 64 * 1024) catch return null;
+    const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, state_path, 64 * 1024) catch return null;
     defer allocator.free(content);
 
     // Parse "gateway": "host:port" field
@@ -1914,7 +1956,7 @@ fn readPairedToken(allocator: std.mem.Allocator) ?[]const u8 {
     defer allocator.free(dir);
     const token_path = config_paths.pathFromConfigDir(allocator, dir, "paired_token") catch return null;
     defer allocator.free(token_path);
-    const raw = fs_compat.readFileAlloc(std.fs.cwd(), allocator, token_path, 4096) catch return null;
+    const raw = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, token_path, 4096) catch return null;
     return trimOwnedRight(allocator, raw);
 }
 
@@ -2006,7 +2048,7 @@ const SchedulerStatus = struct {
 };
 
 fn absolutePathExists(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch return false;
+    std_compat.fs.accessAbsolute(path, .{}) catch return false;
     return true;
 }
 
@@ -2399,10 +2441,10 @@ fn resolveRunnableCwd(cwd_opt: ?[]const u8) ?[]const u8 {
     const cwd = cwd_opt orelse return null;
     if (cwd.len == 0) return null;
 
-    if (std.fs.path.isAbsolute(cwd)) {
-        std.fs.accessAbsolute(cwd, .{}) catch return null;
+    if (std_compat.fs.path.isAbsolute(cwd)) {
+        std_compat.fs.accessAbsolute(cwd, .{}) catch return null;
     } else {
-        std.fs.cwd().access(cwd, .{}) catch return null;
+        fs_compat.accessPath(cwd, .{}) catch return null;
     }
     return cwd;
 }
@@ -2425,10 +2467,10 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
     if (scheduler.getMutableJob(id)) |job| {
         log.info("Running job '{s}': {s}", .{ id, job.command });
-        const run_at = std.time.timestamp();
+        const run_at = std_compat.time.timestamp();
         switch (job.job_type) {
             .shell => {
-                const result = std.process.Child.run(.{
+                const result = std_compat.process.Child.run(.{
                     .allocator = allocator,
                     .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
                     .cwd = run_cwd,
@@ -2443,7 +2485,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                 defer allocator.free(result.stderr);
                 if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
                 const exit_code: u8 = switch (result.term) {
-                    .Exited => |code| code,
+                    .exited => |code| code,
                     else => 1,
                 };
                 job.last_run_secs = run_at;
@@ -2842,7 +2884,7 @@ test "load agent job without command field falls back to prompt" {
     ;
     const path = try cronJsonPath(std.testing.allocator);
     defer std.testing.allocator.free(path);
-    const file = try std.fs.createFileAbsolute(path, .{});
+    const file = try std_compat.fs.createFileAbsolute(path, .{});
     defer file.close();
     try file.writeAll(json);
 
@@ -2863,7 +2905,7 @@ test "load agent job without prompt field falls back to command" {
     ;
     const path = try cronJsonPath(std.testing.allocator);
     defer std.testing.allocator.free(path);
-    const file = try std.fs.createFileAbsolute(path, .{});
+    const file = try std_compat.fs.createFileAbsolute(path, .{});
     defer file.close();
     try file.writeAll(json);
 
@@ -2965,7 +3007,7 @@ test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {
 
     const path = try cronJsonPath(std.testing.allocator);
     defer std.testing.allocator.free(path);
-    const bad_file = try std.fs.createFileAbsolute(path, .{});
+    const bad_file = try std_compat.fs.createFileAbsolute(path, .{});
     defer bad_file.close();
     try bad_file.writeAll("{bad-json");
 
@@ -3214,7 +3256,7 @@ test "tick removes more than 64 one-shot jobs in one pass" {
         _ = try scheduler.addAgentOnce("1s", "noop prompt", null, .{});
     }
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     _ = scheduler.tick(now + 2, null);
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
@@ -3445,7 +3487,7 @@ test "one-shot job deleted after tick execution" {
     scheduler.jobs.items[0].next_run_secs = 0;
 
     // Tick without bus — the shell command "echo oneshot" will actually run
-    _ = scheduler.tick(std.time.timestamp(), null);
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
 
     // One-shot job should have been removed
     try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
@@ -3455,7 +3497,7 @@ test "shell job uses configured cwd for relative output paths" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
@@ -3465,9 +3507,9 @@ test "shell job uses configured cwd for relative output paths" {
     _ = try scheduler.addOnce("1s", "echo cwd_ok > cwd_proof.txt");
     scheduler.jobs.items[0].next_run_secs = 0;
 
-    _ = scheduler.tick(std.time.timestamp(), null);
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
 
-    const proof_file = try tmp.dir.openFile("cwd_proof.txt", .{});
+    const proof_file = try @import("compat").fs.Dir.wrap(tmp.dir).openFile("cwd_proof.txt", .{});
     proof_file.close();
 }
 
@@ -3490,7 +3532,7 @@ test "shell job delivers stdout via bus" {
     };
     scheduler.jobs.items[0].next_run_secs = 0;
 
-    _ = scheduler.tick(std.time.timestamp(), &test_bus);
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
 
     // Verify delivery happened
     try std.testing.expect(test_bus.outboundDepth() > 0);
@@ -3517,7 +3559,7 @@ test "agent job delivers result via bus" {
     });
     job.next_run_secs = 0;
 
-    _ = scheduler.tick(std.time.timestamp(), &test_bus);
+    _ = scheduler.tick(std_compat.time.timestamp(), &test_bus);
 
     // Verify delivery
     try std.testing.expect(test_bus.outboundDepth() > 0);
@@ -3532,7 +3574,7 @@ test "collectChildOutputWithTimeout disables timeout when set to zero" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "echo ready" }, allocator);
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "echo ready" }, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -3553,13 +3595,13 @@ test "collectChildOutputWithTimeout disables timeout when set to zero" {
         &stdout,
         &stderr,
         0,
-        std.time.nanoTimestamp(),
+        std_compat.time.nanoTimestamp(),
     );
     const term = try child.wait();
 
     try std.testing.expect(!timed_out);
     switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => try std.testing.expect(false),
     }
     try std.testing.expect(std.mem.indexOf(u8, stdout.items, "ready") != null);
@@ -3569,7 +3611,7 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "sleep 2; echo never" }, allocator);
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "sleep 2; echo never" }, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -3590,13 +3632,13 @@ test "collectChildOutputWithTimeout kills process after deadline" {
         &stdout,
         &stderr,
         1,
-        std.time.nanoTimestamp(),
+        std_compat.time.nanoTimestamp(),
     );
     const term = try child.wait();
 
     try std.testing.expect(timed_out);
     const completed_ok = switch (term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
     try std.testing.expect(!completed_ok);
@@ -3636,11 +3678,11 @@ test "probeSchedulerStatus reports missing config file" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
-    const daemon_state_path = try std.fs.path.join(allocator, &.{ base, "daemon_state.json" });
+    const daemon_state_path = try std_compat.fs.path.join(allocator, &.{ base, "daemon_state.json" });
     defer allocator.free(daemon_state_path);
 
     const status = probeSchedulerStatus(config_path, daemon_state_path, true);
@@ -3655,15 +3697,15 @@ test "probeSchedulerStatus reports config and daemon state files independently" 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
-    const daemon_state_path = try std.fs.path.join(allocator, &.{ base, "daemon_state.json" });
+    const daemon_state_path = try std_compat.fs.path.join(allocator, &.{ base, "daemon_state.json" });
     defer allocator.free(daemon_state_path);
 
     {
-        const file = try std.fs.createFileAbsolute(config_path, .{});
+        const file = try std_compat.fs.createFileAbsolute(config_path, .{});
         defer file.close();
         try file.writeAll("{}\n");
     }
@@ -3674,7 +3716,7 @@ test "probeSchedulerStatus reports config and daemon state files independently" 
     try std.testing.expect(!status.daemon_state_present);
 
     {
-        const file = try std.fs.createFileAbsolute(daemon_state_path, .{});
+        const file = try std_compat.fs.createFileAbsolute(daemon_state_path, .{});
         defer file.close();
         try file.writeAll("{\"status\":\"running\"}\n");
     }
@@ -3694,7 +3736,7 @@ test "tick without bus still executes jobs" {
     scheduler.jobs.items[0].next_run_secs = 0;
 
     // Tick with null bus — should not crash
-    _ = scheduler.tick(std.time.timestamp(), null);
+    _ = scheduler.tick(std_compat.time.timestamp(), null);
 
     // Job should have been executed and rescheduled
     try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
@@ -3811,7 +3853,7 @@ test "resolveConfigDir falls back to HOME/.nullclaw when NULLCLAW_HOME unset" {
     const dir = try config_paths.defaultConfigDirFromInputs(allocator, null, "test-home");
     defer allocator.free(dir);
 
-    const expected = try std.fs.path.join(allocator, &.{ "test-home", ".nullclaw" });
+    const expected = try std_compat.fs.path.join(allocator, &.{ "test-home", ".nullclaw" });
     defer allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, dir);
@@ -3823,7 +3865,7 @@ test "cronJsonPath appends cron.json to resolved config dir" {
     const path = try cronJsonPathFromDir(allocator, "test-nullclaw-data");
     defer allocator.free(path);
 
-    const expected = try std.fs.path.join(allocator, &.{ "test-nullclaw-data", "cron.json" });
+    const expected = try std_compat.fs.path.join(allocator, &.{ "test-nullclaw-data", "cron.json" });
     defer allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, path);

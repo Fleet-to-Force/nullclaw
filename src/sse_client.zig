@@ -8,6 +8,8 @@
 //! support for real-time message delivery.
 
 const std = @import("std");
+const std_compat = @import("compat");
+const builtin = @import("builtin");
 const log = std.log.scoped(.sse_client);
 
 /// Maximum SSE event size (256KB)
@@ -47,7 +49,7 @@ pub const SseConnection = struct {
     pub fn init(allocator: std.mem.Allocator, url: []const u8) SseConnection {
         return .{
             .allocator = allocator,
-            .client = std.http.Client{ .allocator = allocator },
+            .client = std.http.Client{ .allocator = allocator, .io = std_compat.io() },
             .request = null,
             .body_reader = null,
             .url = url,
@@ -219,11 +221,19 @@ pub const SseConnection = struct {
         // For TLS and buffered transports, data may already be decoded and
         // available even when the socket is not currently poll-readable.
         if (conn.reader().bufferedLen() > 0) return true;
-        const stream = conn.stream_reader.getStream();
+
+        if (comptime builtin.os.tag == .windows) {
+            if (timeout_ms > 0) {
+                std_compat.thread.sleep(@as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms);
+            }
+            return conn.reader().bufferedLen() > 0;
+        }
+
+        const stream = conn.stream_reader.stream;
 
         var poll_fds = [_]std.posix.pollfd{
             .{
-                .fd = stream.handle,
+                .fd = stream.socket.handle,
                 .events = std.posix.POLL.IN,
                 .revents = undefined,
             },
@@ -288,16 +298,16 @@ fn ownOrFreeList(list: *std.ArrayList(u8), allocator: std.mem.Allocator) ![]u8 {
 /// - After "field:", exactly ONE leading space is stripped from the value
 /// - Empty data: lines append an empty string (producing a newline in multi-line data)
 pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent {
-    var events: std.ArrayList(SseEvent) = .{};
+    var events: std.ArrayList(SseEvent) = .empty;
     defer events.deinit(allocator);
 
-    var current_data: std.ArrayList(u8) = .{};
+    var current_data: std.ArrayList(u8) = .empty;
     defer current_data.deinit(allocator);
 
-    var current_event_type: std.ArrayList(u8) = .{};
+    var current_event_type: std.ArrayList(u8) = .empty;
     defer current_event_type.deinit(allocator);
 
-    var current_id: std.ArrayList(u8) = .{};
+    var current_id: std.ArrayList(u8) = .empty;
     defer current_id.deinit(allocator);
 
     var total_event_size: usize = 0;
@@ -306,7 +316,7 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
     var lines = std.mem.splitScalar(u8, buffer, '\n');
     while (lines.next()) |raw_line| {
         // Strip trailing CR for CRLF line endings
-        const line = std.mem.trimRight(u8, raw_line, "\r");
+        const line = std_compat.mem.trimRight(u8, raw_line, "\r");
 
         if (line.len == 0) {
             // Empty line marks end of event — dispatch if we have data
@@ -323,9 +333,9 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
                     .id = id,
                 });
 
-                current_data = .{};
-                current_event_type = .{};
-                current_id = .{};
+                current_data = .empty;
+                current_event_type = .empty;
+                current_id = .empty;
                 total_event_size = 0;
                 has_data = false;
             }
@@ -364,9 +374,9 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
                     current_event_type.deinit(allocator);
                     current_id.deinit(allocator);
                 }
-                current_data = .{};
-                current_event_type = .{};
-                current_id = .{};
+                current_data = .empty;
+                current_event_type = .empty;
+                current_id = .empty;
                 total_event_size = 0;
                 has_data = false;
                 continue;
@@ -409,9 +419,9 @@ pub fn parseEvents(allocator: std.mem.Allocator, buffer: []const u8) ![]SseEvent
             .id = id,
         });
         // Mark as consumed so the defers don't double-free
-        current_data = .{};
-        current_event_type = .{};
-        current_id = .{};
+        current_data = .empty;
+        current_event_type = .empty;
+        current_id = .empty;
     }
 
     return try events.toOwnedSlice(allocator);

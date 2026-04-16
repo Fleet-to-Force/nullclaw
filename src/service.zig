@@ -4,6 +4,7 @@
 //! Uses child process execution to interact with launchctl / systemctl / rc-service / sc.exe.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
@@ -114,7 +115,7 @@ pub fn runWindowsServiceGateway(allocator: std.mem.Allocator) !void {
         },
     };
 
-    if (StartServiceCtrlDispatcherW(&table) == 0) {
+    if (StartServiceCtrlDispatcherW(&table) == .FALSE) {
         return error.CommandFailed;
     }
 }
@@ -241,7 +242,7 @@ fn stopServiceForRestart(allocator: std.mem.Allocator) !void {
 
 fn serviceStatus(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     const w = &bw.interface;
 
     if (comptime builtin.os.tag == .macos) {
@@ -308,14 +309,14 @@ fn uninstall(allocator: std.mem.Allocator) !void {
         try stopService(allocator);
         const plist = try macosServiceFile(allocator);
         defer allocator.free(plist);
-        std.fs.deleteFileAbsolute(plist) catch {};
+        std_compat.fs.deleteFileAbsolute(plist) catch {};
     } else if (comptime builtin.os.tag == .linux) {
         switch (try detectLinuxServiceManager(allocator)) {
             .systemd_user => {
                 try stopService(allocator);
                 const unit = try linuxServiceFile(allocator);
                 defer allocator.free(unit);
-                std.fs.deleteFileAbsolute(unit) catch |err| switch (err) {
+                std_compat.fs.deleteFileAbsolute(unit) catch |err| switch (err) {
                     error.FileNotFound => {},
                     else => return err,
                 };
@@ -337,15 +338,15 @@ fn installMacos(allocator: std.mem.Allocator) !void {
 
     // Ensure parent directory exists
     if (std.mem.lastIndexOfScalar(u8, plist, '/')) |idx| {
-        std.fs.makeDirAbsolute(plist[0..idx]) catch |err| switch (err) {
+        std_compat.fs.makeDirAbsolute(plist[0..idx]) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
 
     // Get current executable path
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = try std.fs.selfExePath(&exe_buf);
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
     const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
     defer allocator.free(service_exe_path);
 
@@ -353,7 +354,7 @@ fn installMacos(allocator: std.mem.Allocator) !void {
     defer allocator.free(home);
     const logs_dir = try std.fmt.allocPrint(allocator, "{s}/.nullclaw/logs", .{home});
     defer allocator.free(logs_dir);
-    std.fs.makeDirAbsolute(logs_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(logs_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -388,14 +389,14 @@ fn installMacos(allocator: std.mem.Allocator) !void {
     , .{ SERVICE_LABEL, xmlEscape(service_exe_path), xmlEscape(stdout_log), xmlEscape(stderr_log) });
     defer allocator.free(content);
 
-    const file = try std.fs.createFileAbsolute(plist, .{});
+    const file = try std_compat.fs.createFileAbsolute(plist, .{});
     defer file.close();
     try file.writeAll(content);
 }
 
 fn resolveServiceExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
     if (try preferredHomebrewShimPath(allocator, exe_path)) |candidate| {
-        std.fs.accessAbsolute(candidate, .{}) catch |err| switch (err) {
+        std_compat.fs.accessAbsolute(candidate, .{}) catch |err| switch (err) {
             error.FileNotFound => {
                 allocator.free(candidate);
                 return allocator.dupe(u8, exe_path);
@@ -443,14 +444,14 @@ fn installLinuxSystemd(allocator: std.mem.Allocator) !void {
         try fs_compat.makePath(unit[0..idx]);
     }
 
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = try std.fs.selfExePath(&exe_buf);
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
     const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
     defer allocator.free(service_exe_path);
 
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
-    const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    const config_dir = try std_compat.fs.path.join(allocator, &.{ home, ".nullclaw" });
     defer allocator.free(config_dir);
 
     const content = try std.fmt.allocPrint(allocator,
@@ -470,7 +471,7 @@ fn installLinuxSystemd(allocator: std.mem.Allocator) !void {
     , .{ service_exe_path, config_dir });
     defer allocator.free(content);
 
-    const file = try std.fs.createFileAbsolute(unit, .{});
+    const file = try std_compat.fs.createFileAbsolute(unit, .{});
     defer file.close();
     try file.writeAll(content);
 
@@ -481,8 +482,8 @@ fn installLinuxSystemd(allocator: std.mem.Allocator) !void {
 fn installLinuxOpenRc(allocator: std.mem.Allocator) !void {
     const openrc_run_path = getOpenRcRunPath() orelse return error.OpenRcUnavailable;
 
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = try std.fs.selfExePath(&exe_buf);
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
     const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
     defer allocator.free(service_exe_path);
 
@@ -492,7 +493,7 @@ fn installLinuxOpenRc(allocator: std.mem.Allocator) !void {
     const service_home = try getServiceHomeDir(allocator);
     defer allocator.free(service_home);
 
-    const config_dir = try std.fs.path.join(allocator, &.{ service_home, ".nullclaw" });
+    const config_dir = try std_compat.fs.path.join(allocator, &.{ service_home, ".nullclaw" });
     defer allocator.free(config_dir);
 
     const script = try buildOpenRcScript(allocator, .{
@@ -504,7 +505,7 @@ fn installLinuxOpenRc(allocator: std.mem.Allocator) !void {
     });
     defer allocator.free(script);
 
-    const file = try std.fs.createFileAbsolute(OPENRC_SERVICE_FILE, .{});
+    const file = try std_compat.fs.createFileAbsolute(OPENRC_SERVICE_FILE, .{});
     defer file.close();
     try file.writeAll(script);
     try file.chmod(0o755);
@@ -513,8 +514,8 @@ fn installLinuxOpenRc(allocator: std.mem.Allocator) !void {
 }
 
 fn installWindows(allocator: std.mem.Allocator) !void {
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = try std.fs.selfExePath(&exe_buf);
+    var exe_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const exe_path = try std_compat.fs.selfExePath(&exe_buf);
     const bin_path = try windowsServiceBinPath(allocator, exe_path);
     defer allocator.free(bin_path);
 
@@ -579,17 +580,17 @@ fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
 fn macosServiceFile(allocator: std.mem.Allocator) ![]const u8 {
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, "Library", "LaunchAgents", SERVICE_LABEL ++ ".plist" });
+    return std_compat.fs.path.join(allocator, &.{ home, "Library", "LaunchAgents", SERVICE_LABEL ++ ".plist" });
 }
 
 fn linuxServiceFile(allocator: std.mem.Allocator) ![]const u8 {
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".config", "systemd", "user", "nullclaw.service" });
+    return std_compat.fs.path.join(allocator, &.{ home, ".config", "systemd", "user", "nullclaw.service" });
 }
 
 fn fileExistsAbsolute(path: []const u8) bool {
-    std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+    std_compat.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return false,
     };
@@ -620,7 +621,7 @@ fn parsePasswdHome(passwd_contents: []const u8, username: []const u8) ?[]const u
 }
 
 fn getHomeDirForUserFromPasswd(allocator: std.mem.Allocator, username: []const u8) ![]const u8 {
-    const passwd = try std.fs.cwd().readFileAlloc(allocator, "/etc/passwd", 1024 * 1024);
+    const passwd = try std_compat.fs.cwd().readFileAlloc(allocator, "/etc/passwd", 1024 * 1024);
     defer allocator.free(passwd);
 
     const home = parsePasswdHome(passwd, username) orelse return error.NoHomeDir;
@@ -868,7 +869,7 @@ fn windowsServiceState(query_output: []const u8) []const u8 {
 }
 
 fn runCaptureStatus(allocator: std.mem.Allocator, argv: []const []const u8) !CaptureStatus {
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     child.spawn() catch |err| switch (err) {
@@ -895,7 +896,7 @@ fn runCaptureStatus(allocator: std.mem.Allocator, argv: []const []const u8) !Cap
 
     const result = try child.wait();
     const success = switch (result) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
     return .{
@@ -965,14 +966,14 @@ fn uninstallOpenRc(allocator: std.mem.Allocator) !void {
         else => return err,
     };
 
-    std.fs.deleteFileAbsolute(OPENRC_SERVICE_FILE) catch |err| switch (err) {
+    std_compat.fs.deleteFileAbsolute(OPENRC_SERVICE_FILE) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
 }
 
 fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
     // Avoid deadlocks: we do not consume pipes in runChecked.
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
@@ -985,13 +986,13 @@ fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     };
     const result = try child.wait();
     switch (result) {
-        .Exited => |code| if (code != 0) return error.CommandFailed,
+        .exited => |code| if (code != 0) return error.CommandFailed,
         else => return error.CommandFailed,
     }
 }
 
 fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
-    var child = std.process.Child.init(argv, allocator);
+    var child = std_compat.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     // We only need stdout here; inheriting/ignoring stderr prevents pipe backpressure hangs.
     child.stderr_behavior = .Ignore;
@@ -1207,11 +1208,11 @@ test "hasAnyExistingAbsolutePath checks actual filesystem state" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("openrc");
-    const existing = try tmp.dir.realpathAlloc(std.testing.allocator, "openrc");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("openrc");
+    const existing = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "openrc");
     defer std.testing.allocator.free(existing);
 
-    const missing = try std.fs.path.join(std.testing.allocator, &.{ existing, "softlevel" });
+    const missing = try std_compat.fs.path.join(std.testing.allocator, &.{ existing, "softlevel" });
     defer std.testing.allocator.free(missing);
 
     try std.testing.expect(hasAnyExistingAbsolutePath(&.{ missing, existing }));

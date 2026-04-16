@@ -1,6 +1,8 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
+const fs_compat = @import("fs_compat.zig");
 const embedded_wasm3_available = build_options.enable_embedded_wasm3;
 
 const c_wasm3 = if (embedded_wasm3_available) @cImport({
@@ -368,7 +370,7 @@ pub const WasmRuntime = struct {
         };
 
         // Build argv for selected engine (wasmtime/wasm3).
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
 
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -382,7 +384,7 @@ pub const WasmRuntime = struct {
 
         const term = try child.wait();
         const exit_code: i32 = switch (term) {
-            .Exited => |code| @as(i32, @intCast(code)),
+            .exited => |code| @as(i32, @intCast(code)),
             else => -1,
         };
 
@@ -470,13 +472,7 @@ pub const WasmRuntime = struct {
 
     fn readModuleBytes(allocator: std.mem.Allocator, module_path: []const u8) ![]u8 {
         const MAX_MODULE_BYTES = 64 * 1024 * 1024;
-        if (std.fs.path.isAbsolute(module_path)) {
-            const file = try std.fs.openFileAbsolute(module_path, .{});
-            defer file.close();
-            return file.readToEndAlloc(allocator, MAX_MODULE_BYTES);
-        }
-
-        const file = try std.fs.cwd().openFile(module_path, .{});
+        const file = try fs_compat.openPath(module_path, .{});
         defer file.close();
         return file.readToEndAlloc(allocator, MAX_MODULE_BYTES);
     }
@@ -520,7 +516,7 @@ pub const WasmRuntime = struct {
     }
 
     fn isCommandAvailable(allocator: std.mem.Allocator, command: []const u8) bool {
-        var child = std.process.Child.init(&.{ command, "--version" }, allocator);
+        var child = std_compat.process.Child.init(&.{ command, "--version" }, allocator);
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
 
@@ -531,11 +527,11 @@ pub const WasmRuntime = struct {
 };
 
 fn resolveWasmtimePath(allocator: std.mem.Allocator) ![]u8 {
-    const path_env = std.process.getEnvVarOwned(allocator, "PATH") catch return error.WasmtimeNotFound;
+    const path_env = std_compat.process.getEnvVarOwned(allocator, "PATH") catch return error.WasmtimeNotFound;
     defer allocator.free(path_env);
 
     const path_extensions = if (builtin.os.tag == .windows)
-        std.process.getEnvVarOwned(allocator, "PATHEXT") catch null
+        std_compat.process.getEnvVarOwned(allocator, "PATHEXT") catch null
     else
         null;
     defer if (path_extensions) |value| allocator.free(value);
@@ -553,7 +549,7 @@ fn resolveExecutableFromSearchPath(
     path_env: []const u8,
     path_extensions: ?[]const u8,
 ) ![]u8 {
-    var parts = std.mem.splitScalar(u8, path_env, std.fs.path.delimiter);
+    var parts = std.mem.splitScalar(u8, path_env, std_compat.fs.path.delimiter);
     while (parts.next()) |part| {
         if (part.len == 0) continue;
         if (try resolveExecutableFromDirectory(allocator, part, executable, path_extensions)) |resolved| {
@@ -569,7 +565,7 @@ fn resolveExecutableFromDirectory(
     executable: []const u8,
     path_extensions: ?[]const u8,
 ) !?[]u8 {
-    const candidate = try std.fs.path.join(allocator, &.{ directory, executable });
+    const candidate = try std_compat.fs.path.join(allocator, &.{ directory, executable });
     defer allocator.free(candidate);
 
     if (try realpathIfExecutable(allocator, candidate)) |resolved| {
@@ -577,7 +573,7 @@ fn resolveExecutableFromDirectory(
     }
 
     if (path_extensions) |extensions| {
-        var extension_it = std.mem.tokenizeScalar(u8, extensions, std.fs.path.delimiter);
+        var extension_it = std.mem.tokenizeScalar(u8, extensions, std_compat.fs.path.delimiter);
         while (extension_it.next()) |ext| {
             if (!supportedWindowsProgramExtension(ext)) continue;
 
@@ -594,18 +590,18 @@ fn resolveExecutableFromDirectory(
 }
 
 fn realpathIfExecutable(allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
-    const stat = std.fs.cwd().statFile(path) catch return null;
+    const stat = fs_compat.statPath(path) catch return null;
     if (stat.kind != .file) return null;
     if (builtin.os.tag != .windows and (stat.mode & 0o111) == 0) return null;
 
-    return std.fs.cwd().realpathAlloc(allocator, path) catch |err| switch (err) {
+    return fs_compat.realpathAllocPath(allocator, path) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return null,
     };
 }
 
 fn supportedWindowsProgramExtension(ext: []const u8) bool {
-    inline for (@typeInfo(std.process.Child.WindowsExtension).@"enum".fields) |field| {
+    inline for (@typeInfo(std_compat.process.Child.WindowsExtension).@"enum".fields) |field| {
         if (std.ascii.eqlIgnoreCase(ext, "." ++ field.name)) return true;
     }
     return false;
@@ -1168,9 +1164,9 @@ test "wasm integration executes module with wasm3 when available" {
         0x00, 0x0a, 0x04, 0x01,
         0x02, 0x00, 0x0b,
     };
-    try tmp.dir.writeFile(.{ .sub_path = "minimal.wasm", .data = &module_bytes });
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{ .sub_path = "minimal.wasm", .data = &module_bytes });
 
-    const module_path = try tmp.dir.realpathAlloc(std.testing.allocator, "minimal.wasm");
+    const module_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "minimal.wasm");
     defer std.testing.allocator.free(module_path);
 
     const wasm = WasmRuntime.init(.{ .engine = .wasm3 });
@@ -1185,17 +1181,17 @@ test "resolveExecutableFromPath returns absolute executable path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "wasmtime",
         .data = "#!/bin/sh\nexit 0\n",
-        .flags = .{ .mode = 0o755 },
+        .flags = .{ .permissions = std_compat.fs.permissionsFromMode(0o755) },
     });
-    const tmp_abs = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_abs = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_abs);
 
     const resolved = try resolveExecutableFromPath(std.testing.allocator, "wasmtime", tmp_abs);
     defer std.testing.allocator.free(resolved);
-    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expect(std_compat.fs.path.isAbsolute(resolved));
     try std.testing.expect(std.mem.endsWith(u8, resolved, "wasmtime"));
 }
 
@@ -1205,35 +1201,35 @@ test "resolveExecutableFromSearchPath skips non-executable entries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("first");
-    try tmp.dir.makeDir("second");
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).makeDir("first");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makeDir("second");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "first/wasmtime",
         .data = "#!/bin/sh\nexit 0\n",
-        .flags = .{ .mode = 0o644 },
+        .flags = .{ .permissions = std_compat.fs.permissionsFromMode(0o644) },
     });
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "second/wasmtime",
         .data = "#!/bin/sh\nexit 0\n",
-        .flags = .{ .mode = 0o755 },
+        .flags = .{ .permissions = std_compat.fs.permissionsFromMode(0o755) },
     });
 
-    const first_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "first");
+    const first_abs = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "first");
     defer std.testing.allocator.free(first_abs);
-    const second_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "second");
+    const second_abs = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "second");
     defer std.testing.allocator.free(second_abs);
 
     const path_env = try std.fmt.allocPrint(
         std.testing.allocator,
         "{s}{c}{s}",
-        .{ first_abs, std.fs.path.delimiter, second_abs },
+        .{ first_abs, std_compat.fs.path.delimiter, second_abs },
     );
     defer std.testing.allocator.free(path_env);
 
     const resolved = try resolveExecutableFromSearchPath(std.testing.allocator, "wasmtime", path_env, null);
     defer std.testing.allocator.free(resolved);
 
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ second_abs, "wasmtime" });
+    const expected = try std_compat.fs.path.join(std.testing.allocator, &.{ second_abs, "wasmtime" });
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
 }
@@ -1242,23 +1238,23 @@ test "resolveExecutableFromSearchPath honors executable extensions" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("bin");
-    try tmp.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp.dir).makeDir("bin");
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "bin/wasmtime.EXE",
         .data = "#!/bin/sh\nexit 0\n",
-        .flags = .{ .mode = 0o755 },
+        .flags = .{ .permissions = std_compat.fs.permissionsFromMode(0o755) },
     });
 
-    const bin_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "bin");
+    const bin_abs = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "bin");
     defer std.testing.allocator.free(bin_abs);
 
     var extensions_buf: [32]u8 = undefined;
-    const path_extensions = try std.fmt.bufPrint(&extensions_buf, ".EXE{c}.BAT", .{std.fs.path.delimiter});
+    const path_extensions = try std.fmt.bufPrint(&extensions_buf, ".EXE{c}.BAT", .{std_compat.fs.path.delimiter});
 
     const resolved = try resolveExecutableFromSearchPath(std.testing.allocator, "wasmtime", bin_abs, path_extensions);
     defer std.testing.allocator.free(resolved);
 
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ bin_abs, "wasmtime.EXE" });
+    const expected = try std_compat.fs.path.join(std.testing.allocator, &.{ bin_abs, "wasmtime.EXE" });
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, resolved);
 }

@@ -8,6 +8,7 @@
 //!   - Document chunking for large markdown files
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
@@ -917,7 +918,7 @@ pub fn initRuntime(
     var resp_cache: ?*cache.ResponseCache = null;
     var cache_db_path: ?[*:0]const u8 = null;
     if (build_options.enable_sqlite and config.response_cache.enabled) blk: {
-        const cp_slice = std.fs.path.joinZ(allocator, &.{ workspace_dir, "response_cache.db" }) catch break :blk;
+        const cp_slice = std_compat.fs.path.joinZ(allocator, &.{ workspace_dir, "response_cache.db" }) catch break :blk;
         const cp: [*:0]const u8 = cp_slice.ptr;
         const rc = allocator.create(cache.ResponseCache) catch {
             allocator.free(std.mem.span(cp));
@@ -1124,12 +1125,12 @@ pub fn initRuntime(
                     const sidecar_path_slice = blk: {
                         const configured = config.search.store.sidecar_path;
                         if (configured.len == 0) {
-                            break :blk std.fs.path.joinZ(allocator, &.{ workspace_dir, "vectors.db" }) catch break :vec_plane;
+                            break :blk std_compat.fs.path.joinZ(allocator, &.{ workspace_dir, "vectors.db" }) catch break :vec_plane;
                         }
-                        if (std.fs.path.isAbsolute(configured)) {
+                        if (std_compat.fs.path.isAbsolute(configured)) {
                             break :blk allocator.dupeZ(u8, configured) catch break :vec_plane;
                         }
-                        break :blk std.fs.path.joinZ(allocator, &.{ workspace_dir, configured }) catch break :vec_plane;
+                        break :blk std_compat.fs.path.joinZ(allocator, &.{ workspace_dir, configured }) catch break :vec_plane;
                     };
                     const sidecar_path: [*:0]const u8 = sidecar_path_slice.ptr;
                     const vs = allocator.create(vector_store.SqliteSidecarVectorStore) catch {
@@ -1258,7 +1259,7 @@ pub fn initRuntime(
     var sem_cache: ?*semantic_cache.SemanticCache = null;
     var sem_cache_db_path: ?[*:0]const u8 = null;
     if (build_options.enable_sqlite and config.response_cache.enabled and embed_provider != null) sem_cache_blk: {
-        const sc_path = std.fs.path.joinZ(allocator, &.{ workspace_dir, "semantic_cache.db" }) catch break :sem_cache_blk;
+        const sc_path = std_compat.fs.path.joinZ(allocator, &.{ workspace_dir, "semantic_cache.db" }) catch break :sem_cache_blk;
         const sc = allocator.create(semantic_cache.SemanticCache) catch {
             allocator.free(std.mem.span(sc_path.ptr));
             break :sem_cache_blk;
@@ -1682,8 +1683,8 @@ const TestWorkspace = struct {
     path: []u8,
 
     fn init(allocator: std.mem.Allocator) !TestWorkspace {
-        var tmp = std.testing.tmpDir(.{});
-        const path = try tmp.dir.realpathAlloc(allocator, ".");
+        const tmp = std.testing.tmpDir(.{});
+        const path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
         return .{ .tmp = tmp, .path = path };
     }
 
@@ -1984,7 +1985,7 @@ test "initRuntime uses configured relative sqlite_sidecar path" {
     }, ws.path) orelse return error.TestUnexpectedResult;
     defer rt.deinit();
 
-    const expected_path = try std.fs.path.join(std.testing.allocator, &.{ ws.path, "vectors-custom.db" });
+    const expected_path = try std_compat.fs.path.join(std.testing.allocator, &.{ ws.path, "vectors-custom.db" });
     defer std.testing.allocator.free(expected_path);
 
     try std.testing.expect(rt._sidecar_db_path != null);
@@ -1995,7 +1996,7 @@ test "initRuntime uses configured absolute sqlite_sidecar path" {
     if (!build_options.enable_memory_sqlite) return;
     var ws = try TestWorkspace.init(std.testing.allocator);
     defer ws.deinit(std.testing.allocator);
-    const absolute_sidecar_path = try std.fs.path.join(std.testing.allocator, &.{ ws.path, "vectors-absolute.db" });
+    const absolute_sidecar_path = try std_compat.fs.path.join(std.testing.allocator, &.{ ws.path, "vectors-absolute.db" });
     defer std.testing.allocator.free(absolute_sidecar_path);
 
     var rt = initRuntime(std.testing.allocator, &.{
@@ -2165,11 +2166,11 @@ test "initRuntime hygiene preserve enqueues vector sync when durable outbox is a
     var ws = try TestWorkspace.init(std.testing.allocator);
     defer ws.deinit(std.testing.allocator);
 
-    const archive_path = try std.fs.path.join(std.testing.allocator, &.{ ws.path, "memory", "archive" });
+    const archive_path = try std_compat.fs.path.join(std.testing.allocator, &.{ ws.path, "memory", "archive" });
     defer std.testing.allocator.free(archive_path);
     try fs_compat.makePath(archive_path);
 
-    var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
+    var archive_dir = try fs_compat.openDirPath(archive_path, .{});
     defer archive_dir.close();
 
     var file = try archive_dir.createFile("old-memory.md", .{});

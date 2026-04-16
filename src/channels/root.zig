@@ -17,6 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const std_compat = @import("compat");
 const streaming = @import("../streaming.zig");
 const outbound = @import("../outbound.zig");
 const log = std.log.scoped(.channels);
@@ -494,7 +495,7 @@ pub fn isAllowedExactScoped(comptime scope: []const u8, allowed: []const []const
 
 /// Get current UNIX epoch seconds.
 pub fn nowEpochSecs() u64 {
-    const ns = std.time.nanoTimestamp();
+    const ns = std_compat.time.nanoTimestamp();
     if (ns < 0) return 0;
     return @intCast(@as(u128, @intCast(ns)) / 1_000_000_000);
 }

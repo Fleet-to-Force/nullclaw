@@ -9,6 +9,7 @@
 //!   - Sandbox, cron status, channel connectivity (nullclaw-specific)
 
 const std = @import("std");
+const std_compat = @import("compat");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
 const channel_catalog = @import("channel_catalog.zig");
@@ -27,6 +28,17 @@ const CHANNEL_STALE_SECONDS: i64 = 300;
 const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 // ── ANSI color support ──────────────────────────────────────────
 
+extern "kernel32" fn GetStdHandle(nStdHandle: std.os.windows.DWORD) callconv(.winapi) ?std.os.windows.HANDLE;
+extern "kernel32" fn GetConsoleMode(
+    hConsoleHandle: std.os.windows.HANDLE,
+    lpMode: *std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn SetConsoleMode(
+    hConsoleHandle: std.os.windows.HANDLE,
+    dwMode: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
+const STD_OUTPUT_HANDLE: std.os.windows.DWORD = @bitCast(@as(i32, -11));
+
 const Color = struct {
     const reset = "\x1b[0m";
     const green = "\x1b[32m";
@@ -34,10 +46,10 @@ const Color = struct {
     const red = "\x1b[31m";
 };
 
-pub fn shouldColorize(file: std.fs.File) bool {
+pub fn shouldColorize(file: std_compat.fs.File) bool {
     // Respect NO_COLOR convention (https://no-color.org/)
-    if (comptime builtin.os.tag != .windows) {
-        if (std.posix.getenv("NO_COLOR")) |_| return false;
+    if (comptime builtin.os.tag != .windows and builtin.link_libc) {
+        if (std.c.getenv("NO_COLOR")) |_| return false;
     }
 
     // Never colorize if stdout is redirected to a file/pipe
@@ -55,11 +67,11 @@ pub fn shouldColorize(file: std.fs.File) bool {
 /// Windows-specific: enable ENABLE_VIRTUAL_TERMINAL_PROCESSING on stdout.
 fn enableWindowsVT100() !bool {
     const windows = std.os.windows;
-    const handle = try windows.GetStdHandle(windows.STD_OUTPUT_HANDLE);
+    const handle = GetStdHandle(STD_OUTPUT_HANDLE) orelse return false;
     var mode: windows.DWORD = 0;
-    if (windows.kernel32.GetConsoleMode(handle, &mode) == 0) return false;
+    if (GetConsoleMode(handle, &mode) == .FALSE) return false;
     mode |= 0x0004; // ENABLE_VIRTUAL_TERMINAL_PROCESSING
-    return windows.kernel32.SetConsoleMode(handle, mode) != 0;
+    return SetConsoleMode(handle, mode) != .FALSE;
 }
 
 // ── Diagnostic types ────────────────────────────────────────────
@@ -162,7 +174,7 @@ pub fn runDoctor(
 
 /// Legacy entry point — uses stdout directly.
 pub fn run(allocator: std.mem.Allocator) !void {
-    const stdout_file = std.fs.File.stdout();
+    const stdout_file = std_compat.fs.File.stdout();
     var stdout_buf: [4096]u8 = undefined;
     var bw = stdout_file.writer(&stdout_buf);
     const stdout = &bw.interface;
@@ -284,7 +296,7 @@ pub fn checkWorkspace(
     const ws = config.workspace_dir;
 
     // Check directory exists
-    if (std.fs.openDirAbsolute(ws, .{})) |dir| {
+    if (std_compat.fs.openDirAbsolute(ws, .{})) |dir| {
         var d = dir;
         d.close();
         try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(allocator, "directory exists: {s}", .{ws})));
@@ -295,18 +307,18 @@ pub fn checkWorkspace(
 
     // Writable probe
     const probe_name = ".nullclaw_doctor_probe";
-    const probe_path = try std.fs.path.join(allocator, &.{ ws, probe_name });
+    const probe_path = try std_compat.fs.path.join(allocator, &.{ ws, probe_name });
     defer allocator.free(probe_path);
 
-    if (std.fs.createFileAbsolute(probe_path, .{})) |file| {
+    if (std_compat.fs.createFileAbsolute(probe_path, .{})) |file| {
         file.writeAll("probe") catch {
             file.close();
-            std.fs.deleteFileAbsolute(probe_path) catch {};
+            std_compat.fs.deleteFileAbsolute(probe_path) catch {};
             try items.append(allocator, DiagItem.err(cat, "directory write probe failed"));
             return;
         };
         file.close();
-        std.fs.deleteFileAbsolute(probe_path) catch {};
+        std_compat.fs.deleteFileAbsolute(probe_path) catch {};
         try items.append(allocator, DiagItem.ok(cat, "directory is writable"));
     } else |_| {
         try items.append(allocator, DiagItem.err(cat, "directory is not writable"));
@@ -372,7 +384,7 @@ fn checkFileExists(
     }
 
     // Fallback: direct filesystem check.
-    const dir = std.fs.openDirAbsolute(base_dir, .{}) catch return;
+    const dir = std_compat.fs.openDirAbsolute(base_dir, .{}) catch return;
     var d = dir;
     defer d.close();
 
@@ -396,7 +408,7 @@ fn checkFileExists(
 }
 
 fn getDiskAvailableMb(allocator: std.mem.Allocator, path: []const u8) !?u64 {
-    const result = std.process.Child.run(.{
+    const result = std_compat.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "df", "-m", path },
         .max_output_bytes = 4096,
@@ -404,7 +416,7 @@ fn getDiskAvailableMb(allocator: std.mem.Allocator, path: []const u8) !?u64 {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     switch (result.term) {
-        .Exited => |code| if (code != 0) return null,
+        .exited => |code| if (code != 0) return null,
         else => return null,
     }
     return parseDfAvailableMb(result.stdout);
@@ -448,7 +460,7 @@ pub fn checkDaemonState(
     const state_path = try daemon.stateFilePath(allocator, config);
     defer allocator.free(state_path);
 
-    const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, state_path, 1024 * 1024) catch {
+    const content = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, state_path, 1024 * 1024) catch {
         try items.append(allocator, DiagItem.err(cat, try std.fmt.allocPrint(
             allocator,
             "state file not found: {s} -- is the daemon running?",
@@ -488,7 +500,7 @@ pub fn checkDaemonState(
     if (root.object.get("updated_at")) |ts_val| {
         if (ts_val == .integer) {
             const updated_at: i64 = ts_val.integer;
-            const now: i64 = @intCast(std.time.timestamp());
+            const now: i64 = @intCast(std_compat.time.timestamp());
             const age = now - updated_at;
             if (age <= DAEMON_STALE_SECONDS) {
                 try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(
@@ -591,7 +603,7 @@ pub fn checkEnvironment(
     }
 
     // $SHELL
-    if (std.process.getEnvVarOwned(allocator, "SHELL")) |shell| {
+    if (std_compat.process.getEnvVarOwned(allocator, "SHELL")) |shell| {
         defer allocator.free(shell);
         if (shell.len > 0) {
             try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(allocator, "shell: {s}", .{shell})));
@@ -612,7 +624,7 @@ pub fn checkEnvironment(
 }
 
 fn checkCommandAvailable(allocator: std.mem.Allocator, cmd: []const u8) !?[]const u8 {
-    const result = std.process.Child.run(.{
+    const result = std_compat.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ cmd, "--version" },
         .max_output_bytes = 1024,
@@ -620,7 +632,7 @@ fn checkCommandAvailable(allocator: std.mem.Allocator, cmd: []const u8) !?[]cons
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     switch (result.term) {
-        .Exited => |code| if (code != 0) return null,
+        .exited => |code| if (code != 0) return null,
         else => return null,
     }
 
@@ -751,7 +763,7 @@ test "DiagItem.iconColored returns ANSI-colored strings" {
 
 test "shouldColorize returns false for non-TTY file" {
     // Open /dev/null — it's not a TTY, so shouldColorize should return false
-    const devnull = std.fs.openFileAbsolute("/dev/null", .{}) catch return;
+    const devnull = std_compat.fs.openFileAbsolute("/dev/null", .{}) catch return;
     defer devnull.close();
     try std.testing.expect(!shouldColorize(devnull));
 }
@@ -901,19 +913,19 @@ test "checkDaemonState parses valid JSON state" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
     const state_content =
         \\{"status": "running", "updated_at": 9999999999, "components": {"scheduler": {"status": "ok"}, "channel:telegram": {"status": "ok"}}}
     ;
     {
-        const file = try tmp.dir.createFile("daemon_state.json", .{});
+        const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("daemon_state.json", .{});
         try file.writeAll(state_content);
         file.close();
     }
 
-    const cfg_path = try std.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
+    const cfg_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "config.json" });
     defer std.testing.allocator.free(cfg_path);
 
     var items: std.ArrayList(DiagItem) = .empty;

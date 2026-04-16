@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
 const config_types = @import("../config_types.zig");
@@ -159,7 +160,7 @@ pub fn complete(allocator: std.mem.Allocator, cfg: anytype, prompt: []const u8) 
     var auth_buf: [512]u8 = undefined;
     const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -194,7 +195,7 @@ pub fn completeWithSystem(allocator: std.mem.Allocator, cfg: anytype, system_pro
     var auth_buf: [512]u8 = undefined;
     const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{api_key}) catch return error.NoApiKey;
 
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -234,12 +235,11 @@ pub fn providerUrl(provider_name: []const u8) []const u8 {
 pub fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt: []const u8, temperature: f64, max_tokens: u32) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try w.writeAll("{\"model\":");
+    try buf.appendSlice(allocator, "{\"model\":");
     try json_util.appendJsonString(&buf, allocator, model);
-    try w.writeAll(",\"messages\":[{\"role\":\"user\",\"content\":");
+    try buf.appendSlice(allocator, ",\"messages\":[{\"role\":\"user\",\"content\":");
     try json_util.appendJsonString(&buf, allocator, prompt);
-    try std.fmt.format(w, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
+    try buf.print(allocator, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -247,14 +247,13 @@ pub fn buildRequestBody(allocator: std.mem.Allocator, model: []const u8, prompt:
 pub fn buildRequestBodyWithSystem(allocator: std.mem.Allocator, model: []const u8, system: []const u8, prompt: []const u8, temperature: f64, max_tokens: u32) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    try w.writeAll("{\"model\":\"");
-    try w.writeAll(model);
-    try w.writeAll("\",\"messages\":[{\"role\":\"system\",\"content\":");
+    try buf.appendSlice(allocator, "{\"model\":\"");
+    try buf.appendSlice(allocator, model);
+    try buf.appendSlice(allocator, "\",\"messages\":[{\"role\":\"system\",\"content\":");
     try json_util.appendJsonString(&buf, allocator, system);
-    try w.writeAll("},{\"role\":\"user\",\"content\":");
+    try buf.appendSlice(allocator, "},{\"role\":\"user\",\"content\":");
     try json_util.appendJsonString(&buf, allocator, prompt);
-    try std.fmt.format(w, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
+    try buf.print(allocator, "}}],\"temperature\":{d:.1},\"max_tokens\":{d}}}", .{ temperature, max_tokens });
     return try buf.toOwnedSlice(allocator);
 }
 

@@ -12,6 +12,7 @@
 //! Uses the existing vector/math.zig for cosine similarity and serialization.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -132,7 +133,7 @@ pub const LanceDbMemory = struct {
 
     fn generateUuid(allocator: std.mem.Allocator) ![]u8 {
         var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf);
+        std_compat.crypto.random.bytes(&buf);
         // Set version 4
         buf[6] = (buf[6] & 0x0f) | 0x40;
         // Set variant bits
@@ -245,7 +246,7 @@ pub const LanceDbMemory = struct {
         const content_z = try self_.allocator.dupeZ(u8, content);
         defer self_.allocator.free(content_z);
 
-        const now = try std.fmt.allocPrint(self_.allocator, "{d}", .{std.time.timestamp()});
+        const now = try std.fmt.allocPrint(self_.allocator, "{d}", .{std_compat.time.timestamp()});
         defer self_.allocator.free(now);
 
         const sql = "INSERT INTO lancedb_memories (id, key, text, embedding, importance, category, created_at, updated_at, session_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(key) DO UPDATE SET text=?3, embedding=?4, updated_at=?8";

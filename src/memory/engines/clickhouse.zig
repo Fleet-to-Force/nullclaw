@@ -8,6 +8,7 @@
 //! ClickHouse query parameters ({name:Type} syntax).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const root = @import("../root.zig");
 const Memory = root.Memory;
@@ -117,14 +118,14 @@ pub fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 // ── Timestamp / ID helpers ────────────────────────────────────────
 
 fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
-    const ts = std.time.timestamp();
+    const ts = std_compat.time.timestamp();
     return std.fmt.allocPrint(allocator, "{d}", .{ts});
 }
 
 fn generateId(allocator: std.mem.Allocator) ![]u8 {
-    const ts = std.time.nanoTimestamp();
+    const ts = std_compat.time.nanoTimestamp();
     var buf: [16]u8 = undefined;
-    std.crypto.random.bytes(&buf);
+    std_compat.crypto.random.bytes(&buf);
     const rand_hi = std.mem.readInt(u64, buf[0..8], .little);
     const rand_lo = std.mem.readInt(u64, buf[8..16], .little);
     return std.fmt.allocPrint(allocator, "{d}-{x}-{x}", .{ ts, rand_hi, rand_lo });
@@ -255,12 +256,12 @@ fn isLoopbackHost(host: []const u8) bool {
 
     if (std.ascii.eqlIgnoreCase(normalized, "localhost")) return true;
 
-    if (std.net.Address.parseIp4(normalized, 0)) |ip4| {
+    if (std_compat.net.Address.parseIp4(normalized, 0)) |ip4| {
         const octets: *const [4]u8 = @ptrCast(&ip4.in.sa.addr);
         return octets[0] == 127;
     } else |_| {}
 
-    if (std.net.Address.parseIp6(normalized, 0)) |ip6| {
+    if (std_compat.net.Address.parseIp6(normalized, 0)) |ip6| {
         const bytes = ip6.in6.sa.addr;
         return std.mem.eql(u8, bytes[0..15], &[_]u8{0} ** 15) and bytes[15] == 1;
     } else |_| {}
@@ -379,7 +380,7 @@ const ClickHouseMemoryImpl = struct {
         const url = try url_buf.toOwnedSlice(allocator);
         defer allocator.free(url);
 
-        var client: std.http.Client = .{ .allocator = allocator };
+        var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -444,7 +445,7 @@ const ClickHouseMemoryImpl = struct {
         const url = try url_buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(url);
 
-        var client: std.http.Client = .{ .allocator = self.allocator };
+        var client: std.http.Client = .{ .allocator = self.allocator, .io = std_compat.io() };
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
@@ -1498,14 +1499,14 @@ fn isTruthy(raw: []const u8) bool {
 }
 
 fn envOrDefault(allocator: std.mem.Allocator, name: []const u8, default_value: []const u8) ![]u8 {
-    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+    return std_compat.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => allocator.dupe(u8, default_value),
         else => err,
     };
 }
 
 fn loadClickHouseIntegrationConfig(allocator: std.mem.Allocator) !?ClickHouseIntegrationConfig {
-    const enabled_raw = std.process.getEnvVarOwned(allocator, "NULLCLAW_TEST_CLICKHOUSE") catch |err| switch (err) {
+    const enabled_raw = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_TEST_CLICKHOUSE") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return null,
         else => return err,
     };
@@ -1523,7 +1524,7 @@ fn loadClickHouseIntegrationConfig(allocator: std.mem.Allocator) !?ClickHouseInt
     const password = try envOrDefault(allocator, "NULLCLAW_TEST_CLICKHOUSE_PASSWORD", "");
     errdefer allocator.free(password);
 
-    const port_raw = std.process.getEnvVarOwned(allocator, "NULLCLAW_TEST_CLICKHOUSE_PORT") catch |err| switch (err) {
+    const port_raw = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_TEST_CLICKHOUSE_PORT") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => return err,
     };
@@ -1533,7 +1534,7 @@ fn loadClickHouseIntegrationConfig(allocator: std.mem.Allocator) !?ClickHouseInt
     else
         8123;
 
-    const https_raw = std.process.getEnvVarOwned(allocator, "NULLCLAW_TEST_CLICKHOUSE_USE_HTTPS") catch |err| switch (err) {
+    const https_raw = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_TEST_CLICKHOUSE_USE_HTTPS") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => return err,
     };

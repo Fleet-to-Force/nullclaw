@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const bus = @import("../bus.zig");
@@ -273,7 +274,7 @@ fn dispatchOutboundMessageWithRetry(
             if (!shouldRetryOutboundMessage(channel, msg, err) or attempt >= MAX_FINAL_SEND_ATTEMPTS) return err;
             const backoff_idx = @min(attempt - 1, FINAL_SEND_RETRY_BACKOFF_MS.len - 1);
             const backoff_ms = FINAL_SEND_RETRY_BACKOFF_MS[backoff_idx];
-            if (backoff_ms > 0) std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+            if (backoff_ms > 0) std_compat.thread.sleep(backoff_ms * std.time.ns_per_ms);
             attempt += 1;
             continue;
         };
@@ -288,7 +289,7 @@ pub fn runDurableOutboundWorker(
 ) void {
     while (!delivery_outbox.isClosed()) {
         const processed = drainDurableOutboundOutboxOnce(allocator, delivery_outbox, registry) catch false;
-        if (!processed) std.Thread.sleep(OUTBOX_IDLE_POLL_MS * std.time.ns_per_ms);
+        if (!processed) std_compat.thread.sleep(OUTBOX_IDLE_POLL_MS * std.time.ns_per_ms);
     }
 }
 
@@ -299,7 +300,7 @@ pub fn drainDurableOutboundOutboxOnce(
 ) !bool {
     if (try delivery_outbox.purgePersistedDelivered() > 0) return true;
 
-    const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const now_ns: i64 = @intCast(std_compat.time.nanoTimestamp());
     var claimed = (try delivery_outbox.claimNextReady(allocator, now_ns)) orelse return false;
     defer claimed.deinit(allocator);
 
@@ -1420,9 +1421,9 @@ test "dispatcher can enqueue final outbound into durable outbox" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_root);
-    const outbox_path = try std.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
     defer allocator.free(outbox_path);
 
     var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
@@ -1452,9 +1453,9 @@ test "dispatcher falls back to direct send when durable enqueue fails" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_root);
-    const outbox_path = try std.fs.path.join(allocator, &.{ tmp_root, "missing", "delivery.json" });
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "missing", "delivery.json" });
     defer allocator.free(outbox_path);
 
     var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
@@ -1485,9 +1486,9 @@ test "durable outbound worker retries persisted final delivery" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_root);
-    const outbox_path = try std.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
     defer allocator.free(outbox_path);
 
     var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
@@ -1522,9 +1523,9 @@ test "durable outbound worker purges acknowledged persisted delivery without res
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_root = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_root);
-    const outbox_path = try std.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
+    const outbox_path = try std_compat.fs.path.join(allocator, &.{ tmp_root, "delivery.json" });
     defer allocator.free(outbox_path);
 
     var outbox = try channel_outbox.DeliveryOutbox.init(allocator, outbox_path);
@@ -1647,7 +1648,7 @@ test "dispatcher runs in a separate thread" {
     try event_bus.publishOutbound(msg);
 
     // Small delay then close bus to let dispatcher process
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
     event_bus.close();
     thread.join();
 
@@ -1691,7 +1692,7 @@ test "dispatcher concurrent producers + single dispatcher" {
     // Wait for all producers, then close bus
     for (&producers) |*p| p.join();
     // Small delay for dispatcher to drain
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    std_compat.thread.sleep(20 * std.time.ns_per_ms);
     event_bus.close();
     dispatcher.join();
 

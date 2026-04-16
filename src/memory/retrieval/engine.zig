@@ -5,6 +5,7 @@
 //! PrimaryAdapter (wraps Memory.recall), RetrievalEngine.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const root = @import("../root.zig");
@@ -297,7 +298,7 @@ pub const RetrievalEngine = struct {
     pub fn init(allocator: Allocator, query_cfg: config_types.MemoryQueryConfig) RetrievalEngine {
         return .{
             .allocator = allocator,
-            .sources = .{},
+            .sources = .empty,
             .merge_k = query_cfg.rrf_k,
             .top_k = query_cfg.max_results,
             .min_score = query_cfg.min_score,
@@ -492,7 +493,7 @@ pub const RetrievalEngine = struct {
                     // Apply pipeline stages 4-8
                     var merged = result;
                     merged = applyMinRelevance(allocator, merged, self.min_score);
-                    temporal_decay_mod.applyTemporalDecay(merged, self.temporal_decay_cfg, std.time.timestamp());
+                    temporal_decay_mod.applyTemporalDecay(merged, self.temporal_decay_cfg, std_compat.time.timestamp());
 
                     if (self.mmr_cfg.enabled and merged.len > 1) {
                         const reranked = mmr_mod.applyMmr(allocator, merged, self.mmr_cfg, self.top_k) catch merged;
@@ -535,7 +536,7 @@ pub const RetrievalEngine = struct {
         merged = applyMinRelevance(allocator, merged, self.min_score);
 
         // ── Stage 5: temporal_decay ──
-        temporal_decay_mod.applyTemporalDecay(merged, self.temporal_decay_cfg, std.time.timestamp());
+        temporal_decay_mod.applyTemporalDecay(merged, self.temporal_decay_cfg, std_compat.time.timestamp());
 
         // ── Stage 6: MMR diversity reranking ──
         if (self.mmr_cfg.enabled and merged.len > 1) {

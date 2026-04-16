@@ -5,6 +5,7 @@
 //! (system prompt), memory_loader.zig (memory enrichment).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
@@ -338,7 +339,7 @@ pub const Agent = struct {
     /// Cross-thread interrupt flag used to stop in-flight tool loops.
     interrupt_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Tracks currently running tool and effective interruptions for user-facing reporting.
-    tool_state_mu: std.Thread.Mutex = .{},
+    tool_state_mu: std_compat.sync.Mutex = .{},
     active_tool_name: ?[]u8 = null,
     interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Conversation context for the current turn.
@@ -1139,7 +1140,7 @@ pub const Agent = struct {
 
     fn markRouteDegraded(self: *Agent, selection: RouteSelection, err: anyerror) !void {
         if (!self.routeShouldBeDegraded(err)) return;
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
         const reason = try self.routeDegradeReason(err);
         errdefer self.allocator.free(reason);
 
@@ -1196,7 +1197,7 @@ pub const Agent = struct {
 
     fn routeSelectionForTurn(self: *Agent, user_message: []const u8) ?RouteSelection {
         if (self.model_pinned_by_user or self.model_routes.len == 0) return null;
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
 
         if (std.mem.indexOf(u8, user_message, "[IMAGE:") != null and self.hasUsableModelRouteHint("vision", now_ms)) {
             return self.routeSelectionForHint(
@@ -1369,7 +1370,8 @@ pub const Agent = struct {
     pub fn formatModelStatus(self: *const Agent) ![]const u8 {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
 
         try w.print("Current model: {s}\n", .{self.model_name});
         try w.print("Default model: {s}\n", .{self.default_model});
@@ -1471,7 +1473,7 @@ pub const Agent = struct {
             }
         }
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
         if (self.model_routes.len > 0) {
             try w.writeAll("\nAuto routes:");
             for (self.model_routes) |route| {
@@ -1509,6 +1511,7 @@ pub const Agent = struct {
         }
 
         try w.writeAll("\nSwitch: /model <name>");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -1727,7 +1730,7 @@ pub const Agent = struct {
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
             if (self.mem) |mem| {
-                const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                 const save_key = std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch null;
                 if (save_key) |key| {
                     defer self.allocator.free(key);
@@ -1797,7 +1800,7 @@ pub const Agent = struct {
             // Build messages slice for provider (arena-owned; freed at end of iteration)
             const messages = try self.buildProviderMessages(arena, turn_model_name);
 
-            const timer_start = std.time.milliTimestamp();
+            const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
             const include_reasoning = self.reasoning_mode != .off;
@@ -1836,7 +1839,7 @@ pub const Agent = struct {
                     self.stream_callback.?,
                     self.stream_ctx.?,
                 ) catch |err| retry_stream: {
-                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
@@ -1910,7 +1913,7 @@ pub const Agent = struct {
                     self.temperature,
                 ) catch |err| retry_blk: {
                     // Record the failed attempt
-                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+                    const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
                     // Auto-disable vision on first "model does not support vision" error
@@ -1997,7 +2000,7 @@ pub const Agent = struct {
                     }
 
                     // Retry once
-                    std.Thread.sleep(500 * std.time.ns_per_ms);
+                    std_compat.thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
                     self.recordLlmRequestEvent(turn_model_name, messages);
                     self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
@@ -2060,7 +2063,7 @@ pub const Agent = struct {
             }
             self.logLlmResponse(iteration + 1, response_attempt, &response);
 
-            const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
+            const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
 
             const response_text = response.contentOrEmpty();
 
@@ -2218,7 +2221,7 @@ pub const Agent = struct {
                             while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
                             break :blk base_text[0..end];
                         } else base_text;
-                        const ts: u128 = @bitCast(std.time.nanoTimestamp());
+                        const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
                         const save_key = std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch null;
                         if (save_key) |key| {
                             defer self.allocator.free(key);
@@ -2265,7 +2268,7 @@ pub const Agent = struct {
             // so avoid writing arbitrary text that can corrupt the control channel.
             if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
                 var out_buf: [4096]u8 = undefined;
-                var bw = std.fs.File.stdout().writer(&out_buf);
+                var bw = std_compat.fs.File.stdout().writer(&out_buf);
                 const w = &bw.interface;
                 w.print("{s}", .{display_text}) catch {};
                 w.flush() catch {};
@@ -2310,7 +2313,7 @@ pub const Agent = struct {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
 
-                const tool_timer = std.time.milliTimestamp();
+                const tool_timer = std_compat.time.milliTimestamp();
                 const result = blk: {
                     if (cachedToolCallResultInTurn(&seen_tool_call_results, call)) |cached_result| {
                         break :blk ToolExecutionResult{
@@ -2332,7 +2335,7 @@ pub const Agent = struct {
                     rememberToolCallResultInTurn(self.allocator, &seen_tool_call_results, call, executed_result);
                     break :blk executed_result;
                 };
-                const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+                const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
                     log.info(
@@ -2412,7 +2415,7 @@ pub const Agent = struct {
         defer self.allocator.free(summary_messages);
         const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
-        const summary_timer_start = std.time.milliTimestamp();
+        const summary_timer_start = std_compat.time.milliTimestamp();
         self.recordLlmRequestEvent(self.model_name, summary_messages);
         self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, summary_messages, false, false);
         var summary_response = self.provider.chat(
@@ -2430,7 +2433,7 @@ pub const Agent = struct {
             self.model_name,
             self.temperature,
         ) catch |err| {
-            const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - summary_timer_start)));
+            const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
             self.recordLlmFailureEvent(self.model_name, fail_duration, @errorName(err));
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
             const complete_event = ObserverEvent{ .turn_complete = {} };
@@ -2438,7 +2441,7 @@ pub const Agent = struct {
             return fallback;
         };
         self.logLlmResponse(self.max_tool_iterations + 1, 1, &summary_response);
-        const summary_duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - summary_timer_start)));
+        const summary_duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
         const summary_text = summary_response.contentOrEmpty();
         var normalized_summary_usage = summary_response.usage;
         if (normalized_summary_usage.total_tokens == 0 and
@@ -2780,8 +2783,7 @@ pub const Agent = struct {
     }
 
     fn llmRequestObserverDetail(buf: []u8, messages: []const ChatMessage) ?[]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         const max_messages = @min(messages.len, 6);
         for (messages[0..max_messages], 0..) |msg, idx| {
             const preview = previewText(msg.content, 240);
@@ -2804,14 +2806,13 @@ pub const Agent = struct {
         if (messages.len > max_messages) {
             w.print("\n... {d} more messages", .{messages.len - max_messages}) catch {};
         }
-        const written = fbs.getWritten();
+        const written = w.buffered();
         if (written.len == 0) return null;
         return written;
     }
 
     fn llmResponseObserverDetail(buf: []u8, response: *const ChatResponse) ?[]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
 
         const content = response.contentOrEmpty();
         const content_preview = previewText(content, 400);
@@ -2854,7 +2855,7 @@ pub const Agent = struct {
             w.print("\n... {d} more tool calls", .{response.tool_calls.len - max_tool_calls}) catch {};
         }
 
-        const written = fbs.getWritten();
+        const written = w.buffered();
         if (written.len == 0) return null;
         return written;
     }
@@ -2862,23 +2863,23 @@ pub const Agent = struct {
     fn toolArgsObserverDetail(buf: []u8, arguments_json: []const u8) ?[]const u8 {
         const preview = previewText(arguments_json, @min(buf.len, 512));
         if (preview.slice.len == 0) return null;
-        var fbs = std.io.fixedBufferStream(buf);
-        fbs.writer().print("{f}{s}", .{
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("{f}{s}", .{
             std.json.fmt(preview.slice, .{}),
             if (preview.truncated) " [truncated]" else "",
         }) catch return null;
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn toolResultObserverDetail(buf: []u8, output: []const u8) ?[]const u8 {
         const preview = previewText(output, @min(buf.len, 512));
         if (preview.slice.len == 0) return null;
-        var fbs = std.io.fixedBufferStream(buf);
-        fbs.writer().print("{f}{s}", .{
+        var w: std.Io.Writer = .fixed(buf);
+        w.print("{f}{s}", .{
             std.json.fmt(preview.slice, .{}),
             if (preview.truncated) " [truncated]" else "",
         }) catch return null;
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn recordLlmRequestEvent(self: *Agent, model_name: []const u8, messages: []const ChatMessage) void {
@@ -3054,7 +3055,7 @@ pub const Agent = struct {
         const cb = self.usage_record_callback orelse return;
         const ctx = self.usage_record_ctx orelse return;
         cb(ctx, .{
-            .ts = std.time.timestamp(),
+            .ts = std_compat.time.timestamp(),
             .provider = self.effectiveProvider(response),
             .model = self.effectiveModel(response),
             .usage = response.usage,
@@ -3150,7 +3151,7 @@ pub const Agent = struct {
         dirs: *std.ArrayListUnmanaged([]const u8),
         raw_dir: []const u8,
     ) !void {
-        const trimmed = std.mem.trimRight(u8, raw_dir, "/\\");
+        const trimmed = std_compat.mem.trimRight(u8, raw_dir, "/\\");
         if (trimmed.len == 0) return;
 
         if (!containsMultimodalDir(dirs.items, trimmed)) {
@@ -3158,7 +3159,7 @@ pub const Agent = struct {
         }
 
         // Add canonical path variant too (/var <-> /private/var on macOS).
-        const canonical = std.fs.realpathAlloc(arena, trimmed) catch return;
+        const canonical = std_compat.fs.realpathAlloc(arena, trimmed) catch return;
         if (!containsMultimodalDir(dirs.items, canonical)) {
             try dirs.append(arena, canonical);
         }
@@ -3781,15 +3782,15 @@ test "Agent buildProviderMessages allows workspace image paths" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{
         .sub_path = "screen.png",
         .data = "\x89PNG\x0d\x0a\x1a\x0a",
     });
 
     const allocator = std.testing.allocator;
-    const workspace_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    const workspace_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace_path);
-    const image_path = try std.fs.path.join(allocator, &.{ workspace_path, "screen.png" });
+    const image_path = try std_compat.fs.path.join(allocator, &.{ workspace_path, "screen.png" });
     defer allocator.free(image_path);
 
     var dummy: u8 = 0;
@@ -5480,14 +5481,14 @@ test "auto route selection benchmark stays below visible overhead" {
     };
 
     const iterations: usize = 50_000;
-    var timer = try std.time.Timer.start();
+    const start_ns = std_compat.time.nanoTimestamp();
     var i: usize = 0;
     while (i < iterations) : (i += 1) {
         const hint = agent.selectRouteHintForTurn("show current status");
         try std.testing.expect(hint != null);
         try std.testing.expectEqualStrings("fast", hint.?);
     }
-    const elapsed_ns = timer.read();
+    const elapsed_ns: u64 = @intCast(std_compat.time.nanoTimestamp() - start_ns);
     const avg_ns = elapsed_ns / iterations;
 
     // Heuristic routing should stay far below human-visible latency.
@@ -6058,9 +6059,9 @@ test "hard stop mock interruption lists exactly interrupted tool" {
     const InterruptWorker = struct {
         fn run(ctx: *InterruptCtx) void {
             while (!ctx.started.load(.acquire)) {
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                std_compat.thread.sleep(10 * std.time.ns_per_ms);
             }
-            std.Thread.sleep(80 * std.time.ns_per_ms);
+            std_compat.thread.sleep(80 * std.time.ns_per_ms);
             ctx.agent.requestInterrupt();
         }
     };
@@ -6374,12 +6375,12 @@ test "turn refreshes system prompt after workspace markdown change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{});
         defer f.close();
         try f.writeAll("SOUL-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6420,7 +6421,7 @@ test "turn refreshes system prompt after workspace markdown change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("SOUL.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("SOUL-V2-UPDATED");
     }
@@ -6465,12 +6466,12 @@ test "turn refreshes system prompt after TOOLS.md change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("TOOLS.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("TOOLS.md", .{});
         defer f.close();
         try f.writeAll("TOOLS-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6511,7 +6512,7 @@ test "turn refreshes system prompt after TOOLS.md change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "TOOLS-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("TOOLS.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("TOOLS.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("TOOLS-V2-UPDATED");
     }
@@ -6556,12 +6557,12 @@ test "turn refreshes system prompt after USER.md change" {
     defer tmp.cleanup();
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{});
         defer f.close();
         try f.writeAll("- **Name:** USER-V1");
     }
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6602,7 +6603,7 @@ test "turn refreshes system prompt after USER.md change" {
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "USER-V1") != null);
 
     {
-        const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("USER.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("- **Name:** USER-V2-UPDATED");
     }
@@ -6646,7 +6647,7 @@ test "turn refreshes system prompt when conversation sender changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(workspace);
 
     var provider_state: u8 = 0;
@@ -6841,9 +6842,9 @@ test "direct slash skill command resolves hyphenated skill name" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6855,14 +6856,14 @@ test "direct slash skill command resolves hyphenated skill name" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news-digest latest ai news")).?;
@@ -6877,9 +6878,9 @@ test "direct slash skill command resolves two-word alias to hyphenated skill" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6891,14 +6892,14 @@ test "direct slash skill command resolves two-word alias to hyphenated skill" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
@@ -6913,9 +6914,9 @@ test "direct slash skill command does not collapse token boundaries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6927,14 +6928,14 @@ test "direct slash skill command does not collapse token boundaries" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = try agent.handleSlashCommand("/newsdigest latest ai news");
@@ -6946,10 +6947,10 @@ test "direct slash skill command reports ambiguous normalized alias" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news-digest");
-    try tmp.dir.makePath("skills/news_ digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news_ digest");
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6961,12 +6962,12 @@ test "direct slash skill command reports ambiguous normalized alias" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect news and format digest.");
     }
     {
-        const f = try tmp.dir.createFile("skills/news_ digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news_ digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -6978,14 +6979,14 @@ test "direct slash skill command reports ambiguous normalized alias" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news_ digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news_ digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Collect other news and format digest.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
@@ -6999,9 +7000,9 @@ test "direct slash skill command does not shadow built in doctor" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/doctor");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/doctor");
     {
-        const f = try tmp.dir.createFile("skills/doctor/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/doctor/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -7013,14 +7014,14 @@ test "direct slash skill command does not shadow built in doctor" {
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/doctor/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/doctor/SKILL.md", .{});
         defer f.close();
         try f.writeAll("This should not shadow /doctor.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/doctor")).?;
@@ -7035,10 +7036,10 @@ test "direct slash skill command reports ambiguity between exact and composite m
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makePath("skills/news");
-    try tmp.dir.makePath("skills/news-digest");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/news-digest");
     {
-        const f = try tmp.dir.createFile("skills/news/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -7050,12 +7051,12 @@ test "direct slash skill command reports ambiguity between exact and composite m
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news/SKILL.md", .{});
         defer f.close();
         try f.writeAll("General news skill body.");
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/skill.json", .{});
         defer f.close();
         try f.writeAll(
             \\{
@@ -7067,14 +7068,14 @@ test "direct slash skill command reports ambiguity between exact and composite m
         );
     }
     {
-        const f = try tmp.dir.createFile("skills/news-digest/SKILL.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/news-digest/SKILL.md", .{});
         defer f.close();
         try f.writeAll("Digest skill body.");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     const response = (try agent.handleSlashCommand("/news digest latest ai news")).?;
@@ -7087,16 +7088,16 @@ test "slash /skill reload invalidates prompt caches" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath("skills/broken");
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("skills/broken");
     {
-        const f = try tmp.dir.createFile("skills/broken/skill.json", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("skills/broken/skill.json", .{});
         defer f.close();
         try f.writeAll("{ invalid json");
     }
 
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
-    agent.workspace_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    agent.workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(agent.workspace_dir);
 
     agent.has_system_prompt = true;
@@ -7245,8 +7246,8 @@ test "turn passes auto-routed model to provider" {
 // Simulate by verifying the @max(0, ...) clamping logic.
 test "milliTimestamp negative difference clamps to zero" {
     // Simulate: timer_start is in the future relative to "now" (negative diff)
-    const timer_start = std.time.milliTimestamp() + 10_000;
-    const diff = std.time.milliTimestamp() - timer_start;
+    const timer_start = std_compat.time.milliTimestamp() + 10_000;
+    const diff = std_compat.time.milliTimestamp() - timer_start;
     // diff < 0 here; @max(0, diff) must clamp to 0 without panic
     const clamped = @max(0, diff);
     const duration: u64 = @as(u64, @intCast(clamped));
@@ -9286,19 +9287,19 @@ test "execBlockMessage allows all commands when exec_security=full" {
     agent.exec_ask = .off;
 
     // Even high-risk commands should not be blocked by execBlockMessage
-    var args1 = std.json.ObjectMap.init(allocator);
-    defer args1.deinit();
-    try args1.put("command", .{ .string = "rm -rf /tmp/test" });
+    var args1: std.json.ObjectMap = .empty;
+    defer args1.deinit(allocator);
+    try args1.put(allocator, "command", .{ .string = "rm -rf /tmp/test" });
     try std.testing.expect(agent.execBlockMessage(args1) == null);
 
-    var args2 = std.json.ObjectMap.init(allocator);
-    defer args2.deinit();
-    try args2.put("command", .{ .string = "curl https://example.com" });
+    var args2: std.json.ObjectMap = .empty;
+    defer args2.deinit(allocator);
+    try args2.put(allocator, "command", .{ .string = "curl https://example.com" });
     try std.testing.expect(agent.execBlockMessage(args2) == null);
 
-    var args3 = std.json.ObjectMap.init(allocator);
-    defer args3.deinit();
-    try args3.put("command", .{ .string = "ls -la" });
+    var args3: std.json.ObjectMap = .empty;
+    defer args3.deinit(allocator);
+    try args3.put(allocator, "command", .{ .string = "ls -la" });
     try std.testing.expect(agent.execBlockMessage(args3) == null);
 }
 
@@ -9323,15 +9324,15 @@ test "execBlockMessage checks allowlist when exec_security=allowlist" {
     agent.policy = &policy;
 
     // Allowed command passes
-    var args1 = std.json.ObjectMap.init(allocator);
-    defer args1.deinit();
-    try args1.put("command", .{ .string = "ls -la" });
+    var args1: std.json.ObjectMap = .empty;
+    defer args1.deinit(allocator);
+    try args1.put(allocator, "command", .{ .string = "ls -la" });
     try std.testing.expect(agent.execBlockMessage(args1) == null);
 
     // Disallowed command is blocked
-    var args2 = std.json.ObjectMap.init(allocator);
-    defer args2.deinit();
-    try args2.put("command", .{ .string = "curl https://example.com" });
+    var args2: std.json.ObjectMap = .empty;
+    defer args2.deinit(allocator);
+    try args2.put(allocator, "command", .{ .string = "curl https://example.com" });
     try std.testing.expect(agent.execBlockMessage(args2) != null);
 }
 
@@ -9369,9 +9370,9 @@ test "execBlockMessage allowlist mode honors wildcard allowed_commands" {
 
     // Command outside default allowlist should pass with wildcard policy.
     agent.policy = &open_policy;
-    var args = std.json.ObjectMap.init(allocator);
-    defer args.deinit();
-    try args.put("command", .{ .string = "python3 script.py" });
+    var args: std.json.ObjectMap = .empty;
+    defer args.deinit(allocator);
+    try args.put(allocator, "command", .{ .string = "python3 script.py" });
     try std.testing.expect(agent.execBlockMessage(args) == null);
 
     // Same command should be blocked under restrictive allowlist.

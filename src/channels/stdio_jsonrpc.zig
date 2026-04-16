@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const json_util = @import("../json_util.zig");
 
 const log = std.log.scoped(.stdio_jsonrpc);
@@ -21,7 +22,7 @@ pub const NotificationHandler = *const fn (ctx: *anyopaque, method: []const u8, 
 
 pub const StdioJsonRpc = struct {
     allocator: std.mem.Allocator,
-    child: ?std.process.Child = null,
+    child: ?std_compat.process.Child = null,
     reader_thread: ?std.Thread = null,
     notification_thread: ?std.Thread = null,
     reader_alive: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -33,8 +34,8 @@ pub const StdioJsonRpc = struct {
     const Self = @This();
 
     const RequestState = struct {
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        mutex: std_compat.sync.Mutex = .{},
+        cond: std_compat.sync.Condition = .{},
         next_id: u32 = 1,
         pending_id: ?u32 = null,
         response_line: ?[]u8 = null,
@@ -42,8 +43,8 @@ pub const StdioJsonRpc = struct {
     };
 
     const NotificationState = struct {
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        mutex: std_compat.sync.Mutex = .{},
+        cond: std_compat.sync.Condition = .{},
         queue: std.ArrayListUnmanaged([]u8) = .empty,
         closed: bool = false,
     };
@@ -75,13 +76,13 @@ pub const StdioJsonRpc = struct {
             try argv.append(self.allocator, arg);
         }
 
-        var child = std.process.Child.init(argv.items, self.allocator);
+        var child = std_compat.process.Child.init(argv.items, self.allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit;
 
         if (process_config.env.len > 0) {
-            var env = std.process.EnvMap.init(self.allocator);
+            var env = std_compat.process.EnvMap.init(self.allocator);
             defer env.deinit();
 
             const inherit_vars = [_][]const u8{
@@ -91,7 +92,7 @@ pub const StdioJsonRpc = struct {
                 "SYSTEMROOT",  "COMSPEC", "PROGRAMFILES", "WINDIR",
             };
             for (&inherit_vars) |key| {
-                if (std.process.getEnvVarOwned(self.allocator, key)) |value| {
+                if (std_compat.process.getEnvVarOwned(self.allocator, key)) |value| {
                     defer self.allocator.free(value);
                     try env.put(key, value);
                 } else |_| {}
@@ -190,7 +191,7 @@ pub const StdioJsonRpc = struct {
             return err;
         };
 
-        const deadline_ns: i128 = std.time.nanoTimestamp() +
+        const deadline_ns: i128 = std_compat.time.nanoTimestamp() +
             (@as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms);
         self.request_state.mutex.lock();
         defer self.request_state.mutex.unlock();
@@ -200,14 +201,9 @@ pub const StdioJsonRpc = struct {
                 self.request_state.pending_id = null;
                 return Error.RequestTimeout;
             }
-            self.request_state.cond.timedWait(&self.request_state.mutex, remaining_ns) catch |err| switch (err) {
-                error.Timeout => {
-                    if (!self.request_state.closed and self.request_state.pending_id != null and self.request_state.response_line == null) {
-                        self.request_state.pending_id = null;
-                        return Error.RequestTimeout;
-                    }
-                },
-            };
+            self.request_state.mutex.unlock();
+            std_compat.thread.sleep(@intCast(@min(remaining_ns, 10 * std.time.ns_per_ms)));
+            self.request_state.mutex.lock();
         }
         if (self.request_state.response_line) |line| {
             self.request_state.response_line = null;
@@ -283,7 +279,7 @@ pub const StdioJsonRpc = struct {
         self.notification_state.cond.broadcast();
     }
 
-    fn readerThreadMain(self: *Self, stdout_file: std.fs.File) void {
+    fn readerThreadMain(self: *Self, stdout_file: std_compat.fs.File) void {
         var stdout = stdout_file;
         self.reader_alive.store(true, .release);
         defer {
@@ -440,7 +436,7 @@ pub const StdioJsonRpc = struct {
     }
 };
 
-fn readJsonRpcLine(allocator: std.mem.Allocator, file: *std.fs.File) ![]u8 {
+fn readJsonRpcLine(allocator: std.mem.Allocator, file: *std_compat.fs.File) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -464,7 +460,9 @@ fn buildJsonRpcRequest(allocator: std.mem.Allocator, request_id: u32, method: []
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    const writer = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    defer buf = buf_writer.toArrayList();
+    const writer = &buf_writer.writer;
     try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try writer.print("{d}", .{request_id});
     try writer.writeAll(",\"method\":");
@@ -477,7 +475,7 @@ fn buildJsonRpcRequest(allocator: std.mem.Allocator, request_id: u32, method: []
 }
 
 fn remainingRequestTimeoutNs(deadline_ns: i128) u64 {
-    const remaining_ns = deadline_ns - std.time.nanoTimestamp();
+    const remaining_ns = deadline_ns - std_compat.time.nanoTimestamp();
     if (remaining_ns <= 0) return 0;
     return @intCast(remaining_ns);
 }

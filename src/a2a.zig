@@ -8,6 +8,7 @@
 //! Task state machine: submitted -> working -> completed | failed | canceled | rejected | input-required | auth-required
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
 const gateway = @import("gateway.zig");
@@ -125,7 +126,7 @@ fn sortTaskSnapshotsByRecency(tasks: []TaskSnapshot) void {
 
 pub const TaskRegistry = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     tasks: std.StringHashMapUnmanaged(*TaskRecord) = .empty,
     next_id: u64 = 1,
 
@@ -177,7 +178,7 @@ pub const TaskRegistry = struct {
         const empty_agent = try self.allocator.dupe(u8, "");
         errdefer self.allocator.free(empty_agent);
 
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
 
         const task = try self.allocator.create(TaskRecord);
         errdefer self.allocator.destroy(task);
@@ -222,7 +223,7 @@ pub const TaskRegistry = struct {
         const task = self.tasks.get(task_id) orelse return false;
         if (isTerminalState(task.state) and task.state != new_state) return false;
         task.state = new_state;
-        task.updated_at = std.time.timestamp();
+        task.updated_at = std_compat.time.timestamp();
         return true;
     }
 
@@ -249,7 +250,7 @@ pub const TaskRegistry = struct {
         }
 
         task.state = final_state;
-        task.updated_at = std.time.timestamp();
+        task.updated_at = std_compat.time.timestamp();
         return try self.snapshotLocked(allocator, task);
     }
 
@@ -260,7 +261,7 @@ pub const TaskRegistry = struct {
         const task = self.tasks.get(task_id) orelse return null;
         if (!isTerminalState(task.state)) {
             task.state = .canceled;
-            task.updated_at = std.time.timestamp();
+            task.updated_at = std_compat.time.timestamp();
         }
         return try self.snapshotLocked(allocator, task);
     }
@@ -391,7 +392,8 @@ pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config, vision_
     const endpoint_url = buildEndpointUrl(allocator, cfg.a2a.url) catch return errorResponse();
     defer allocator.free(endpoint_url);
 
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     w.writeAll("{\"name\":\"") catch return errorResponse();
     gateway.jsonEscapeInto(w, cfg.a2a.name) catch return errorResponse();
     w.writeAll("\",\"description\":\"") catch return errorResponse();
@@ -430,6 +432,7 @@ pub fn handleAgentCard(allocator: std.mem.Allocator, cfg: *const Config, vision_
     w.writeAll(",\"skills\":[{\"id\":\"chat\",\"name\":\"General Chat\",\"description\":\"General-purpose AI assistant\",\"tags\":[\"chat\",\"general\"]}]") catch return errorResponse();
     w.writeAll("}") catch return errorResponse();
 
+    buf = buf_writer.toArrayList();
     const body = buf.toOwnedSlice(allocator) catch return errorResponse();
     return .{ .body = body };
 }
@@ -497,7 +500,7 @@ pub fn isStreamingMethod(body: []const u8) bool {
 
 /// SSE Sink context — writes JSON-RPC SSE events to a raw TCP stream.
 pub const SseStreamCtx = struct {
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     allocator: std.mem.Allocator,
     request_id: []const u8,
     task_id: []const u8,
@@ -544,7 +547,7 @@ pub const SseStreamCtx = struct {
 pub fn handleStreamingRpc(
     allocator: std.mem.Allocator,
     body: []const u8,
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     registry: *TaskRegistry,
     session_mgr: anytype,
 ) void {
@@ -646,7 +649,7 @@ pub fn handleStreamingRpc(
 fn handleResubscribeStreaming(
     allocator: std.mem.Allocator,
     body: []const u8,
-    stream: *std.net.Stream,
+    stream: *std_compat.net.Stream,
     request_id: []const u8,
     registry: *TaskRegistry,
 ) void {
@@ -684,7 +687,7 @@ fn writeSseErrorEvent(allocator: std.mem.Allocator, sse_ctx: *SseStreamCtx, code
 }
 
 /// Write SSE headers and a single error event for pre-streaming failures.
-fn writeSseError(allocator: std.mem.Allocator, stream: *std.net.Stream, request_id: []const u8, code: i32, message: []const u8) void {
+fn writeSseError(allocator: std.mem.Allocator, stream: *std_compat.net.Stream, request_id: []const u8, code: i32, message: []const u8) void {
     stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n") catch return;
     const err_json = buildJsonRpcError(allocator, request_id, code, message) catch return;
     defer allocator.free(err_json);
@@ -946,7 +949,8 @@ fn handleListTasks(
     // Build result JSON: {"tasks":[...], "nextPageToken":"", "pageSize":N, "totalSize":N}
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     w.writeAll("{\"tasks\":[") catch return errorResponse();
     for (tasks, 0..) |*task, i| {
@@ -956,11 +960,12 @@ fn handleListTasks(
         w.writeAll(task_json) catch return errorResponse();
     }
     w.writeAll("],\"nextPageToken\":\"\",\"pageSize\":") catch return errorResponse();
-    std.fmt.format(w, "{d}", .{page_size}) catch return errorResponse();
+    w.print("{d}", .{page_size}) catch return errorResponse();
     w.writeAll(",\"totalSize\":") catch return errorResponse();
-    std.fmt.format(w, "{d}", .{registry.taskCount()}) catch return errorResponse();
+    w.print("{d}", .{registry.taskCount()}) catch return errorResponse();
     w.writeByte('}') catch return errorResponse();
 
+    buf = buf_writer.toArrayList();
     const list_json = buf.toOwnedSlice(allocator) catch return errorResponse();
     defer allocator.free(list_json);
 
@@ -975,7 +980,8 @@ fn handleListTasks(
 fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, result_json: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
@@ -983,6 +989,7 @@ fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, resu
     try w.writeAll(result_json);
     try w.writeByte('}');
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -990,23 +997,26 @@ fn buildJsonRpcResult(allocator: std.mem.Allocator, request_id: []const u8, resu
 fn buildJsonRpcError(allocator: std.mem.Allocator, request_id: []const u8, code: i32, message: []const u8) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
     try w.writeAll(",\"error\":{\"code\":");
-    try std.fmt.format(w, "{d}", .{code});
+    try w.print("{d}", .{code});
     try w.writeAll(",\"message\":\"");
     try gateway.jsonEscapeInto(w, message);
     try w.writeAll("\"}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
 fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot, max_history: ?i64) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     // Format timestamp as ISO 8601 from unix epoch seconds.
     var ts_buf: [32]u8 = undefined;
@@ -1068,6 +1078,7 @@ fn buildTaskJson(allocator: std.mem.Allocator, task: *const TaskSnapshot, max_hi
 
     try w.writeByte('}');
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1324,7 +1335,7 @@ fn extractMessageContent(allocator: std.mem.Allocator, body: []const u8) !?[]u8 
     const message = extractObjectObjectField(params, "message") orelse return null;
     const parts_json = extractObjectArrayField(message, "parts") orelse return null;
 
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     errdefer buf.deinit(allocator);
 
     // Walk every element of the parts array.
@@ -1480,7 +1491,8 @@ fn buildArtifactUpdateEvent(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try w.writeAll(request_id);
@@ -1496,6 +1508,7 @@ fn buildArtifactUpdateEvent(
     try w.writeAll(if (last_chunk) "true" else "false");
     try w.writeAll("}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -1510,7 +1523,8 @@ fn buildStatusUpdateEvent(
 ) ![]u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
     var ts_buf: [32]u8 = undefined;
     const timestamp = formatTimestamp(&ts_buf, updated_at);
 
@@ -1528,6 +1542,7 @@ fn buildStatusUpdateEvent(
     try w.writeAll(if (final) "true" else "false");
     try w.writeAll("}}");
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 

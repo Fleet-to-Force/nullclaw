@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const probe = @import("probe.zig");
 const Sandbox = @import("sandbox.zig").Sandbox;
 
 /// Bubblewrap (bwrap) sandbox backend.
@@ -69,30 +70,14 @@ pub const BubblewrapSandbox = struct {
         return buf[0 .. prefix_len + argv.len];
     }
 
-    fn isAvailable(_: *anyopaque) bool {
+    fn isAvailable(ptr: *anyopaque) bool {
         if (comptime builtin.os.tag != .linux) return false;
-        return probeCommand(&.{
-            "bwrap",
-            "--ro-bind",
-            "/usr",
-            "/usr",
-            "--ro-bind-try",
-            "/bin",
-            "/bin",
-            "--ro-bind-try",
-            "/lib",
-            "/lib",
-            "--ro-bind-try",
-            "/lib64",
-            "/lib64",
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "/bin/sh",
-            "-c",
-            "exit 0",
-        });
+        const smoke_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
+        var wrapped_argv: [32][]const u8 = undefined;
+        // Probe the same wrapper argv we execute later so auto-detect does not
+        // advertise bubblewrap when the host cannot actually sandbox a command.
+        const argv = wrapCommand(ptr, &smoke_argv, &wrapped_argv) catch return false;
+        return probe.runQuietCommand(argv);
     }
 
     fn getName(_: *anyopaque) []const u8 {
@@ -101,19 +86,6 @@ pub const BubblewrapSandbox = struct {
 
     fn getDescription(_: *anyopaque) []const u8 {
         return "User namespace sandbox (requires bwrap)";
-    }
-
-    fn probeCommand(argv: []const []const u8) bool {
-        var child = std.process.Child.init(argv, std.heap.page_allocator);
-        child.stderr_behavior = .Ignore;
-        child.stdout_behavior = .Ignore;
-        child.stdin_behavior = .Ignore;
-        child.spawn() catch return false;
-        const term = child.wait() catch return false;
-        return switch (term) {
-            .Exited => |code| code == 0,
-            else => false,
-        };
     }
 };
 
@@ -247,10 +219,4 @@ test "bubblewrap sandbox availability requires executable in PATH" {
     defer std.testing.allocator.free(empty_z);
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, empty_z.ptr, 1));
     try std.testing.expect(!sb.isAvailable());
-}
-
-test "bubblewrap probeCommand reports child exit status" {
-    if (comptime builtin.os.tag != .linux) return;
-    try std.testing.expect(BubblewrapSandbox.probeCommand(&.{ "/bin/sh", "-c", "exit 0" }));
-    try std.testing.expect(!BubblewrapSandbox.probeCommand(&.{ "/bin/sh", "-c", "exit 9" }));
 }

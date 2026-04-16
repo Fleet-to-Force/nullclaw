@@ -4,6 +4,7 @@
 //! Uses curl to avoid Zig 0.15 std.http.Client segfaults.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
 
@@ -45,7 +46,7 @@ pub fn currentThreadInterruptFlag() ?*const AtomicBool {
 }
 
 const CancelWatcherCtx = struct {
-    child: *std.process.Child,
+    child: *std_compat.process.Child,
     cancel_flag: *const AtomicBool,
     done: *AtomicBool,
 };
@@ -54,13 +55,13 @@ fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
     while (!ctx.done.load(.acquire)) {
         if (ctx.cancel_flag.load(.acquire)) {
             if (comptime @import("builtin").os.tag == .windows) {
-                std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
+                _ = ctx.child.kill() catch {};
             } else {
                 std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
             }
             break;
         }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+        std_compat.thread.sleep(20 * std.time.ns_per_ms);
     }
 }
 
@@ -179,7 +180,7 @@ fn curlRequestWithProxy(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -226,7 +227,7 @@ fn curlRequestWithProxy(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logCurlExitFailure(method, code);
             allocator.free(stdout);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
@@ -325,7 +326,7 @@ pub fn curlPostWithStatusAndTimeout(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -372,7 +373,7 @@ pub fn curlPostWithStatusAndTimeout(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logCurlExitFailure("POST", code);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
@@ -452,7 +453,7 @@ pub fn curlPostWithStatusHeadersAndTimeout(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -499,7 +500,7 @@ pub fn curlPostWithStatusHeadersAndTimeout(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+        .exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
     }
 
@@ -572,7 +573,7 @@ pub fn curlGetWithStatusAndTimeout(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -602,7 +603,7 @@ pub fn curlGetWithStatusAndTimeout(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logCurlExitFailure("GET", code);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
@@ -687,7 +688,7 @@ fn curlGetWithProxyAndResolve(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -716,7 +717,7 @@ fn curlGetWithProxyAndResolve(
         return error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             logCurlExitFailure("GET", code);
             allocator.free(stdout);
             return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
@@ -778,7 +779,7 @@ pub fn curlGetMaxBytes(
 /// Returns null if no proxy is set.
 /// Caller owns returned memory.
 var proxy_override_value: ?[]u8 = null;
-var proxy_override_mutex: std.Thread.Mutex = .{};
+var proxy_override_mutex: std_compat.sync.Mutex = .{};
 
 pub const ProxyOverrideError = error{OutOfMemory};
 
@@ -817,7 +818,7 @@ pub fn getProxyFromEnv(allocator: Allocator) !?[]const u8 {
 
     const env_vars = [_][]const u8{ "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY" };
     for (env_vars) |var_name| {
-        if (std.process.getEnvVarOwned(allocator, var_name)) |val| {
+        if (std_compat.process.getEnvVarOwned(allocator, var_name)) |val| {
             errdefer allocator.free(val);
             const out = try normalizeProxyEnvValue(allocator, val);
             allocator.free(val);
@@ -856,7 +857,7 @@ pub fn curlGetSSE(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -890,7 +891,7 @@ pub fn curlGetSSE(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) {
                 // Exit code 28 = timeout. This is expected for SSE when no data arrives,
                 // but curl may have received some data before timing out - return it.

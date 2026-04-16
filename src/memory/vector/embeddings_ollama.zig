@@ -5,6 +5,7 @@
 //! Default model: "nomic-embed-text", 768 dimensions (model-dependent)
 
 const std = @import("std");
+const std_compat = @import("compat");
 const EmbeddingProvider = @import("embeddings.zig").EmbeddingProvider;
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const net_security = @import("../../net_security.zig");
@@ -106,7 +107,7 @@ pub const OllamaEmbedding = struct {
         const url = try self_.buildUrl(allocator);
         defer allocator.free(url);
 
-        var client = std.http.Client{ .allocator = allocator };
+        var client = std.http.Client{ .allocator = allocator, .io = std_compat.io() };
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(allocator);

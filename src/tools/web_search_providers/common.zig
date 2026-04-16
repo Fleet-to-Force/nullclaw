@@ -162,15 +162,15 @@ pub fn formatResultEntries(allocator: std.mem.Allocator, query: []const u8, entr
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    try std.fmt.format(buf.writer(allocator), "Results for: {s}\n\n", .{query});
+    try buf.print(allocator, "Results for: {s}\n\n", .{query});
 
     for (entries, 0..) |entry, i| {
         const title = if (entry.title.len > 0) entry.title else "(no title)";
         const url = if (entry.url.len > 0) entry.url else "(no url)";
 
-        try std.fmt.format(buf.writer(allocator), "{d}. {s}\n   {s}\n", .{ i + 1, title, url });
+        try buf.print(allocator, "{d}. {s}\n   {s}\n", .{ i + 1, title, url });
         if (entry.description.len > 0) {
-            try std.fmt.format(buf.writer(allocator), "   {s}\n", .{entry.description});
+            try buf.print(allocator, "   {s}\n", .{entry.description});
         }
         try buf.append(allocator, '\n');
     }
@@ -188,7 +188,7 @@ pub fn formatResultsArray(
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
-    try std.fmt.format(buf.writer(allocator), "Results for: {s}\n\n", .{query});
+    try buf.print(allocator, "Results for: {s}\n\n", .{query});
 
     var out_idx: usize = 0;
     for (items) |item| {
@@ -209,9 +209,9 @@ pub fn formatResultsArray(
         };
 
         out_idx += 1;
-        try std.fmt.format(buf.writer(allocator), "{d}. {s}\n   {s}\n", .{ out_idx, title, url });
+        try buf.print(allocator, "{d}. {s}\n   {s}\n", .{ out_idx, title, url });
         if (desc.len > 0) {
-            try std.fmt.format(buf.writer(allocator), "   {s}\n", .{desc});
+            try buf.print(allocator, "   {s}\n", .{desc});
         }
         try buf.append(allocator, '\n');
     }

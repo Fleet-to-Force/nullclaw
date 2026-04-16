@@ -1,4 +1,6 @@
 const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus_mod = @import("../bus.zig");
@@ -51,7 +53,7 @@ pub const TeamsChannel = struct {
     // Placeholder activity ID cache: maps recipient target → activityId for pending placeholders.
     // Guarded by placeholder_mutex for thread safety (startTyping and vtableSend may run on different threads).
     placeholder_entries: [MAX_PLACEHOLDER_ENTRIES]?PlaceholderEntry = .{null} ** MAX_PLACEHOLDER_ENTRIES,
-    placeholder_mutex: std.Thread.Mutex = .{},
+    placeholder_mutex: std_compat.sync.Mutex = .{},
 
     pub const MAX_PLACEHOLDER_ENTRIES = 16;
     pub const PlaceholderEntry = struct {
@@ -81,14 +83,16 @@ pub const TeamsChannel = struct {
     pub fn acquireToken(self: *TeamsChannel) !void {
         // Build token URL: https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("https://login.microsoftonline.com/{s}/oauth2/v2.0/token", .{self.tenant_id});
-        const token_url = url_fbs.getWritten();
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
+        try url_writer.print("https://login.microsoftonline.com/{s}/oauth2/v2.0/token", .{self.tenant_id});
+        const token_url = url_writer.buffered();
 
         // Build form body with URL-encoded values
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const bw = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const bw = &body_writer.writer;
         try bw.writeAll("grant_type=client_credentials&client_id=");
         try writeUrlEncoded(bw, self.client_id);
         try bw.writeAll("&client_secret=");
@@ -138,14 +142,14 @@ pub const TeamsChannel = struct {
 
         // Cache new token
         self.cached_token = try self.allocator.dupe(u8, token_val.string);
-        self.token_expiry = std.time.timestamp() + expires_in;
+        self.token_expiry = std_compat.time.timestamp() + expires_in;
 
         log.info("Teams OAuth2 token acquired, expires in {d}s", .{expires_in});
     }
 
     /// Get a valid token, refreshing if necessary.
     fn getToken(self: *TeamsChannel) ![]const u8 {
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         if (self.cached_token) |token| {
             if (now < self.token_expiry - TOKEN_BUFFER_SECS) {
                 return token;
@@ -164,28 +168,30 @@ pub const TeamsChannel = struct {
 
         // Build URL: {serviceUrl}/v3/conversations/{conversationId}/activities
         var url_buf: [512]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
         // Strip trailing slash from service_url if present
         const svc = if (service_url.len > 0 and service_url[service_url.len - 1] == '/')
             service_url[0 .. service_url.len - 1]
         else
             service_url;
-        try url_fbs.writer().print("{s}/v3/conversations/{s}/activities", .{ svc, conversation_id });
-        const url = url_fbs.getWritten();
+        try url_writer.print("{s}/v3/conversations/{s}/activities", .{ svc, conversation_id });
+        const url = url_writer.buffered();
 
         // Build JSON body: {"type":"message","text":"..."}
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const bw = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const bw = &body_writer.writer;
         try bw.writeAll("{\"type\":\"message\",\"text\":");
         try root.appendJsonStringW(bw, text);
         try bw.writeByte('}');
 
         // Build auth header
         var auth_buf: [2048]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bearer {s}", .{token});
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bearer {s}", .{token});
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
             log.err("Teams Bot Framework POST failed: {}", .{err});
@@ -220,27 +226,29 @@ pub const TeamsChannel = struct {
 
         // Build URL: {serviceUrl}/v3/conversations/{conversationId}/activities/{activityId}
         var url_buf: [512]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
         const svc = if (service_url.len > 0 and service_url[service_url.len - 1] == '/')
             service_url[0 .. service_url.len - 1]
         else
             service_url;
-        try url_fbs.writer().print("{s}/v3/conversations/{s}/activities/{s}", .{ svc, conversation_id, activity_id });
-        const url = url_fbs.getWritten();
+        try url_writer.print("{s}/v3/conversations/{s}/activities/{s}", .{ svc, conversation_id, activity_id });
+        const url = url_writer.buffered();
 
         // Build JSON body
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const bw = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const bw = &body_writer.writer;
         try bw.writeAll("{\"type\":\"message\",\"text\":");
         try root.appendJsonStringW(bw, text);
         try bw.writeByte('}');
 
         // Build auth header
         var auth_buf: [2048]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bearer {s}", .{token});
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bearer {s}", .{token});
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPut(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
             log.err("Teams Bot Framework PUT (update) failed: {}", .{err});
@@ -267,20 +275,22 @@ pub const TeamsChannel = struct {
         const conversation_id = self.conv_ref_conversation_id orelse return;
 
         var path_buf: [512]u8 = undefined;
-        var path_fbs = std.io.fixedBufferStream(&path_buf);
-        try path_fbs.writer().print("{s}/teams_conversation_ref.json", .{config_dir});
-        const path = path_fbs.getWritten();
+        var path_writer: std.Io.Writer = .fixed(&path_buf);
+        try path_writer.print("{s}/teams_conversation_ref.json", .{config_dir});
+        const path = path_writer.buffered();
 
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const bw = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const bw = &body_writer.writer;
         try bw.writeAll("{\"serviceUrl\":");
         try root.appendJsonStringW(bw, service_url);
         try bw.writeAll(",\"conversationId\":");
         try root.appendJsonStringW(bw, conversation_id);
         try bw.writeByte('}');
 
-        const file = try std.fs.cwd().createFile(path, .{});
+        const file = try fs_compat.createPath(path, .{});
         defer file.close();
         try file.writeAll(body_list.items);
 
@@ -290,11 +300,11 @@ pub const TeamsChannel = struct {
     /// Load conversation reference from JSON file.
     pub fn loadConversationRef(self: *TeamsChannel, config_dir: []const u8) !void {
         var path_buf: [512]u8 = undefined;
-        var path_fbs = std.io.fixedBufferStream(&path_buf);
-        try path_fbs.writer().print("{s}/teams_conversation_ref.json", .{config_dir});
-        const path = path_fbs.getWritten();
+        var path_writer: std.Io.Writer = .fixed(&path_buf);
+        try path_writer.print("{s}/teams_conversation_ref.json", .{config_dir});
+        const path = path_writer.buffered();
 
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        const file = fs_compat.openPath(path, .{}) catch |err| {
             if (err == error.FileNotFound) {
                 log.debug("No Teams conversation reference file found", .{});
                 return;
@@ -433,19 +443,19 @@ pub const TeamsChannel = struct {
 
         // Build URL: {serviceUrl}/v3/conversations/{conversationId}/activities
         var url_buf: [512]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
         const svc = if (service_url.len > 0 and service_url[service_url.len - 1] == '/')
             service_url[0 .. service_url.len - 1]
         else
             service_url;
-        url_fbs.writer().print("{s}/v3/conversations/{s}/activities", .{ svc, conversation_id }) catch return;
-        const url = url_fbs.getWritten();
+        url_writer.print("{s}/v3/conversations/{s}/activities", .{ svc, conversation_id }) catch return;
+        const url = url_writer.buffered();
 
         // Build auth header
         var auth_buf: [2048]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        auth_fbs.writer().print("Authorization: Bearer {s}", .{token}) catch return;
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        auth_writer.print("Authorization: Bearer {s}", .{token}) catch return;
+        const auth_header = auth_writer.buffered();
 
         // Send typing indicator
         const resp = root.http_util.curlPost(self.allocator, url, "{\"type\":\"typing\"}", &.{auth_header}) catch |err| {
@@ -536,7 +546,7 @@ pub const TeamsChannel = struct {
 
         // Strip <nc_choices>...</nc_choices> tags — Teams doesn't render interactive choices.
         const clean = if (std.mem.indexOf(u8, message, "<nc_choices>")) |tag_start|
-            std.mem.trimRight(u8, message[0..tag_start], &std.ascii.whitespace)
+            std_compat.mem.trimRight(u8, message[0..tag_start], &std.ascii.whitespace)
         else
             message;
 
@@ -580,7 +590,7 @@ pub const TeamsChannel = struct {
         const self: *TeamsChannel = @ptrCast(@alignCast(ptr));
         if (!self.running.load(.acquire)) return false;
         // Healthy if we have a valid token or can obtain one
-        const now = std.time.timestamp();
+        const now = std_compat.time.timestamp();
         if (self.cached_token != null and now < self.token_expiry - TOKEN_BUFFER_SECS) {
             return true;
         }
@@ -656,7 +666,7 @@ test "Teams stopTyping is idempotent" {
 test "vtableSend strips nc_choices tags from message" {
     const msg = "Pick one:\n- Option A\n- Option B\n<nc_choices>{\"v\":1,\"options\":[{\"id\":\"a\",\"label\":\"A\"},{\"id\":\"b\",\"label\":\"B\"}]}</nc_choices>";
     const clean = if (std.mem.indexOf(u8, msg, "<nc_choices>")) |tag_start|
-        std.mem.trimRight(u8, msg[0..tag_start], &std.ascii.whitespace)
+        std_compat.mem.trimRight(u8, msg[0..tag_start], &std.ascii.whitespace)
     else
         msg;
     try std.testing.expectEqualStrings("Pick one:\n- Option A\n- Option B", clean);
@@ -726,9 +736,9 @@ test "placeholder cache evicts oldest when full" {
     // Fill all slots
     var targets: [TeamsChannel.MAX_PLACEHOLDER_ENTRIES][32]u8 = undefined;
     for (0..TeamsChannel.MAX_PLACEHOLDER_ENTRIES) |i| {
-        var fbs = std.io.fixedBufferStream(&targets[i]);
-        fbs.writer().print("target-{d}", .{i}) catch unreachable;
-        ch.cachePlaceholder(fbs.getWritten(), "id");
+        var writer: std.Io.Writer = .fixed(&targets[i]);
+        writer.print("target-{d}", .{i}) catch unreachable;
+        ch.cachePlaceholder(writer.buffered(), "id");
     }
 
     // Add one more — should evict first entry (target-0)
@@ -736,9 +746,9 @@ test "placeholder cache evicts oldest when full" {
 
     // target-1 should still be there
     var fbs1: [32]u8 = undefined;
-    var fbs1_stream = std.io.fixedBufferStream(&fbs1);
-    fbs1_stream.writer().print("target-{d}", .{1}) catch unreachable;
-    const taken1 = ch.takePlaceholder(fbs1_stream.getWritten());
+    var fbs1_writer: std.Io.Writer = .fixed(&fbs1);
+    fbs1_writer.print("target-{d}", .{1}) catch unreachable;
+    const taken1 = ch.takePlaceholder(fbs1_writer.buffered());
     try std.testing.expect(taken1 != null);
     std.testing.allocator.free(taken1.?);
 
@@ -750,9 +760,9 @@ test "placeholder cache evicts oldest when full" {
     // Clean up remaining entries
     for (2..TeamsChannel.MAX_PLACEHOLDER_ENTRIES) |i| {
         var tgt_buf: [32]u8 = undefined;
-        var tgt_fbs = std.io.fixedBufferStream(&tgt_buf);
-        tgt_fbs.writer().print("target-{d}", .{i}) catch unreachable;
-        if (ch.takePlaceholder(tgt_fbs.getWritten())) |id| {
+        var tgt_writer: std.Io.Writer = .fixed(&tgt_buf);
+        tgt_writer.print("target-{d}", .{i}) catch unreachable;
+        if (ch.takePlaceholder(tgt_writer.buffered())) |id| {
             std.testing.allocator.free(id);
         }
     }
@@ -761,7 +771,7 @@ test "placeholder cache evicts oldest when full" {
 test "vtableSend preserves message without nc_choices" {
     const msg = "Hello, how can I help?";
     const clean = if (std.mem.indexOf(u8, msg, "<nc_choices>")) |tag_start|
-        std.mem.trimRight(u8, msg[0..tag_start], &std.ascii.whitespace)
+        std_compat.mem.trimRight(u8, msg[0..tag_start], &std.ascii.whitespace)
     else
         msg;
     try std.testing.expectEqualStrings("Hello, how can I help?", clean);

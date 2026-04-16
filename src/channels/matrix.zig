@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -82,62 +83,57 @@ pub const MatrixChannel = struct {
     }
 
     fn buildWhoAmIUrl(self: *const MatrixChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.homeserver);
         try w.writeAll("/_matrix/client/v3/account/whoami");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn buildSyncUrl(self: *const MatrixChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.homeserver);
         try w.writeAll("/_matrix/client/v3/sync?timeout=30000");
         if (self.next_batch_len > 0) {
             try w.writeAll("&since=");
-            try appendUrlEncoded(w, self.nextBatch());
+            try appendUrlEncoded(&w, self.nextBatch());
         }
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn buildSendUrl(self: *const MatrixChannel, buf: []u8, room_id: []const u8, txn_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.homeserver);
         try w.writeAll("/_matrix/client/v3/rooms/");
-        try appendUrlEncoded(w, room_id);
+        try appendUrlEncoded(&w, room_id);
         try w.writeAll("/send/m.room.message/");
-        try appendUrlEncoded(w, txn_id);
-        return fbs.getWritten();
+        try appendUrlEncoded(&w, txn_id);
+        return w.buffered();
     }
 
     fn buildTypingUrl(self: *const MatrixChannel, buf: []u8, room_id: []const u8, user_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.homeserver);
         try w.writeAll("/_matrix/client/v3/rooms/");
-        try appendUrlEncoded(w, room_id);
+        try appendUrlEncoded(&w, room_id);
         try w.writeAll("/typing/");
-        try appendUrlEncoded(w, user_id);
-        return fbs.getWritten();
+        try appendUrlEncoded(&w, user_id);
+        return w.buffered();
     }
 
     fn buildJoinUrl(self: *const MatrixChannel, buf: []u8, room_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll(self.homeserver);
         try w.writeAll("/_matrix/client/v3/rooms/");
-        try appendUrlEncoded(w, room_id);
+        try appendUrlEncoded(&w, room_id);
         try w.writeAll("/join");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn nextTxnId(self: *MatrixChannel, buf: []u8) ![]const u8 {
         self.txn_counter += 1;
         return std.fmt.bufPrint(buf, "nullclaw-{s}-{d}-{d}", .{
             self.account_id,
-            std.time.timestamp(),
+            std_compat.time.timestamp(),
             self.txn_counter,
         });
     }
@@ -163,10 +159,12 @@ pub const MatrixChannel = struct {
 
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const w = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        const w = &body_writer.writer;
         try w.writeAll("{\"msgtype\":\"m.text\",\"body\":");
         try root.appendJsonStringW(w, chunk);
         try w.writeAll("}");
+        body_list = body_writer.toArrayList();
 
         const auth_header = try self.authHeader(self.allocator);
         defer self.allocator.free(auth_header);
@@ -748,7 +746,7 @@ fn stripTrailingSlashes(url: []const u8) []const u8 {
     return url[0..end];
 }
 
-fn appendUrlEncoded(writer: anytype, text: []const u8) !void {
+fn appendUrlEncoded(writer: *std.Io.Writer, text: []const u8) !void {
     try url_percent.appendPercentEncodedWriter(writer, text);
 }
 

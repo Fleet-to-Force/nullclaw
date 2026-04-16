@@ -4,6 +4,7 @@
 //! process_util.run() for child process spawning.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const retrieval = @import("engine.zig");
 const RetrievalCandidate = retrieval.RetrievalCandidate;
@@ -66,7 +67,7 @@ pub const QmdAdapter = struct {
 
         const argv = &[_][]const u8{ self.config.command, self.config.search_mode, query, "--json", "-n", limit_str };
 
-        var env_map = std.process.EnvMap.init(alloc);
+        var env_map = std_compat.process.EnvMap.init(alloc);
         defer env_map.deinit();
         env_map.put("NO_COLOR", "1") catch {};
 
@@ -140,7 +141,7 @@ pub const QmdAdapter = struct {
         };
         defer parsed.deinit();
 
-        var candidates = std.ArrayListUnmanaged(RetrievalCandidate){};
+        var candidates = std.ArrayListUnmanaged(RetrievalCandidate).empty;
         errdefer {
             for (candidates.items) |*c| c.deinit(allocator);
             candidates.deinit(allocator);
@@ -276,19 +277,19 @@ pub const QmdAdapter = struct {
             // Build file path
             const file_name = std.fmt.allocPrint(allocator, "{s}.md", .{sid}) catch continue;
             defer allocator.free(file_name);
-            const file_path = std.fs.path.join(allocator, &.{ export_dir, file_name }) catch continue;
+            const file_path = std_compat.fs.path.join(allocator, &.{ export_dir, file_name }) catch continue;
             defer allocator.free(file_path);
 
             // Check if existing file has same content hash (skip redundant writes)
             const skip = blk: {
-                const existing = fs_compat.readFileAlloc(std.fs.cwd(), allocator, file_path, 1024 * 1024) catch break :blk false;
+                const existing = fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, file_path, 1024 * 1024) catch break :blk false;
                 defer allocator.free(existing);
                 break :blk std.hash.Fnv1a_32.hash(existing) == new_hash;
             };
             if (skip) continue;
 
             // Write file
-            const file = std.fs.cwd().createFile(file_path, .{}) catch |err| {
+            const file = fs_compat.createPath(file_path, .{}) catch |err| {
                 log.warn("failed to write session export '{s}': {}", .{ file_path, err });
                 continue;
             };
@@ -314,9 +315,9 @@ pub const QmdAdapter = struct {
             return 0;
 
         const retention_ns: i128 = @as(i128, self.config.sessions.retention_days) * 24 * 3600 * std.time.ns_per_s;
-        const now_ns: i128 = std.time.nanoTimestamp();
+        const now_ns: i128 = std_compat.time.nanoTimestamp();
 
-        var dir = std.fs.cwd().openDir(export_dir, .{ .iterate = true }) catch return 0;
+        var dir = fs_compat.openDirPath(export_dir, .{ .iterate = true }) catch return 0;
         defer dir.close();
 
         var deleted: u32 = 0;
@@ -542,7 +543,7 @@ test "exportSessions with mock session store writes files" {
     // Create temp dir
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
     var mock = MockSessionStore{};
@@ -569,7 +570,7 @@ test "exportSessions skips unchanged files (hash check)" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
     var mock = MockSessionStore{};
@@ -617,7 +618,7 @@ test "exportSessions skips unsafe session ids" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
     var mock = MockSessionStore{};
@@ -635,12 +636,12 @@ test "pruneExportedSessions deletes old files" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(tmp_path);
 
     // Create a test file
     {
-        const f = try tmp.dir.createFile("old-session.md", .{});
+        const f = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("old-session.md", .{});
         try f.writeAll("old content");
         f.close();
     }
@@ -653,6 +654,6 @@ test "pruneExportedSessions deletes old files" {
     try std.testing.expectEqual(@as(u32, 1), deleted);
 
     // Verify file was deleted
-    const result = tmp.dir.statFile("old-session.md");
+    const result = @import("compat").fs.Dir.wrap(tmp.dir).statFile("old-session.md");
     try std.testing.expectError(error.FileNotFound, result);
 }

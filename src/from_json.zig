@@ -4,6 +4,7 @@
 /// saves, scaffolds the workspace, and prints {"status":"ok"} on success.
 /// Used by nullhub to configure nullclaw without interactive terminal input.
 const std = @import("std");
+const std_compat = @import("compat");
 const onboard = @import("onboard.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const config_mod = @import("config.zig");
@@ -99,13 +100,13 @@ fn initConfigWithCustomHome(backing_allocator: std.mem.Allocator, home_dir: []co
         .arena = arena_ptr,
     };
 
-    const config_path = try std.fs.path.join(allocator, &.{ home_dir, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ home_dir, "config.json" });
     const workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, home_dir);
     cfg.config_path = config_path;
     cfg.workspace_dir = workspace_dir;
     cfg.workspace_dir_override = workspace_dir;
 
-    if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+    if (std_compat.fs.openFileAbsolute(config_path, .{})) |file| {
         defer file.close();
         const content = try file.readToEndAlloc(allocator, 1024 * 64);
         cfg.parseJson(content) catch |err| switch (err) {
@@ -200,7 +201,7 @@ fn applyProvidersFromArray(cfg: *Config, items: []const std.json.Value) !void {
         const resolved = onboard.resolveProviderForQuickSetup(name) orelse {
             if (!primary_provider_set) {
                 std.debug.print("error: unknown provider '{s}'\n", .{name});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             }
             continue;
         };
@@ -312,7 +313,7 @@ fn putValueByDottedKey(
     value: std.json.Value,
 ) anyerror!void {
     if (std.mem.indexOfScalar(u8, dotted_key, '.') == null) {
-        try root_obj.put(dotted_key, value);
+        try root_obj.put(allocator, dotted_key, value);
         return;
     }
 
@@ -325,24 +326,24 @@ fn putValueByDottedKey(
     while (segments.next()) |next_segment| {
         if (current_obj.getPtr(segment)) |existing_ptr| {
             if (existing_ptr.* != .object) {
-                existing_ptr.* = .{ .object = std.json.ObjectMap.init(allocator) };
+                existing_ptr.* = .{ .object = .empty };
             }
         } else {
-            try current_obj.put(segment, .{ .object = std.json.ObjectMap.init(allocator) });
+            try current_obj.put(allocator, segment, .{ .object = .empty });
         }
 
         current_obj = &current_obj.getPtr(segment).?.object;
         segment = next_segment;
     }
 
-    try current_obj.put(segment, value);
+    try current_obj.put(allocator, segment, value);
 }
 
 fn normalizeWizardAccountObject(
     allocator: std.mem.Allocator,
     raw_obj: std.json.ObjectMap,
 ) anyerror!std.json.ObjectMap {
-    var normalized = std.json.ObjectMap.init(allocator);
+    var normalized: std.json.ObjectMap = .empty;
 
     var it = raw_obj.iterator();
     while (it.next()) |entry| {
@@ -367,20 +368,20 @@ fn addAccountsChannelValue(
         break :blk raw_channel_obj;
     };
 
-    var accounts_obj = std.json.ObjectMap.init(allocator);
+    var accounts_obj: std.json.ObjectMap = .empty;
     var acc_it = accounts_source.iterator();
     while (acc_it.next()) |acc_entry| {
         const account_name = acc_entry.key_ptr.*;
         if (acc_entry.value_ptr.* != .object) continue;
         const normalized = try normalizeWizardAccountObject(allocator, acc_entry.value_ptr.*.object);
-        try accounts_obj.put(account_name, .{ .object = normalized });
+        try accounts_obj.put(allocator, account_name, .{ .object = normalized });
     }
 
     if (accounts_obj.count() == 0) return;
 
-    var wrapper = std.json.ObjectMap.init(allocator);
-    try wrapper.put("accounts", .{ .object = accounts_obj });
-    try channels_obj.put(channel_type, .{ .object = wrapper });
+    var wrapper: std.json.ObjectMap = .empty;
+    try wrapper.put(allocator, "accounts", .{ .object = accounts_obj });
+    try channels_obj.put(allocator, channel_type, .{ .object = wrapper });
 }
 
 fn addSingleChannelValue(
@@ -411,11 +412,11 @@ fn addSingleChannelValue(
 
     if (candidate != .object) return;
     const normalized = try normalizeWizardAccountObject(allocator, candidate.object);
-    try channels_obj.put(channel_type, .{ .object = normalized });
+    try channels_obj.put(allocator, channel_type, .{ .object = normalized });
 }
 
 fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void {
-    var channels_obj = std.json.ObjectMap.init(cfg.allocator);
+    var channels_obj: std.json.ObjectMap = .empty;
 
     var ch_it = raw_channels.iterator();
     while (ch_it.next()) |ch_entry| {
@@ -435,12 +436,12 @@ fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void
 
     if (channels_obj.getPtr("webhook")) |webhook_ptr| {
         if (webhook_ptr.* == .object and webhook_ptr.object.get("port") == null) {
-            try webhook_ptr.object.put("port", .{ .integer = @as(i64, @intCast(cfg.gateway.port)) });
+            try webhook_ptr.object.put(cfg.allocator, "port", .{ .integer = @as(i64, @intCast(cfg.gateway.port)) });
         }
     }
 
-    var root_obj = std.json.ObjectMap.init(cfg.allocator);
-    try root_obj.put("channels", .{ .object = channels_obj });
+    var root_obj: std.json.ObjectMap = .empty;
+    try root_obj.put(cfg.allocator, "channels", .{ .object = channels_obj });
     const root_value: std.json.Value = .{ .object = root_obj };
     const patch_json = try std.json.Stringify.valueAlloc(cfg.allocator, root_value, .{});
     defer cfg.allocator.free(patch_json);
@@ -451,7 +452,7 @@ fn applyChannelsFromObject(cfg: *Config, raw_channels: std.json.ObjectMap) !void
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len == 0) {
         std.debug.print("error: --from-json requires a JSON argument\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     }
 
     const json_str = args[0];
@@ -462,7 +463,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         .{ .allocate = .alloc_always, .ignore_unknown_fields = true },
     ) catch {
         std.debug.print("error: invalid JSON\n", .{});
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
     defer parsed.deinit();
     const answers = parsed.value;
@@ -476,7 +477,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     ) catch null;
     defer if (raw_parsed) |rp| rp.deinit();
 
-    const env_home = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch null;
+    const env_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch null;
     defer if (env_home) |v| allocator.free(v);
 
     // Resolve home directory: JSON home > NULLCLAW_HOME env > default (~/.nullclaw/)
@@ -509,7 +510,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
             error.UnknownProvider => {
                 const provider = answers.provider orelse "unknown";
                 std.debug.print("error: unknown provider '{s}'\n", .{provider});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             },
             else => return err,
         };
@@ -520,11 +521,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         const backend = onboard.resolveMemoryBackendForQuickSetup(m) catch |err| switch (err) {
             error.UnknownMemoryBackend => {
                 std.debug.print("error: unknown memory backend '{s}'\n", .{m});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             },
             error.MemoryBackendDisabledInBuild => {
                 std.debug.print("error: memory backend '{s}' is disabled in this build\n", .{m});
-                std.process.exit(1);
+                std_compat.process.exit(1);
             },
         };
         cfg.memory.backend = backend.name;
@@ -536,7 +537,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (answers.tunnel) |t| {
         if (!isKnownTunnelProvider(t)) {
             std.debug.print("error: invalid tunnel provider '{s}'\n", .{t});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         cfg.tunnel.provider = try cfg.allocator.dupe(u8, t);
     }
@@ -545,7 +546,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (answers.autonomy) |a| {
         applyAutonomySelection(&cfg, a) catch {
             std.debug.print("error: invalid autonomy level '{s}'\n", .{a});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         };
     }
 
@@ -553,7 +554,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (answers.gateway_port) |port| {
         if (port == 0) {
             std.debug.print("error: gateway_port must be > 0\n", .{});
-            std.process.exit(1);
+            std_compat.process.exit(1);
         }
         cfg.gateway.port = port;
     }
@@ -570,7 +571,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
                     .object => |channels_obj| {
                         applyChannelsFromObject(&cfg, channels_obj) catch |err| {
                             std.debug.print("error: invalid channels payload ({s})\n", .{@errorName(err)});
-                            std.process.exit(1);
+                            std_compat.process.exit(1);
                         };
                     },
                     else => {},
@@ -590,17 +591,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     cfg.syncFlatFields();
     cfg.validate() catch |err| {
         Config.printValidationError(err);
-        std.process.exit(1);
+        std_compat.process.exit(1);
     };
 
     // Ensure parent config directory and workspace directory exist
-    if (std.fs.path.dirname(cfg.workspace_dir)) |parent| {
-        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+    if (std_compat.fs.path.dirname(cfg.workspace_dir)) |parent| {
+        std_compat.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
-    std.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
+    std_compat.fs.makeDirAbsolute(cfg.workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -613,7 +614,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 
     // Output success as JSON to stdout
     var stdout_buf: [4096]u8 = undefined;
-    var bw = std.fs.File.stdout().writer(&stdout_buf);
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
     try bw.interface.writeAll("{\"status\":\"ok\"}\n");
     try bw.interface.flush();
 }

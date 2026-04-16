@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
@@ -591,7 +592,7 @@ fn appendOpenRouterRequestFields(
 
 /// HTTP GET via curl subprocess with auth header.
 fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) ![]u8 {
-    var child = std.process.Child.init(&.{
+    var child = std_compat.process.Child.init(&.{
         "curl", "-s", "-H", auth_hdr, url,
     }, allocator);
     child.stdout_behavior = .Pipe;
@@ -603,7 +604,7 @@ fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) 
 
     const term = child.wait() catch return error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             allocator.free(stdout);
             return error.CurlFailed;
         },

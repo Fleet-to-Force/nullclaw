@@ -6,6 +6,7 @@
 //! - Device Authorization Grant flow (RFC 8628)
 
 const std = @import("std");
+const std_compat = @import("compat");
 const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
@@ -28,7 +29,7 @@ pub const PkceChallenge = struct {
 /// SHA-256(verifier) → base64url (no padding) challenge.
 pub fn generatePkce(allocator: std.mem.Allocator) !PkceChallenge {
     var random_bytes: [64]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    std_compat.crypto.random.bytes(&random_bytes);
 
     // base64url-encode the random bytes → verifier (86 chars for 64 bytes, no padding)
     const verifier = try base64UrlEncodeAlloc(allocator, &random_bytes);
@@ -65,7 +66,7 @@ pub const OAuthToken = struct {
     /// Returns true if the token is expired or within 300s of expiring.
     pub fn isExpired(self: OAuthToken) bool {
         if (self.expires_at == 0) return false;
-        return std.time.timestamp() + 300 >= self.expires_at;
+        return std_compat.time.timestamp() + 300 >= self.expires_at;
     }
 
     /// Free all heap-allocated fields. Only call on tokens returned by
@@ -97,10 +98,10 @@ fn writeCredentialsFileAtomic(allocator: std.mem.Allocator, file_path: []const u
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{file_path});
     defer allocator.free(tmp_path);
 
-    const tmp_file = std.fs.createFileAbsolute(tmp_path, .{}) catch return error.CredentialWriteFailed;
+    const tmp_file = std_compat.fs.createFileAbsolute(tmp_path, .{}) catch return error.CredentialWriteFailed;
     tmp_file.writeAll(contents) catch {
         tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
         return error.CredentialWriteFailed;
     };
 
@@ -109,8 +110,8 @@ fn writeCredentialsFileAtomic(allocator: std.mem.Allocator, file_path: []const u
     }
     tmp_file.close();
 
-    std.fs.renameAbsolute(tmp_path, file_path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    std_compat.fs.renameAbsolute(tmp_path, file_path) catch {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
         return error.CredentialWriteFailed;
     };
 }
@@ -126,11 +127,11 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
     defer allocator.free(file_path);
 
     // Ensure directory exists
-    const dir_path = std.fs.path.dirname(file_path) orelse return error.CredentialWriteFailed;
+    const dir_path = std_compat.fs.path.dirname(file_path) orelse return error.CredentialWriteFailed;
     fs_compat.makePath(dir_path) catch return error.CredentialWriteFailed;
 
     // Read existing credentials (if any)
-    var existing = loadAllCredentials(allocator, file_path) orelse std.StringArrayHashMap(StoredToken).init(allocator);
+    var existing = loadAllCredentials(allocator, file_path) orelse std.StringHashMap(StoredToken).init(allocator);
     defer {
         var it = existing.iterator();
         while (it.next()) |entry| {
@@ -147,7 +148,7 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
     var put_succeeded = false;
     const key_owned = try allocator.dupe(u8, provider);
     errdefer if (!put_succeeded) allocator.free(key_owned);
-    if (existing.fetchSwapRemove(key_owned)) |old| {
+    if (existing.fetchRemove(key_owned)) |old| {
         allocator.free(old.key);
         freeStoredToken(allocator, old.value);
     }
@@ -204,7 +205,7 @@ pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAut
     const file_path = credentialFilePath(allocator) catch return null;
     defer allocator.free(file_path);
 
-    const file = std.fs.cwd().openFile(file_path, .{}) catch return null;
+    const file = fs_compat.openPath(file_path, .{}) catch return null;
     defer file.close();
 
     const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
@@ -259,7 +260,7 @@ pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAut
     const token_type = try allocator.dupe(u8, token_type_raw);
     errdefer allocator.free(token_type);
 
-    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at and refresh_token == null) {
+    if (expires_at != 0 and std_compat.time.timestamp() + 300 >= expires_at and refresh_token == null) {
         allocator.free(access_token);
         if (refresh_token) |rt| allocator.free(rt);
         allocator.free(token_type);
@@ -287,8 +288,8 @@ fn freeStoredToken(allocator: std.mem.Allocator, tok: StoredToken) void {
     allocator.free(tok.token_type);
 }
 
-fn loadAllCredentials(allocator: std.mem.Allocator, file_path: []const u8) ?std.StringArrayHashMap(StoredToken) {
-    const file = std.fs.cwd().openFile(file_path, .{}) catch return null;
+fn loadAllCredentials(allocator: std.mem.Allocator, file_path: []const u8) ?std.StringHashMap(StoredToken) {
+    const file = fs_compat.openPath(file_path, .{}) catch return null;
     defer file.close();
 
     const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
@@ -302,7 +303,7 @@ fn loadAllCredentials(allocator: std.mem.Allocator, file_path: []const u8) ?std.
         else => return null,
     };
 
-    var map = std.StringArrayHashMap(StoredToken).init(allocator);
+    var map = std.StringHashMap(StoredToken).init(allocator);
     var it = root_obj.iterator();
     while (it.next()) |entry| {
         const prov_obj = switch (entry.value_ptr.*) {
@@ -366,7 +367,7 @@ pub fn refreshAccessToken(
     client_id: []const u8,
     refresh_token: []const u8,
 ) !OAuthToken {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
     const payload = try std.fmt.allocPrint(
@@ -435,7 +436,7 @@ pub fn deleteCredential(allocator: std.mem.Allocator, provider: []const u8) !boo
     if (!found) return false;
 
     // Remove and re-serialize
-    if (existing.fetchSwapRemove(provider)) |old| {
+    if (existing.fetchRemove(provider)) |old| {
         allocator.free(old.key);
         freeStoredToken(allocator, old.value);
     }
@@ -492,7 +493,7 @@ pub fn startDeviceCodeFlow(
     device_auth_url: []const u8,
     scope: []const u8,
 ) !DeviceCode {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
     const payload = try std.fmt.allocPrint(
@@ -579,7 +580,7 @@ pub fn pollDeviceCode(
     device_code: []const u8,
     interval_s: u32,
 ) !OAuthToken {
-    var client: std.http.Client = .{ .allocator = allocator };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
 
     const payload = try std.fmt.allocPrint(
@@ -593,7 +594,7 @@ pub fn pollDeviceCode(
     const max_attempts: u32 = 120;
 
     for (0..max_attempts) |_| {
-        std.Thread.sleep(interval_ns);
+        std_compat.thread.sleep(interval_ns);
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
@@ -676,7 +677,7 @@ fn parseTokenResponse(allocator: std.mem.Allocator, body: []const u8) !OAuthToke
     return .{
         .access_token = at_owned,
         .refresh_token = rt_owned,
-        .expires_at = std.time.timestamp() + expires_in,
+        .expires_at = std_compat.time.timestamp() + expires_in,
         .token_type = tt_owned,
     };
 }
@@ -736,7 +737,7 @@ test "PKCE challenge matches SHA-256 of verifier" {
 test "OAuthToken isExpired returns true for past expiry" {
     const token = OAuthToken{
         .access_token = "tok",
-        .expires_at = std.time.timestamp() - 3600,
+        .expires_at = std_compat.time.timestamp() - 3600,
     };
     try std.testing.expect(token.isExpired());
 }
@@ -744,7 +745,7 @@ test "OAuthToken isExpired returns true for past expiry" {
 test "OAuthToken isExpired returns false for far-future expiry" {
     const token = OAuthToken{
         .access_token = "tok",
-        .expires_at = std.time.timestamp() + 3600,
+        .expires_at = std_compat.time.timestamp() + 3600,
     };
     try std.testing.expect(!token.isExpired());
 }
@@ -760,7 +761,7 @@ test "OAuthToken isExpired returns false when expires_at is zero" {
 test "OAuthToken isExpired buffer: token expiring in 200s is expired" {
     const token = OAuthToken{
         .access_token = "tok",
-        .expires_at = std.time.timestamp() + 200,
+        .expires_at = std_compat.time.timestamp() + 200,
     };
     // 200s < 300s buffer → should be expired
     try std.testing.expect(token.isExpired());
@@ -769,7 +770,7 @@ test "OAuthToken isExpired buffer: token expiring in 200s is expired" {
 test "OAuthToken isExpired buffer: token expiring in 400s is NOT expired" {
     const token = OAuthToken{
         .access_token = "tok",
-        .expires_at = std.time.timestamp() + 400,
+        .expires_at = std_compat.time.timestamp() + 400,
     };
     // 400s > 300s buffer → not expired
     try std.testing.expect(!token.isExpired());
@@ -824,7 +825,7 @@ test "parseTokenResponse parses valid token" {
 
     try std.testing.expectEqualStrings("ya29.xyz", token.access_token);
     try std.testing.expectEqualStrings("1//abc", token.refresh_token.?);
-    try std.testing.expect(token.expires_at > std.time.timestamp());
+    try std.testing.expect(token.expires_at > std_compat.time.timestamp());
 }
 
 test "parseTokenResponse fails on missing access_token" {
@@ -852,7 +853,7 @@ test "parseTokenResponse preserves refresh_token in refresh response" {
     try std.testing.expectEqualStrings("new_access", token.access_token);
     try std.testing.expectEqualStrings("new_refresh", token.refresh_token.?);
     try std.testing.expectEqualStrings("Bearer", token.token_type);
-    try std.testing.expect(token.expires_at > std.time.timestamp());
+    try std.testing.expect(token.expires_at > std_compat.time.timestamp());
 }
 
 test "parseTokenResponse handles missing refresh_token in response" {
@@ -922,8 +923,38 @@ test "credentialFilePathFromConfigDir appends auth.json" {
     const path = try credentialFilePathFromConfigDir(std.testing.allocator, "/tmp/nullclaw-home");
     defer std.testing.allocator.free(path);
 
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "auth.json" });
+    const expected = try std_compat.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "auth.json" });
     defer std.testing.allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, path);
+}
+
+test "loadAllCredentials reads absolute auth path" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const abs = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(abs);
+
+    const auth_path = try std_compat.fs.path.join(std.testing.allocator, &.{ abs, "auth.json" });
+    defer std.testing.allocator.free(auth_path);
+
+    const file = try fs_compat.createPath(auth_path, .{});
+    defer file.close();
+    try file.writeAll(
+        \\{"openai":{"access_token":"tok","expires_at":4102444800,"token_type":"Bearer"}}
+    );
+
+    var credentials = loadAllCredentials(std.testing.allocator, auth_path) orelse return error.TestUnexpectedResult;
+    defer {
+        var it = credentials.iterator();
+        while (it.next()) |entry| {
+            std.testing.allocator.free(entry.key_ptr.*);
+            freeStoredToken(std.testing.allocator, entry.value_ptr.*);
+        }
+        credentials.deinit();
+    }
+
+    const token = credentials.get("openai") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("tok", token.access_token);
 }

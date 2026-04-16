@@ -47,7 +47,8 @@ pub const CronListTool = struct {
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+        const w = &buf_writer.writer;
         for (jobs) |job| {
             const status: []const u8 = if (job.paused) "paused" else "enabled";
             try w.print("- {s} | {s} | {s} | next: {d} | cmd: {s}\n", .{
@@ -58,6 +59,7 @@ pub const CronListTool = struct {
                 job.command,
             });
         }
+        buf = buf_writer.toArrayList();
         return ToolResult{ .success = true, .output = try buf.toOwnedSlice(allocator) };
     }
 };
@@ -83,7 +85,8 @@ test "cron_list_with_jobs" {
     // Format output the same way the tool does, to verify content
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
-    const w = buf.writer(std.testing.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    const w = &buf_writer.writer;
     const status: []const u8 = if (job.paused) "paused" else "enabled";
     try w.print("- {s} | {s} | {s} | next: {d} | cmd: {s}\n", .{
         job.id,
@@ -92,6 +95,7 @@ test "cron_list_with_jobs" {
         job.next_run_secs,
         job.command,
     });
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, job.id) != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "enabled") != null);
@@ -110,7 +114,8 @@ test "cron_list_shows_paused" {
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
-    const w = buf.writer(std.testing.allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(std.testing.allocator, &buf);
+    const w = &buf_writer.writer;
     const status: []const u8 = if (jobs[0].paused) "paused" else "enabled";
     try w.print("- {s} | {s} | {s} | next: {d} | cmd: {s}\n", .{
         jobs[0].id,
@@ -119,6 +124,7 @@ test "cron_list_shows_paused" {
         jobs[0].next_run_secs,
         jobs[0].command,
     });
+    buf = buf_writer.toArrayList();
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "paused") != null);
 }

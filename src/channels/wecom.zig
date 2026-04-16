@@ -145,14 +145,18 @@ pub const ParsedWeComMessage = struct {
 };
 
 fn appendTextPayload(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), text: []const u8) !void {
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, out);
+    defer out.* = out_writer.toArrayList();
+    const w = &out_writer.writer;
     try w.writeAll("{\"msgtype\":\"text\",\"text\":{\"content\":");
     try root.appendJsonStringW(w, text);
     try w.writeAll("}}");
 }
 
 fn appendMarkdownPayload(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), markdown: []const u8) !void {
-    const w = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, out);
+    defer out.* = out_writer.toArrayList();
+    const w = &out_writer.writer;
     try w.writeAll("{\"msgtype\":\"markdown\",\"markdown\":{\"content\":");
     try root.appendJsonStringW(w, markdown);
     try w.writeAll("}}");

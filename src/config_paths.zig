@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const platform = @import("platform.zig");
 
 pub fn defaultConfigDirFromInputs(
@@ -8,11 +9,11 @@ pub fn defaultConfigDirFromInputs(
 ) ![]u8 {
     if (nullclaw_home) |config_dir| return allocator.dupe(u8, config_dir);
     const home = home_dir orelse return error.HomeDirNotFound;
-    return std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    return std_compat.fs.path.join(allocator, &.{ home, ".nullclaw" });
 }
 
 pub fn defaultConfigDir(allocator: std.mem.Allocator) ![]u8 {
-    const nullclaw_home = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+    const nullclaw_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => return err,
     };
@@ -28,7 +29,7 @@ pub fn pathFromConfigDir(
     config_dir: []const u8,
     leaf_name: []const u8,
 ) ![]u8 {
-    return std.fs.path.join(allocator, &.{ config_dir, leaf_name });
+    return std_compat.fs.path.join(allocator, &.{ config_dir, leaf_name });
 }
 
 pub fn defaultWorkspaceDirFromInputs(
@@ -48,7 +49,7 @@ pub fn defaultWorkspaceDirFromConfigDir(
 }
 
 pub fn defaultWorkspaceDir(allocator: std.mem.Allocator) ![]u8 {
-    const nullclaw_workspace = std.process.getEnvVarOwned(allocator, "NULLCLAW_WORKSPACE") catch |err| switch (err) {
+    const nullclaw_workspace = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_WORKSPACE") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => return err,
     };
@@ -70,7 +71,7 @@ test "defaultConfigDirFromInputs falls back to HOME/.nullclaw" {
     const config_dir = try defaultConfigDirFromInputs(std.testing.allocator, null, "/home/alice");
     defer std.testing.allocator.free(config_dir);
 
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/home/alice", ".nullclaw" });
+    const expected = try std_compat.fs.path.join(std.testing.allocator, &.{ "/home/alice", ".nullclaw" });
     defer std.testing.allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, config_dir);
@@ -84,7 +85,7 @@ test "pathFromConfigDir appends a leaf name" {
     const path = try pathFromConfigDir(std.testing.allocator, "/tmp/nullclaw-home", "config.json");
     defer std.testing.allocator.free(path);
 
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "config.json" });
+    const expected = try std_compat.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "config.json" });
     defer std.testing.allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, path);
@@ -101,7 +102,7 @@ test "defaultWorkspaceDirFromConfigDir appends workspace" {
     const workspace_dir = try defaultWorkspaceDirFromConfigDir(std.testing.allocator, "/tmp/nullclaw-home");
     defer std.testing.allocator.free(workspace_dir);
 
-    const expected = try std.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "workspace" });
+    const expected = try std_compat.fs.path.join(std.testing.allocator, &.{ "/tmp/nullclaw-home", "workspace" });
     defer std.testing.allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, workspace_dir);

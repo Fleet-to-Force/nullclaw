@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const auth = @import("../auth.zig");
 const config_mod = @import("../config_types.zig");
@@ -25,7 +26,7 @@ pub const QwenCliCredentials = struct {
     pub fn isExpired(self: QwenCliCredentials) bool {
         const expiry_date_ms = self.expiry_date_ms orelse return false;
         const refresh_buffer_ms: i64 = 30 * 1000;
-        return std.time.milliTimestamp() >= expiry_date_ms - refresh_buffer_ms;
+        return std_compat.time.milliTimestamp() >= expiry_date_ms - refresh_buffer_ms;
     }
 };
 
@@ -85,7 +86,7 @@ pub fn resolveApiKey(
 }
 
 fn loadNonEmptyEnv(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
-    const value = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+    const value = std_compat.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => return null,
         else => return err,
     };
@@ -216,7 +217,7 @@ fn writeQwenCredentialsJson(
 
     try buf.append(allocator, '}');
 
-    const file = std.fs.createFileAbsolute(path, .{ .mode = 0o600 }) catch return error.FileWriteError;
+    const file = std_compat.fs.createFileAbsolute(path, .{ .permissions = std_compat.fs.permissionsFromMode(0o600) }) catch return error.FileWriteError;
     defer file.close();
     try file.writeAll(buf.items);
 }
@@ -267,10 +268,10 @@ pub fn tryLoadQwenCliToken(allocator: std.mem.Allocator) ?QwenCliCredentials {
     const home = platform.getHomeDir(allocator) catch return null;
     defer allocator.free(home);
 
-    const path = std.fs.path.join(allocator, &.{ home, ".qwen", "oauth_creds.json" }) catch return null;
+    const path = std_compat.fs.path.join(allocator, &.{ home, ".qwen", "oauth_creds.json" }) catch return null;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
 
     const json_bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
@@ -540,7 +541,7 @@ test "tryLoadQwenCliToken disabled during tests" {
 }
 
 test "QwenCliCredentials isExpired uses expiry_date with refresh buffer" {
-    const now_ms = std.time.milliTimestamp();
+    const now_ms = std_compat.time.milliTimestamp();
     const expired = QwenCliCredentials{
         .access_token = "token",
         .token_type = "Bearer",
@@ -560,10 +561,10 @@ test "writeQwenCredentialsJson preserves qwen oauth fields" {
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
 
-    const temp_dir_path = try temp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const temp_dir_path = try @import("compat").fs.Dir.wrap(temp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(temp_dir_path);
 
-    const file_path = try std.fs.path.join(std.testing.allocator, &.{ temp_dir_path, "oauth_creds.json" });
+    const file_path = try std_compat.fs.path.join(std.testing.allocator, &.{ temp_dir_path, "oauth_creds.json" });
     defer std.testing.allocator.free(file_path);
 
     const creds = QwenCliCredentials{
@@ -577,7 +578,7 @@ test "writeQwenCredentialsJson preserves qwen oauth fields" {
 
     try writeQwenCredentialsJson(std.testing.allocator, creds, file_path);
 
-    const file = try std.fs.openFileAbsolute(file_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(file_path, .{});
     defer file.close();
 
     const json_bytes = try file.readToEndAlloc(std.testing.allocator, 1024 * 1024);

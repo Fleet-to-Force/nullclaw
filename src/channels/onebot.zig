@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -9,9 +10,9 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.onebot);
 
-const SocketFd = std.net.Stream.Handle;
+const SocketFd = std_compat.net.Stream.Handle;
 const invalid_socket: SocketFd = switch (builtin.os.tag) {
-    .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+    .windows => std_compat.net.invalidHandle(SocketFd),
     else => -1,
 };
 
@@ -291,7 +292,7 @@ pub const OneBotChannel = struct {
             if (self.config.group_trigger_prefix) |prefix| {
                 if (std.mem.startsWith(u8, content, prefix)) {
                     // Strip prefix and leading whitespace
-                    content = std.mem.trimLeft(u8, content[prefix.len..], " ");
+                    content = std.mem.trimStart(u8, content[prefix.len..], " ");
                 } else if (!cq.is_mention) {
                     // Not prefixed and not a mention — skip
                     return;
@@ -308,8 +309,8 @@ pub const OneBotChannel = struct {
 
         // Build metadata JSON
         var meta_buf: [256]u8 = undefined;
-        var meta_fbs = std.io.fixedBufferStream(&meta_buf);
-        const mw = meta_fbs.writer();
+        var meta_writer: std.Io.Writer = .fixed(&meta_buf);
+        const mw = &meta_writer;
         mw.print("{{\"message_id\":{d},\"is_group\":{s}", .{
             message_id,
             if (is_group) "true" else "false",
@@ -322,7 +323,7 @@ pub const OneBotChannel = struct {
             mw.writeByte('"') catch return;
         }
         mw.writeByte('}') catch return;
-        const metadata = meta_fbs.getWritten();
+        const metadata = meta_writer.buffered();
 
         const msg = bus.makeInboundFull(
             self.allocator,
@@ -370,7 +371,9 @@ pub const OneBotChannel = struct {
         // Build JSON body dynamically
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        const bw = body_list.writer(self.allocator);
+        var body_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &body_list);
+        defer body_list = body_writer.toArrayList();
+        const bw = &body_writer.writer;
         try bw.writeAll("{\"action\":\"send_msg\",\"params\":{");
         try bw.print("\"message_type\":\"{s}\",", .{msg_type});
         if (std.mem.eql(u8, msg_type, "group")) {
@@ -388,9 +391,9 @@ pub const OneBotChannel = struct {
         var header_storage: [512]u8 = undefined;
         var headers: []const []const u8 = &.{};
         if (self.config.access_token) |token| {
-            var hdr_fbs = std.io.fixedBufferStream(&header_storage);
-            try hdr_fbs.writer().print("Authorization: Bearer {s}", .{token});
-            headers_buf[0] = hdr_fbs.getWritten();
+            var header_writer: std.Io.Writer = .fixed(&header_storage);
+            try header_writer.print("Authorization: Bearer {s}", .{token});
+            headers_buf[0] = header_writer.buffered();
             headers = &headers_buf;
         }
 
@@ -432,11 +435,7 @@ pub const OneBotChannel = struct {
         // Unblock a blocking read without stealing final ownership from WsClient.deinit().
         const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
         if (fd != invalid_socket) {
-            if (comptime builtin.os.tag == .windows) {
-                _ = std.os.windows.ws2_32.shutdown(fd, std.os.windows.ws2_32.SD_RECEIVE);
-            } else {
-                std.posix.shutdown(fd, .recv) catch {};
-            }
+            (std_compat.net.Stream{ .handle = fd }).shutdown(.recv) catch {};
         }
 
         if (self.gateway_thread) |t| {
@@ -483,7 +482,7 @@ pub const OneBotChannel = struct {
 
             var slept: u64 = 0;
             while (slept < RECONNECT_DELAY_NS and self.running.load(.acquire)) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
                 slept += 100 * std.time.ns_per_ms;
             }
         }
@@ -491,16 +490,16 @@ pub const OneBotChannel = struct {
     }
 
     fn runGatewayOnce(self: *OneBotChannel) !void {
-        var host_buf: [256]u8 = undefined;
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         var path_buf: [512]u8 = undefined;
         const parts = try parseWebSocketConnectParts(self.config.url, &host_buf, &path_buf);
 
         var auth_buf: [512]u8 = undefined;
         var headers_buf: [1][]const u8 = undefined;
         const headers: []const []const u8 = if (self.config.access_token) |token| blk: {
-            var fbs = std.io.fixedBufferStream(&auth_buf);
-            try fbs.writer().print("Authorization: Bearer {s}", .{token});
-            headers_buf[0] = fbs.getWritten();
+            var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+            try auth_writer.print("Authorization: Bearer {s}", .{token});
+            headers_buf[0] = auth_writer.buffered();
             break :blk headers_buf[0..1];
         } else &.{};
 
@@ -564,7 +563,7 @@ fn componentAsSlice(component: std.Uri.Component) []const u8 {
 
 fn parseWebSocketConnectParts(
     ws_url: []const u8,
-    host_buf: []u8,
+    host_buf: *[std.Io.net.HostName.max_len]u8,
     path_buf: []u8,
 ) !OneBotConnectParts {
     const uri = std.Uri.parse(ws_url) catch return error.InvalidOneBotUrl;
@@ -575,13 +574,12 @@ fn parseWebSocketConnectParts(
     else
         return error.InvalidOneBotUrl;
 
-    const host = uri.getHost(host_buf) catch return error.InvalidOneBotUrl;
+    const host = (uri.getHost(host_buf) catch return error.InvalidOneBotUrl).bytes;
     const port: u16 = uri.port orelse if (secure) 443 else 80;
     const raw_path = componentAsSlice(uri.path);
     const query = if (uri.query) |q| componentAsSlice(q) else "";
 
-    var fbs = std.io.fixedBufferStream(path_buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(path_buf);
     if (raw_path.len == 0) {
         try w.writeByte('/');
     } else {
@@ -597,7 +595,7 @@ fn parseWebSocketConnectParts(
         .secure = secure,
         .host = host,
         .port = port,
-        .path = fbs.getWritten(),
+        .path = w.buffered(),
     };
 }
 
@@ -614,18 +612,17 @@ fn buildSendApiUrl(buf: []u8, ws_url: []const u8) ![]const u8 {
     else
         return error.InvalidOneBotUrl;
 
-    var host_storage: [256]u8 = undefined;
-    const host = uri.getHost(&host_storage) catch return error.InvalidOneBotUrl;
+    var host_storage: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = (uri.getHost(&host_storage) catch return error.InvalidOneBotUrl).bytes;
     const port: u16 = uri.port orelse if (secure) 443 else 80;
 
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w: std.Io.Writer = .fixed(buf);
     try w.print("{s}://{s}", .{ if (secure) "https" else "http", host });
     if ((secure and port != 443) or (!secure and port != 80)) {
         try w.print(":{d}", .{port});
     }
     try w.writeAll("/send_msg");
-    return fbs.getWritten();
+    return w.buffered();
 }
 
 fn messageSuggestsAuthIssue(msg: []const u8) bool {
@@ -841,7 +838,7 @@ test "parseTarget no prefix defaults to private" {
 }
 
 test "parseWebSocketConnectParts supports ws url" {
-    var host_buf: [64]u8 = undefined;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     var path_buf: [128]u8 = undefined;
     const parts = try parseWebSocketConnectParts("ws://localhost:6700", &host_buf, &path_buf);
     try std.testing.expect(!parts.secure);
@@ -851,7 +848,7 @@ test "parseWebSocketConnectParts supports ws url" {
 }
 
 test "parseWebSocketConnectParts keeps path and query" {
-    var host_buf: [64]u8 = undefined;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     var path_buf: [128]u8 = undefined;
     const parts = try parseWebSocketConnectParts("wss://bot.example.com:9443/ws/onebot?token=abc", &host_buf, &path_buf);
     try std.testing.expect(parts.secure);

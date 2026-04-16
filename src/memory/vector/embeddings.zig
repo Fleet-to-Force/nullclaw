@@ -7,6 +7,7 @@
 //!   - Factory function: createEmbeddingProvider()
 
 const std = @import("std");
+const std_compat = @import("compat");
 const build_options = @import("build_options");
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 const GeminiEmbedding = @import("embeddings_gemini.zig").GeminiEmbedding;
@@ -175,7 +176,7 @@ pub const OpenAiEmbedding = struct {
         const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self_.api_key});
         defer allocator.free(auth_header);
 
-        var client = std.http.Client{ .allocator = allocator };
+        var client = std.http.Client{ .allocator = allocator, .io = std_compat.io() };
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -236,7 +237,7 @@ fn hasExplicitApiPath(url: []const u8) bool {
     const path_start = std.mem.indexOfScalar(u8, after_scheme, '/') orelse return false;
     const path = after_scheme[path_start..];
     // Trim trailing slashes
-    const trimmed = std.mem.trimRight(u8, path, "/");
+    const trimmed = std_compat.mem.trimRight(u8, path, "/");
     return trimmed.len > 0 and !std.mem.eql(u8, trimmed, "/");
 }
 

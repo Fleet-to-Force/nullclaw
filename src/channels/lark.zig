@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
@@ -10,9 +11,9 @@ const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.lark);
 
-const SocketFd = std.net.Stream.Handle;
+const SocketFd = std_compat.net.Stream.Handle;
 const invalid_socket: SocketFd = switch (builtin.os.tag) {
-    .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+    .windows => std_compat.net.invalidHandle(SocketFd),
     else => -1,
 };
 const AtomicU32 = std.atomic.Value(u32);
@@ -103,15 +104,15 @@ pub const LarkChannel = struct {
     reaction_emojis: []const []const u8 = &.{},
     /// Pending reaction message_ids queued per chat_id (for undo after responses are sent).
     pending_reactions: std.StringHashMapUnmanaged(PendingReactionQueue) = .empty,
-    typing_mutex: std.Thread.Mutex = .{},
+    typing_mutex: std_compat.sync.Mutex = .{},
     typing_placeholders: std.StringHashMapUnmanaged(root.Channel.MessageRef) = .empty,
     test_message_seq: if (builtin.is_test) u64 else void = if (builtin.is_test) 0 else {},
     test_deleted_message_count: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     test_typing_hook: if (builtin.is_test) ?*TypingPlaceholderTestHook else void = if (builtin.is_test) null else {},
 
     const TypingPlaceholderTestHook = struct {
-        mutex: std.Thread.Mutex = .{},
-        cond: std.Thread.Condition = .{},
+        mutex: std_compat.sync.Mutex = .{},
+        cond: std_compat.sync.Condition = .{},
         armed: bool = true,
         paused: bool = false,
         released: bool = false,
@@ -247,37 +248,36 @@ pub const LarkChannel = struct {
     }
 
     fn buildMessageCollectionUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
-        return fbs.getWritten();
+        var writer: std.Io.Writer = .fixed(buf);
+        try writer.print("{s}/im/v1/messages?receive_id_type=chat_id", .{self.apiBase()});
+        return writer.buffered();
     }
 
     fn buildMessageItemUrl(self: *const LarkChannel, buf: []u8, message_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("{s}/im/v1/messages/{s}", .{ self.apiBase(), message_id });
-        return fbs.getWritten();
+        var writer: std.Io.Writer = .fixed(buf);
+        try writer.print("{s}/im/v1/messages/{s}", .{ self.apiBase(), message_id });
+        return writer.buffered();
     }
 
     fn buildTextContent(text: []const u8, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().writeAll("{\"text\":");
-        try root.appendJsonStringW(fbs.writer(), text);
-        try fbs.writer().writeAll("}");
-        return fbs.getWritten();
+        var writer: std.Io.Writer = .fixed(buf);
+        try writer.writeAll("{\"text\":");
+        try root.appendJsonStringW(&writer, text);
+        try writer.writeAll("}");
+        return writer.buffered();
     }
 
     fn buildTextMessageBody(recipient: []const u8, text: []const u8, buf: []u8) ![]const u8 {
         var content_buf: [4096]u8 = undefined;
         const content = try buildTextContent(text, &content_buf);
 
-        var body_fbs = std.io.fixedBufferStream(buf);
-        const w = body_fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll("{\"receive_id\":\"");
         try w.writeAll(recipient);
         try w.writeAll("\",\"msg_type\":\"text\",\"content\":");
-        try root.appendJsonStringW(w, content);
+        try root.appendJsonStringW(&w, content);
         try w.writeAll("}");
-        return body_fbs.getWritten();
+        return w.buffered();
     }
 
     fn parseMessageId(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
@@ -712,11 +712,13 @@ pub const LarkChannel = struct {
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
-        const writer = out.writer(allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+        const writer = &out_writer.writer;
         try writer.writeAll("{\"schema\":\"2.0\",\"config\":{\"update_multi\":true},\"body\":{\"elements\":[");
         try writer.writeAll("{\"tag\":\"markdown\",\"content\":");
         try root.appendJsonStringW(writer, markdown.items);
         try writer.writeAll("}]}}");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(allocator);
     }
 
@@ -747,10 +749,12 @@ pub const LarkChannel = struct {
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(allocator);
-        const writer = out.writer(allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+        const writer = &out_writer.writer;
         try writer.writeAll("{\"toast\":{\"type\":\"success\",\"content\":\"已提交，正在处理\"},\"card\":{\"type\":\"raw\",\"data\":");
         try writer.writeAll(card_json);
         try writer.writeAll("}}");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(allocator);
     }
 
@@ -762,7 +766,7 @@ pub const LarkChannel = struct {
     pub fn getTenantAccessToken(self: *LarkChannel) ![]const u8 {
         // Check cache first
         if (self.cached_token) |token| {
-            const now = std.time.timestamp();
+            const now = std_compat.time.timestamp();
             if (now < self.token_expires_at - 60) {
                 return self.allocator.dupe(u8, token);
             }
@@ -776,7 +780,7 @@ pub const LarkChannel = struct {
 
         // Cache the token (2 hour typical expiry)
         self.cached_token = self.allocator.dupe(u8, token) catch null;
-        self.token_expires_at = std.time.timestamp() + 7200;
+        self.token_expires_at = std_compat.time.timestamp() + 7200;
 
         return token;
     }
@@ -796,15 +800,15 @@ pub const LarkChannel = struct {
 
         // Build URL: base ++ "/auth/v3/tenant_access_token/internal"
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/auth/v3/tenant_access_token/internal", .{base});
-        const url = url_fbs.getWritten();
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
+        try url_writer.print("{s}/auth/v3/tenant_access_token/internal", .{base});
+        const url = url_writer.buffered();
 
         // Build JSON body
         var body_buf: [512]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&body_buf);
-        try fbs.writer().print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
-        const body = fbs.getWritten();
+        var writer: std.Io.Writer = .fixed(&body_buf);
+        try writer.print("{{\"app_id\":\"{s}\",\"app_secret\":\"{s}\"}}", .{ self.app_id, self.app_secret });
+        const body = writer.buffered();
 
         const resp = http_util.curlPostWithStatus(
             self.allocator,
@@ -909,7 +913,7 @@ pub const LarkChannel = struct {
         argv_buf[argc] = url;
         argc += 1;
 
-        var child = std.process.Child.init(argv_buf[0..argc], allocator);
+        var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
         child.spawn() catch return error.LarkApiError;
@@ -923,7 +927,7 @@ pub const LarkChannel = struct {
 
         const term = child.wait() catch return error.LarkApiError;
         switch (term) {
-            .Exited => |code| if (code != 0) return error.LarkApiError,
+            .exited => |code| if (code != 0) return error.LarkApiError,
             else => return error.LarkApiError,
         }
 
@@ -941,8 +945,8 @@ pub const LarkChannel = struct {
     }
 
     fn buildRichCardContent(buf: []u8, payload: root.Channel.OutboundPayload) ![]const u8 {
-        var card_fbs = std.io.fixedBufferStream(buf);
-        const writer = card_fbs.writer();
+        var card_writer: std.Io.Writer = .fixed(buf);
+        const writer = &card_writer;
 
         try writer.writeAll("{\"schema\":\"2.0\"");
         if (payload.card_title.len > 0) {
@@ -964,15 +968,15 @@ pub const LarkChannel = struct {
             first_element = false;
 
             var section_buf: [4096]u8 = undefined;
-            var section_fbs = std.io.fixedBufferStream(&section_buf);
+            var section_writer: std.Io.Writer = .fixed(&section_buf);
             if (section.title.len > 0) {
-                try section_fbs.writer().print("**{s}**\n{s}", .{ section.title, section.body });
+                try section_writer.print("**{s}**\n{s}", .{ section.title, section.body });
             } else {
-                try section_fbs.writer().writeAll(section.body);
+                try section_writer.writeAll(section.body);
             }
 
             try writer.writeAll("{\"tag\":\"div\",\"text\":{\"tag\":\"lark_md\",\"content\":");
-            try root.appendJsonStringW(writer, section_fbs.getWritten());
+            try root.appendJsonStringW(writer, section_writer.buffered());
             try writer.writeAll("}}");
         }
 
@@ -1015,7 +1019,7 @@ pub const LarkChannel = struct {
         }
 
         try writer.writeAll("]}}");
-        return card_fbs.getWritten();
+        return card_writer.buffered();
     }
 
     fn sendTextTracked(self: *LarkChannel, recipient: []const u8, text: []const u8) !root.Channel.MessageRef {
@@ -1117,15 +1121,15 @@ pub const LarkChannel = struct {
         var card_buf: [16384]u8 = undefined;
         const card_content = try buildRichCardContent(&card_buf, payload);
         var body_buf: [20480]u8 = undefined;
-        var body_fbs = std.io.fixedBufferStream(&body_buf);
-        const bw = body_fbs.writer();
+        var body_writer: std.Io.Writer = .fixed(&body_buf);
+        const bw = &body_writer;
         try bw.writeAll("{\"receive_id\":\"");
         try bw.writeAll(recipient);
         try bw.writeAll("\",\"msg_type\":\"interactive\",\"content\":");
         try root.appendJsonStringW(bw, card_content);
         try bw.writeAll("}");
 
-        try self.postWithTokenRetry("send_message", url, body_fbs.getWritten());
+        try self.postWithTokenRetry("send_message", url, body_writer.buffered());
     }
 
     /// Add a reaction emoji to a message. Randomly picks from reaction_emojis config.
@@ -1135,20 +1139,20 @@ pub const LarkChannel = struct {
         if (self.reaction_emojis.len == 0) return;
 
         const idx = if (self.reaction_emojis.len == 1) 0 else blk: {
-            const seed = @as(u64, @bitCast(std.time.timestamp()));
+            const seed = @as(u64, @bitCast(std_compat.time.timestamp()));
             break :blk @as(usize, @intCast(@mod(seed, @as(u64, @intCast(self.reaction_emojis.len)))));
         };
         const emoji = self.reaction_emojis[idx];
 
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions", .{ self.apiBase(), message_id });
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
+        try url_writer.print("{s}/im/v1/messages/{s}/reactions", .{ self.apiBase(), message_id });
 
         var body_buf: [256]u8 = undefined;
-        var body_fbs = std.io.fixedBufferStream(&body_buf);
-        try body_fbs.writer().writeAll("{\"reaction_type\":{\"emoji_type\":\"");
-        try body_fbs.writer().writeAll(emoji);
-        try body_fbs.writer().writeAll("\"}}");
+        var body_writer: std.Io.Writer = .fixed(&body_buf);
+        try body_writer.writeAll("{\"reaction_type\":{\"emoji_type\":\"");
+        try body_writer.writeAll(emoji);
+        try body_writer.writeAll("\"}}");
 
         const token = try self.getTenantAccessToken();
         defer self.allocator.free(token);
@@ -1158,7 +1162,7 @@ pub const LarkChannel = struct {
         var auth_header_buf: [576]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
 
-        const resp = http_util.curlPostWithStatus(self.allocator, url_fbs.getWritten(), body_fbs.getWritten(), &.{auth_header}) catch return error.LarkApiError;
+        const resp = http_util.curlPostWithStatus(self.allocator, url_writer.buffered(), body_writer.buffered(), &.{auth_header}) catch return error.LarkApiError;
         defer self.allocator.free(resp.body);
 
         if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
@@ -1193,8 +1197,8 @@ pub const LarkChannel = struct {
     /// List reactions on a message and delete ones matching our configured emojis.
     fn deleteReaction(self: *LarkChannel, message_id: []const u8) !void {
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions", .{ self.apiBase(), message_id });
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
+        try url_writer.print("{s}/im/v1/messages/{s}/reactions", .{ self.apiBase(), message_id });
 
         const token = try self.getTenantAccessToken();
         defer self.allocator.free(token);
@@ -1204,7 +1208,7 @@ pub const LarkChannel = struct {
         var auth_header_buf: [576]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
 
-        const resp = http_util.curlGetWithStatus(self.allocator, url_fbs.getWritten(), &.{auth_header}) catch return error.LarkApiError;
+        const resp = http_util.curlGetWithStatus(self.allocator, url_writer.buffered(), &.{auth_header}) catch return error.LarkApiError;
         defer self.allocator.free(resp.body);
 
         if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
@@ -1241,8 +1245,8 @@ pub const LarkChannel = struct {
 
     fn deleteReactionById(self: *LarkChannel, message_id: []const u8, reaction_id: []const u8) !void {
         var url_buf: [256]u8 = undefined;
-        var url_fbs = std.io.fixedBufferStream(&url_buf);
-        try url_fbs.writer().print("{s}/im/v1/messages/{s}/reactions/{s}", .{ self.apiBase(), message_id, reaction_id });
+        var url_writer: std.Io.Writer = .fixed(&url_buf);
+        try url_writer.print("{s}/im/v1/messages/{s}/reactions/{s}", .{ self.apiBase(), message_id, reaction_id });
 
         const token = try self.getTenantAccessToken();
         defer self.allocator.free(token);
@@ -1252,7 +1256,7 @@ pub const LarkChannel = struct {
         var auth_header_buf: [576]u8 = undefined;
         const auth_header = std.fmt.bufPrint(&auth_header_buf, "Authorization: {s}", .{auth_value}) catch return error.LarkApiError;
 
-        const resp = curlDeleteWithStatus(self.allocator, url_fbs.getWritten(), &.{auth_header}) catch return error.LarkApiError;
+        const resp = curlDeleteWithStatus(self.allocator, url_writer.buffered(), &.{auth_header}) catch return error.LarkApiError;
         defer self.allocator.free(resp.body);
 
         if (!statusCodeIsSuccess(resp.status_code)) return error.LarkApiError;
@@ -1261,20 +1265,19 @@ pub const LarkChannel = struct {
 
     fn buildWebsocketConfigUrl(self: *const LarkChannel, buf: []u8) ![]const u8 {
         const host = if (self.use_feishu) FEISHU_CALLBACK_HOST else LARK_CALLBACK_HOST;
-        var fbs = std.io.fixedBufferStream(buf);
-        try fbs.writer().print("{s}/callback/ws/endpoint", .{host});
-        return fbs.getWritten();
+        var writer: std.Io.Writer = .fixed(buf);
+        try writer.print("{s}/callback/ws/endpoint", .{host});
+        return writer.buffered();
     }
 
     fn buildWebsocketConfigBody(buf: []u8, app_id: []const u8, app_secret: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll("{\"AppID\":");
-        try root.appendJsonStringW(w, app_id);
+        try root.appendJsonStringW(&w, app_id);
         try w.writeAll(",\"AppSecret\":");
-        try root.appendJsonStringW(w, app_secret);
+        try root.appendJsonStringW(&w, app_secret);
         try w.writeAll("}");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn extractWebsocketConnectConfig(allocator: std.mem.Allocator, resp_body: []const u8) !LarkWsConnectConfig {
@@ -1322,13 +1325,13 @@ pub const LarkChannel = struct {
 
     fn parseWebsocketConnectUrl(
         connect_url: []const u8,
-        host_buf: []u8,
+        host_buf: *[std.Io.net.HostName.max_len]u8,
         path_buf: []u8,
     ) !struct { host: []const u8, port: u16, path: []const u8, service_id: ?i32 } {
         const uri = std.Uri.parse(connect_url) catch return error.LarkApiError;
         if (!std.ascii.eqlIgnoreCase(uri.scheme, "wss")) return error.LarkApiError;
 
-        const host = uri.getHost(host_buf) catch return error.LarkApiError;
+        const host = (uri.getHost(host_buf) catch return error.LarkApiError).bytes;
         const port = uri.port orelse 443;
         const raw_path = componentAsSlice(uri.path);
         const query = if (uri.query) |q| componentAsSlice(q) else "";
@@ -1337,8 +1340,7 @@ pub const LarkChannel = struct {
             break :blk std.fmt.parseInt(i32, raw_service, 10) catch null;
         } else null;
 
-        var fbs = std.io.fixedBufferStream(path_buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(path_buf);
         if (raw_path.len == 0) {
             try w.writeByte('/');
         } else {
@@ -1352,27 +1354,25 @@ pub const LarkChannel = struct {
         return .{
             .host = host,
             .port = port,
-            .path = fbs.getWritten(),
+            .path = w.buffered(),
             .service_id = service_id,
         };
     }
 
     fn buildWebsocketPong(buf: []u8, ts: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll("{\"type\":\"pong\",\"ts\":");
-        try root.appendJsonStringW(w, ts);
+        try root.appendJsonStringW(&w, ts);
         try w.writeAll("}");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn buildWebsocketAck(buf: []u8, uuid: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.writeAll("{\"uuid\":");
-        try root.appendJsonStringW(w, uuid);
+        try root.appendJsonStringW(&w, uuid);
         try w.writeAll("}");
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn fetchWebsocketConnectConfig(self: *LarkChannel) !LarkWsConnectConfig {
@@ -1407,8 +1407,8 @@ pub const LarkChannel = struct {
         const session_key = std.fmt.bufPrint(&key_buf, "lark:{s}", .{msg.sender}) catch "lark:unknown";
 
         var meta_buf: [384]u8 = undefined;
-        var meta_fbs = std.io.fixedBufferStream(&meta_buf);
-        const mw = meta_fbs.writer();
+        var meta_writer: std.Io.Writer = .fixed(&meta_buf);
+        const mw = &meta_writer;
         mw.writeAll("{\"account_id\":") catch return;
         root.appendJsonStringW(mw, self.account_id) catch return;
         mw.writeAll(",\"peer_kind\":") catch return;
@@ -1416,7 +1416,7 @@ pub const LarkChannel = struct {
         mw.writeAll(",\"peer_id\":") catch return;
         root.appendJsonStringW(mw, msg.sender) catch return;
         mw.writeAll("}") catch return;
-        const metadata = meta_fbs.getWritten();
+        const metadata = meta_writer.buffered();
 
         const inbound = bus.makeInboundFull(
             self.allocator,
@@ -1513,7 +1513,7 @@ pub const LarkChannel = struct {
         const msg_type = larkWsHeaderValue(frame.headers, "type") orelse return;
         if (!std.mem.eql(u8, msg_type, "event")) return;
 
-        const started_at_ms = std.time.milliTimestamp();
+        const started_at_ms = std_compat.time.milliTimestamp();
         const maybe_payload = try mergeLarkWsEventPayload(self.allocator, event_buffers, frame);
         defer if (maybe_payload) |merged_payload| self.allocator.free(merged_payload);
 
@@ -1528,7 +1528,7 @@ pub const LarkChannel = struct {
                 log.warn("lark websocket event handling failed: {}", .{err});
             };
 
-            const elapsed_ms: u64 = @intCast(@max(std.time.milliTimestamp() - started_at_ms, 0));
+            const elapsed_ms: u64 = @intCast(@max(std_compat.time.milliTimestamp() - started_at_ms, 0));
             const ack = buildLarkWsEventAckFrame(self.allocator, frame, elapsed_ms, ack_payload) catch return;
             defer self.allocator.free(ack);
             ws.writeBinary(ack) catch |err| {
@@ -1541,7 +1541,7 @@ pub const LarkChannel = struct {
         var connect_cfg = try self.fetchWebsocketConnectConfig();
         defer connect_cfg.deinit(self.allocator);
 
-        var host_buf: [256]u8 = undefined;
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         var path_buf: [2048]u8 = undefined;
         const connect_parts = try parseWebsocketConnectUrl(connect_cfg.url, &host_buf, &path_buf);
 
@@ -1619,7 +1619,7 @@ pub const LarkChannel = struct {
 
             var slept_ms: u64 = 0;
             while (slept_ms < 5000 and self.running.load(.acquire)) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
                 slept_ms += 100;
             }
         }
@@ -1649,11 +1649,7 @@ pub const LarkChannel = struct {
 
         const fd = self.ws_fd.swap(invalid_socket, .acq_rel);
         if (fd != invalid_socket) {
-            if (comptime builtin.os.tag == .windows) {
-                _ = std.os.windows.ws2_32.closesocket(fd);
-            } else {
-                std.posix.close(fd);
-            }
+            (std_compat.net.Stream{ .handle = fd }).close();
         }
 
         if (self.ws_thread) |t| {
@@ -2055,11 +2051,10 @@ fn protoWriteString(writer: anytype, field_number: u32, value: []const u8) !void
 
 fn protoWriteHeader(writer: anytype, key: []const u8, value: []const u8) !void {
     var header_buf: [1024]u8 = undefined;
-    var header_fbs = std.io.fixedBufferStream(&header_buf);
-    const header_writer = header_fbs.writer();
-    try protoWriteString(header_writer, 1, key);
-    try protoWriteString(header_writer, 2, value);
-    try protoWriteBytes(writer, 5, header_fbs.getWritten());
+    var header_writer: std.Io.Writer = .fixed(&header_buf);
+    try protoWriteString(&header_writer, 1, key);
+    try protoWriteString(&header_writer, 2, value);
+    try protoWriteBytes(writer, 5, header_writer.buffered());
 }
 
 fn larkWsHeaderValue(headers: []const LarkWsHeader, key: []const u8) ?[]const u8 {
@@ -2098,7 +2093,8 @@ fn buildLarkWsAckPayload(
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const writer = &out_writer.writer;
     try writer.writeAll("{\"code\":200,\"headers\":null,\"data\":");
     if (callback_response_json) |raw| {
         const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
@@ -2110,18 +2106,18 @@ fn buildLarkWsAckPayload(
         try writer.writeAll("null");
     }
     try writer.writeAll("}");
+    out = out_writer.toArrayList();
     return out.toOwnedSlice(allocator);
 }
 
 fn buildLarkWsPingFrame(buf: []u8, service_id: i32) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const writer = fbs.writer();
-    try protoWriteU64(writer, 1, 0);
-    try protoWriteU64(writer, 2, 0);
-    try protoWriteInt32(writer, 3, service_id);
-    try protoWriteInt32(writer, 4, LARK_WS_METHOD_CONTROL);
-    try protoWriteHeader(writer, "type", "ping");
-    return fbs.getWritten();
+    var writer: std.Io.Writer = .fixed(buf);
+    try protoWriteU64(&writer, 1, 0);
+    try protoWriteU64(&writer, 2, 0);
+    try protoWriteInt32(&writer, 3, service_id);
+    try protoWriteInt32(&writer, 4, LARK_WS_METHOD_CONTROL);
+    try protoWriteHeader(&writer, "type", "ping");
+    return writer.buffered();
 }
 
 fn buildLarkWsEventAckFrame(
@@ -2132,7 +2128,8 @@ fn buildLarkWsEventAckFrame(
 ) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    const writer = out.writer(allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    const writer = &out_writer.writer;
     try protoWriteU64(writer, 1, frame.seq_id);
     try protoWriteU64(writer, 2, frame.log_id);
     try protoWriteInt32(writer, 3, frame.service);
@@ -2155,6 +2152,7 @@ fn buildLarkWsEventAckFrame(
     if (frame.log_id_new) |log_id_new| {
         try protoWriteString(writer, 9, log_id_new);
     }
+    out = out_writer.toArrayList();
     return out.toOwnedSlice(allocator);
 }
 
@@ -2201,7 +2199,7 @@ fn mergeLarkWsEventPayload(
     event_buffers: *std.StringHashMapUnmanaged(LarkWsEventBuffer),
     frame: LarkWsFrame,
 ) !?[]u8 {
-    try cleanupExpiredLarkWsEventBuffers(allocator, event_buffers, std.time.milliTimestamp());
+    try cleanupExpiredLarkWsEventBuffers(allocator, event_buffers, std_compat.time.milliTimestamp());
 
     const message_id = larkWsHeaderValue(frame.headers, "message_id") orelse {
         if (frame.payload.len == 0) return null;
@@ -2241,7 +2239,7 @@ fn mergeLarkWsEventPayload(
         gop.value_ptr.* = .{
             .trace_id = trace_id_copy,
             .parts = parts,
-            .created_at_ms = std.time.milliTimestamp(),
+            .created_at_ms = std_compat.time.milliTimestamp(),
         };
     } else if (gop.value_ptr.parts.len != sum) {
         gop.value_ptr.deinit(allocator);
@@ -2256,7 +2254,7 @@ fn mergeLarkWsEventPayload(
         gop.value_ptr.* = .{
             .trace_id = trace_id_copy,
             .parts = parts,
-            .created_at_ms = std.time.milliTimestamp(),
+            .created_at_ms = std_compat.time.milliTimestamp(),
         };
     }
 
@@ -2305,7 +2303,7 @@ fn larkWsPingLoop(ctx: *LarkWsPingLoopCtx) void {
         var waited_ms: u32 = 0;
         while (waited_ms < interval_ms and ctx.running.load(.acquire)) {
             const step_ms: u32 = @min(interval_ms - waited_ms, @as(u32, 1000));
-            std.Thread.sleep(@as(u64, step_ms) * std.time.ns_per_ms);
+            std_compat.thread.sleep(@as(u64, step_ms) * std.time.ns_per_ms);
             waited_ms += step_ms;
         }
         if (!ctx.running.load(.acquire)) break;
@@ -2714,7 +2712,7 @@ test "lark token caching returns same token within expiry" {
     var ch = LarkChannel.init(std.testing.allocator, "id", "secret", "token", 9898, &.{});
     // Simulate a cached token
     ch.cached_token = try std.testing.allocator.dupe(u8, "test_cached_token_123");
-    ch.token_expires_at = std.time.timestamp() + 3600; // 1 hour from now
+    ch.token_expires_at = std_compat.time.timestamp() + 3600; // 1 hour from now
 
     // getTenantAccessToken should return the cached token without hitting API
     const token = try ch.getTenantAccessToken();
@@ -3020,7 +3018,7 @@ test "lark extractWebsocketConnectConfig captures ping interval" {
 }
 
 test "lark parseWebsocketConnectUrl extracts host port and path" {
-    var host_buf: [256]u8 = undefined;
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
     var path_buf: [512]u8 = undefined;
     const parsed = try LarkChannel.parseWebsocketConnectUrl(
         "wss://ws-client.feishu.cn/v1/ws?app_id=cli_xxx&device_id=dev1&service_id=7",
@@ -3330,7 +3328,7 @@ test "lark invalidateToken clears cached token" {
 
     // Setup a cached token
     ch.cached_token = try std.testing.allocator.dupe(u8, "cached_tok_123");
-    ch.token_expires_at = std.time.timestamp() + 7200;
+    ch.token_expires_at = std_compat.time.timestamp() + 7200;
 
     // Invalidate should clear everything
     ch.invalidateToken();
@@ -3348,7 +3346,7 @@ test "lark resetOwnedState keeps pending reactions FIFO and frees allocations" {
     try ch.enqueuePendingReaction("chat-1", "msg-2");
     try ch.enqueuePendingReaction("chat-2", "msg-3");
     ch.cached_token = try allocator.dupe(u8, "cached_tok_123");
-    ch.token_expires_at = std.time.timestamp() + 7200;
+    ch.token_expires_at = std_compat.time.timestamp() + 7200;
 
     try std.testing.expectEqual(@as(usize, 2), ch.pending_reactions.getPtr("chat-1").?.items.len);
     try std.testing.expectEqualStrings("msg-1", ch.pending_reactions.getPtr("chat-1").?.items[0]);

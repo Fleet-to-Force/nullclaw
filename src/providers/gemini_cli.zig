@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 
@@ -21,9 +22,9 @@ pub const GeminiCliProvider = struct {
     model: []const u8,
 
     /// Persistent state
-    child: ?*std.process.Child = null,
+    child: ?*std_compat.process.Child = null,
     child_argv: ?[][]const u8 = null,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     session_id: ?[]const u8 = null,
     next_id: u32 = 1,
     read_buffer: std.ArrayListUnmanaged(u8) = .empty,
@@ -126,7 +127,7 @@ pub const GeminiCliProvider = struct {
         self.resetConnectionState();
     }
 
-    fn cleanupStartupFailure(self: *GeminiCliProvider, child: ?*std.process.Child, child_spawned: bool) void {
+    fn cleanupStartupFailure(self: *GeminiCliProvider, child: ?*std_compat.process.Child, child_spawned: bool) void {
         if (child) |allocated_child| {
             if (child_spawned) {
                 self.child = allocated_child;
@@ -178,11 +179,11 @@ pub const GeminiCliProvider = struct {
         try argv_list.append(self.allocator, try self.allocator.dupe(u8, "yolo"));
         self.child_argv = try argv_list.toOwnedSlice(self.allocator);
 
-        var child: ?*std.process.Child = null;
+        var child: ?*std_compat.process.Child = null;
         var child_spawned = false;
         errdefer self.cleanupStartupFailure(child, child_spawned);
-        child = try self.allocator.create(std.process.Child);
-        child.?.* = std.process.Child.init(self.child_argv.?, self.allocator);
+        child = try self.allocator.create(std_compat.process.Child);
+        child.?.* = std_compat.process.Child.init(self.child_argv.?, self.allocator);
         child.?.stdin_behavior = .Pipe;
         child.?.stdout_behavior = .Pipe;
         child.?.stderr_behavior = .Inherit;
@@ -208,7 +209,7 @@ pub const GeminiCliProvider = struct {
 
         try self.readInitializeResponse(init_id);
 
-        const cwd = try std.fs.cwd().realpathAlloc(self.allocator, ".");
+        const cwd = try std_compat.fs.cwd().realpathAlloc(self.allocator, ".");
         defer self.allocator.free(cwd);
 
         const session_id = self.next_id;
@@ -461,7 +462,7 @@ pub const GeminiCliProvider = struct {
             "stream-json",
         };
 
-        var child = std.process.Child.init(argv, allocator);
+        var child = std_compat.process.Child.init(argv, allocator);
         child.stdin_behavior = .Close;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
@@ -477,7 +478,7 @@ pub const GeminiCliProvider = struct {
 
         const term = try child.wait();
         switch (term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code == 0) {
                     return try parseModelsJson(allocator, out);
                 }
@@ -609,7 +610,7 @@ fn parseModelsJson(allocator: std.mem.Allocator, out: []const u8) ![][]const u8 
 /// Run `<cli> --version` and verify exit code 0.
 fn checkCliVersion(allocator: std.mem.Allocator, cli_name: []const u8) !void {
     const argv = [_][]const u8{ cli_name, "--version" };
-    var child = std.process.Child.init(&argv, allocator);
+    var child = std_compat.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Close;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
@@ -621,7 +622,7 @@ fn checkCliVersion(allocator: std.mem.Allocator, cli_name: []const u8) !void {
     allocator.free(out);
     const term = child.wait() catch return error.CliNotFound;
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code == 0) return;
         },
         else => {},
@@ -792,8 +793,8 @@ test "cleanupStartupFailure clears provider state" {
     try provider.read_buffer.appendSlice(std.testing.allocator, "partial");
     provider.read_offset = 3;
 
-    const child = try std.testing.allocator.create(std.process.Child);
-    child.* = std.process.Child.init(provider.child_argv.?, std.testing.allocator);
+    const child = try std.testing.allocator.create(std_compat.process.Child);
+    child.* = std_compat.process.Child.init(provider.child_argv.?, std.testing.allocator);
     provider.child = child;
 
     // Regression: handshake failures in ensureStarted() must not leave provider

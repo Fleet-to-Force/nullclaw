@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const config_mod = @import("config.zig");
 const config_paths = @import("config_paths.zig");
 const platform = @import("platform.zig");
@@ -79,7 +80,7 @@ fn defaultConfigPathFromDir(allocator: std.mem.Allocator, config_dir: []const u8
 }
 
 pub fn defaultConfigPath(allocator: std.mem.Allocator) ![]u8 {
-    const nullclaw_home = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+    const nullclaw_home = std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
         else => return err,
     };
@@ -136,10 +137,11 @@ fn parseValueInput(allocator: std.mem.Allocator, raw_input: []const u8) !std.jso
 }
 
 fn ensureObject(value: *std.json.Value, allocator: std.mem.Allocator) *std.json.ObjectMap {
+    _ = allocator;
     switch (value.*) {
         .object => |*obj| return obj,
         else => {
-            value.* = .{ .object = std.json.ObjectMap.init(allocator) };
+            value.* = .{ .object = .empty };
             return &value.object;
         },
     }
@@ -198,7 +200,7 @@ fn setAtPath(
         }
 
         const key_copy = try allocator.dupe(u8, token);
-        try obj.put(key_copy, .{ .object = std.json.ObjectMap.init(allocator) });
+        try obj.put(allocator, key_copy, .{ .object = .empty });
         current = obj.getPtr(token).?;
     }
 
@@ -210,7 +212,7 @@ fn setAtPath(
     }
 
     const key_copy = try allocator.dupe(u8, last);
-    try obj.put(key_copy, value);
+    try obj.put(allocator, key_copy, value);
 }
 
 fn setPrimaryModelPathValue(
@@ -269,7 +271,7 @@ fn stringifyValue(allocator: std.mem.Allocator, value: ?*std.json.Value) ![]u8 {
 }
 
 fn readConfigOrDefault(allocator: std.mem.Allocator, config_path: []const u8) !struct { content: []u8, existed: bool } {
-    const file = std.fs.openFileAbsolute(config_path, .{}) catch |err| switch (err) {
+    const file = std_compat.fs.openFileAbsolute(config_path, .{}) catch |err| switch (err) {
         error.FileNotFound => {
             return .{ .content = try allocator.dupe(u8, "{}\n"), .existed = false };
         },
@@ -294,15 +296,15 @@ test "defaultConfigPath appends config filename to NULLCLAW_HOME override" {
     const config_path = try defaultConfigPathFromDir(allocator, "/tmp/nullclaw-home");
     defer allocator.free(config_path);
 
-    const expected = try std.fmt.allocPrint(allocator, "/tmp/nullclaw-home{s}config.json", .{std.fs.path.sep_str});
+    const expected = try std.fmt.allocPrint(allocator, "/tmp/nullclaw-home{s}config.json", .{std_compat.fs.path.sep_str});
     defer allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, config_path);
 }
 
 fn writeAtomic(allocator: std.mem.Allocator, path: []const u8, content: []const u8) !void {
-    const dir = std.fs.path.dirname(path) orelse return error.InvalidPath;
-    std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+    const dir = std_compat.fs.path.dirname(path) orelse return error.InvalidPath;
+    std_compat.fs.makeDirAbsolute(dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -310,20 +312,20 @@ fn writeAtomic(allocator: std.mem.Allocator, path: []const u8, content: []const 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+    const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
     defer tmp_file.close();
     try tmp_file.writeAll(content);
 
-    std.fs.renameAbsolute(tmp_path, path) catch {
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
-        const file = try std.fs.createFileAbsolute(path, .{});
+    std_compat.fs.renameAbsolute(tmp_path, path) catch {
+        std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+        const file = try std_compat.fs.createFileAbsolute(path, .{});
         defer file.close();
         try file.writeAll(content);
     };
 }
 
 fn validateCandidateJson(allocator: std.mem.Allocator, config_path: []const u8, content: []const u8) !void {
-    const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse return error.InvalidPath;
     const workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
     var cfg = config_mod.Config{
@@ -351,7 +353,7 @@ pub fn getPathValueJson(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 
     var root = parsed.value;
     if (root != .object) {
-        root = .{ .object = std.json.ObjectMap.init(a) };
+        root = .{ .object = .empty };
     }
 
     const tokens = try splitPathTokens(a, path);
@@ -393,7 +395,7 @@ pub fn mutateDefaultConfig(
     const parsed = std.json.parseFromSlice(std.json.Value, a, current.content, .{}) catch return error.InvalidJson;
     var root = parsed.value;
     if (root != .object) {
-        root = .{ .object = std.json.ObjectMap.init(a) };
+        root = .{ .object = .empty };
     }
 
     const tokens = try splitPathTokens(a, trimmed_path);
@@ -443,7 +445,7 @@ pub fn mutateDefaultConfig(
         if (current.existed) {
             const backup_path = try std.fmt.allocPrint(allocator, "{s}.bak", .{config_path});
             errdefer allocator.free(backup_path);
-            const backup_file = try std.fs.createFileAbsolute(backup_path, .{});
+            const backup_file = try std_compat.fs.createFileAbsolute(backup_path, .{});
             defer backup_file.close();
             try backup_file.writeAll(current.content);
             backup_path_opt = backup_path;
@@ -483,7 +485,7 @@ test "setAtPath creates nested objects and stores value" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var root = std.json.Value{ .object = std.json.ObjectMap.init(a) };
+    var root = std.json.Value{ .object = .empty };
     const tokens = [_][]const u8{ "memory", "backend" };
     const value = std.json.Value{ .string = try a.dupe(u8, "sqlite") };
 
@@ -499,7 +501,7 @@ test "unsetAtPath removes existing key" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    var root = std.json.Value{ .object = std.json.ObjectMap.init(a) };
+    var root = std.json.Value{ .object = .empty };
     const tokens = [_][]const u8{ "gateway", "port" };
     try setAtPath(&root, a, &tokens, .{ .integer = 3000 });
 
@@ -536,7 +538,7 @@ test "setPrimaryModelPathValue stores split provider field for versionless custo
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var root = std.json.Value{ .object = std.json.ObjectMap.init(a) };
+    var root = std.json.Value{ .object = .empty };
 
     try setPrimaryModelPathValue(&root, a, "custom:https://gateway.example.com/api/qianfan/custom-model");
 

@@ -6,6 +6,7 @@
 //! Note: input_type matters — "query" for search, "document" for storage.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const EmbeddingProvider = @import("embeddings.zig").EmbeddingProvider;
 const appendJsonEscaped = @import("../../util.zig").appendJsonEscaped;
 
@@ -103,7 +104,7 @@ pub const VoyageEmbedding = struct {
         const auth_header = try std.fmt.allocPrint(allocator, "Bearer {s}", .{self_.api_key});
         defer allocator.free(auth_header);
 
-        var client = std.http.Client{ .allocator = allocator };
+        var client = std.http.Client{ .allocator = allocator, .io = std_compat.io() };
         defer client.deinit();
 
         var aw: std.Io.Writer.Allocating = .init(allocator);

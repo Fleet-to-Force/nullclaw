@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("root.zig");
 const model_refs = @import("../model_refs.zig");
 
@@ -450,7 +451,7 @@ pub const ReliableProvider = struct {
 
                 if (attempt < self.max_retries) {
                     const wait = self.computeBackoff(backoff_ms, err_slice);
-                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    std_compat.thread.sleep(wait * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms *| 2, 10_000);
                 }
             }
@@ -495,7 +496,7 @@ pub const ReliableProvider = struct {
 
                 if (attempt < self.max_retries) {
                     const wait = self.computeBackoff(backoff_ms, err_slice);
-                    std.Thread.sleep(wait * std.time.ns_per_ms);
+                    std_compat.thread.sleep(wait * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms *| 2, 10_000);
                 }
             }

@@ -1,5 +1,7 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -75,9 +77,9 @@ fn validatePathEnvValue(
     while (iter.next()) |component| {
         if (component.len == 0) continue;
         // Must be absolute
-        if (!std.fs.path.isAbsolute(component)) return false;
+        if (!std_compat.fs.path.isAbsolute(component)) return false;
         // Resolve to canonical path (follows symlinks)
-        const resolved = std.fs.cwd().realpathAlloc(allocator, component) catch
+        const resolved = fs_compat.realpathAllocPath(allocator, component) catch
             return false; // path doesn't exist or can't be resolved
         defer allocator.free(resolved);
         if (!isResolvedPathAllowed(allocator, resolved, ws_resolved, allowed_paths))
@@ -186,16 +188,16 @@ pub const ShellTool = struct {
         // Determine working directory
         const effective_cwd = if (root.getString(args, "cwd")) |cwd| blk: {
             // cwd must be absolute
-            if (cwd.len == 0 or !std.fs.path.isAbsolute(cwd))
+            if (cwd.len == 0 or !std_compat.fs.path.isAbsolute(cwd))
                 return ToolResult.fail("cwd must be an absolute path");
             // Resolve and validate
-            const resolved_cwd = std.fs.cwd().realpathAlloc(allocator, cwd) catch |err| {
+            const resolved_cwd = fs_compat.realpathAllocPath(allocator, cwd) catch |err| {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to resolve cwd: {}", .{err});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
             defer allocator.free(resolved_cwd);
 
-            const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+            const ws_resolved: ?[]const u8 = fs_compat.realpathAllocPath(allocator, self.workspace_dir) catch null;
             defer if (ws_resolved) |wr| allocator.free(wr);
             if (ws_resolved == null and self.allowed_paths.len == 0)
                 return ToolResult.fail("cwd not allowed (workspace unavailable and no allowed_paths configured)");
@@ -207,10 +209,10 @@ pub const ShellTool = struct {
         } else self.workspace_dir;
 
         if (sandboxRestrictsToWorkspace(self.sandbox)) {
-            const resolved_cwd = std.fs.cwd().realpathAlloc(allocator, effective_cwd) catch
+            const resolved_cwd = fs_compat.realpathAllocPath(allocator, effective_cwd) catch
                 return ToolResult.fail("sandboxed cwd must stay within workspace");
             defer allocator.free(resolved_cwd);
-            const ws_resolved = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch
+            const ws_resolved = fs_compat.realpathAllocPath(allocator, self.workspace_dir) catch
                 return ToolResult.fail("sandboxed cwd must stay within workspace");
             defer allocator.free(ws_resolved);
 
@@ -221,7 +223,7 @@ pub const ShellTool = struct {
 
         // Clear environment to prevent leaking API keys (CWE-200),
         // then re-add only safe, functional variables.
-        var env = std.process.EnvMap.init(allocator);
+        var env = std_compat.process.EnvMap.init(allocator);
         defer env.deinit();
         for (SAFE_ENV_VARS) |key| {
             if (platform.getEnvOrNull(allocator, key)) |val| {
@@ -233,7 +235,7 @@ pub const ShellTool = struct {
         // Add path-validated env vars: each delimiter-separated component
         // (`:` on Unix, `;` on Windows) must resolve within workspace or allowed_paths.
         if (self.path_env_vars.len > 0) {
-            const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+            const ws_resolved: ?[]const u8 = fs_compat.realpathAllocPath(allocator, self.workspace_dir) catch null;
             defer if (ws_resolved) |wr| allocator.free(wr);
             const ws_for_check = ws_resolved orelse UNAVAILABLE_WORKSPACE_SENTINEL;
             const sandbox_allowed_paths = if (sandboxRestrictsToWorkspace(self.sandbox))
@@ -329,7 +331,7 @@ fn parseWindowsCommandArgv(allocator: std.mem.Allocator, command: []const u8) ![
     const command_line_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, command);
     defer allocator.free(command_line_w);
 
-    var iter = try std.process.ArgIteratorWindows.init(allocator, command_line_w);
+    var iter = try std_compat.process.ArgIteratorWindows.init(allocator, command_line_w);
     defer iter.deinit();
 
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -528,7 +530,7 @@ test "shell cwd inside workspace works without allowed_paths" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
     var args_buf: [512]u8 = undefined;
@@ -549,13 +551,13 @@ test "shell cwd outside workspace without allowed_paths is rejected" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.makeDir("ws");
-    try tmp_dir.dir.makeDir("other");
-    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("ws");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("other");
+    const root_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root_path);
-    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
+    const ws_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
     defer std.testing.allocator.free(ws_path);
-    const other_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
+    const other_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
     defer std.testing.allocator.free(other_path);
 
     var args_buf: [768]u8 = undefined;
@@ -585,7 +587,7 @@ test "shell cwd with allowed_paths runs in cwd" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
     var args_buf: [512]u8 = undefined;
@@ -608,13 +610,13 @@ test "shell sandboxed cwd outside workspace is rejected before spawn" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.makeDir("ws");
-    try tmp_dir.dir.makeDir("other");
-    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("ws");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("other");
+    const root_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root_path);
-    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
+    const ws_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
     defer std.testing.allocator.free(ws_path);
-    const other_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
+    const other_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
     defer std.testing.allocator.free(other_path);
 
     var prefix = PrefixSandbox{};
@@ -824,11 +826,11 @@ test "shell without policy executes command" {
 test "validatePathEnvValue allows paths within workspace" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp_dir.dir.makeDir("lib");
-    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("lib");
+    const lib_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
     defer std.testing.allocator.free(lib_path);
 
     try std.testing.expect(validatePathEnvValue(
@@ -842,14 +844,14 @@ test "validatePathEnvValue allows paths within workspace" {
 test "validatePathEnvValue allows delimiter-separated paths within workspace" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp_dir.dir.makeDir("lib");
-    try tmp_dir.dir.makeDir("usr");
-    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("lib");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("usr");
+    const lib_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
     defer std.testing.allocator.free(lib_path);
-    const usr_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "usr" });
+    const usr_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "usr" });
     defer std.testing.allocator.free(usr_path);
 
     const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}" ++ &[_]u8{path_list_delimiter} ++ "{s}", .{ lib_path, usr_path });
@@ -866,14 +868,14 @@ test "validatePathEnvValue allows delimiter-separated paths within workspace" {
 test "validatePathEnvValue rejects paths outside workspace" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp_dir.dir.makeDir("ws");
-    try tmp_dir.dir.makeDir("outside");
-    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "ws" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("ws");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("outside");
+    const ws_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "ws" });
     defer std.testing.allocator.free(ws_path);
-    const outside_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "outside" });
+    const outside_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "outside" });
     defer std.testing.allocator.free(outside_path);
 
     try std.testing.expect(!validatePathEnvValue(
@@ -898,11 +900,11 @@ test "validatePathEnvValue rejects system paths" {
 test "validatePathEnvValue allows via allowed_paths" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp_dir.dir.makeDir("tools");
-    const tools_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "tools" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("tools");
+    const tools_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "tools" });
     defer std.testing.allocator.free(tools_path);
 
     try std.testing.expect(validatePathEnvValue(
@@ -916,11 +918,11 @@ test "validatePathEnvValue allows via allowed_paths" {
 test "validatePathEnvValue rejects mixed valid and invalid paths" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp_dir.dir.makeDir("lib");
-    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("lib");
+    const lib_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
     defer std.testing.allocator.free(lib_path);
 
     // Mix a valid path with a system path (blocked)
@@ -964,11 +966,11 @@ test "shell path_env_vars passes validated vars to child" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    try tmp_dir.dir.makeDir("mylibs");
-    const libs_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mylibs" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("mylibs");
+    const libs_path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_path, "mylibs" });
     defer std.testing.allocator.free(libs_path);
 
     const key_z = try std.testing.allocator.dupeZ(u8, "TEST_LIB_PATH");
@@ -1000,19 +1002,19 @@ test "shell sandboxed path_env_vars ignore allowed_paths outside workspace" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.makeDir("ws");
-    try tmp_dir.dir.makeDir("other");
-    const root_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("ws");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makeDir("other");
+    const root_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(root_path);
-    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
+    const ws_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "ws" });
     defer std.testing.allocator.free(ws_path);
-    const other_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
+    const other_path = try std_compat.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
     defer std.testing.allocator.free(other_path);
 
-    try std.fs.cwd().makePath(other_path);
-    const libs_path = try std.fs.path.join(std.testing.allocator, &.{ other_path, "mylibs" });
+    try std_compat.fs.cwd().makePath(other_path);
+    const libs_path = try std_compat.fs.path.join(std.testing.allocator, &.{ other_path, "mylibs" });
     defer std.testing.allocator.free(libs_path);
-    try std.fs.cwd().makePath(libs_path);
+    try std_compat.fs.cwd().makePath(libs_path);
 
     const key_z = try std.testing.allocator.dupeZ(u8, "TEST_LIB_PATH");
     defer std.testing.allocator.free(key_z);

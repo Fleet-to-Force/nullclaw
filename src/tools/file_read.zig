@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -92,7 +93,7 @@ pub fn getBinaryFileType(data: []const u8, path: []const u8) []const u8 {
         if (std.mem.startsWith(u8, data, sig.magic)) return sig.type_name;
     }
 
-    const ext = std.fs.path.extension(path);
+    const ext = std_compat.fs.path.extension(path);
     for (EXTENSION_TYPES) |entry| {
         if (std.mem.eql(u8, ext, entry[0])) return entry[1];
     }
@@ -148,7 +149,7 @@ pub const FileReadTool = struct {
         if (bootstrap_filename) |filename| {
             if (self.bootstrap_provider) |bp| {
                 if (!bootstrap_mod.backendUsesFiles(self.backend_name)) {
-                    const parent_to_check = std.fs.path.dirname(full_path) orelse full_path;
+                    const parent_to_check = std_compat.fs.path.dirname(full_path) orelse full_path;
                     const resolved_ancestor = resolveNearestExistingAncestor(allocator, parent_to_check) catch |err| {
                         const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
                         return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -190,7 +191,7 @@ pub const FileReadTool = struct {
         }
 
         // Resolve to catch symlink escapes
-        const resolved = std.fs.cwd().realpathAlloc(allocator, full_path) catch |err| {
+        const resolved = fs_compat.realpathAllocPath(allocator, full_path) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to resolve file path: {} ({s})", .{ err, path });
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -202,7 +203,7 @@ pub const FileReadTool = struct {
         }
 
         // Check file size
-        const file = std.fs.openFileAbsolute(resolved, .{}) catch |err| {
+        const file = std_compat.fs.openFileAbsolute(resolved, .{}) catch |err| {
             const msg = try std.fmt.allocPrint(allocator, "Failed to open file: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
@@ -261,10 +262,10 @@ test "file_read reads existing file" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{ .sub_path = "test.txt", .data = "hello world" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "test.txt", .data = "hello world" });
 
     // Get the real path of the tmp dir
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadTool{ .workspace_dir = ws_path };
@@ -282,7 +283,7 @@ test "file_read reads existing file" {
 test "file_read nonexistent file" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadTool{ .workspace_dir = ws_path };
@@ -333,10 +334,10 @@ test "file_read missing path param" {
 test "file_read nested path" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.makePath("sub/dir");
-    try tmp_dir.dir.writeFile(.{ .sub_path = "sub/dir/deep.txt", .data = "deep content" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).makePath("sub/dir");
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "sub/dir/deep.txt", .data = "deep content" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadTool{ .workspace_dir = ws_path };
@@ -354,9 +355,9 @@ test "file_read nested path" {
 test "file_read empty file" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "empty.txt", .data = "" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "empty.txt", .data = "" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadTool{ .workspace_dir = ws_path };
@@ -375,7 +376,7 @@ test "file_read reads bootstrap doc from memory backend" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var lru = memory_root.InMemoryLruMemory.init(std.testing.allocator, 16);
@@ -422,11 +423,11 @@ test "file_read absolute path without allowed_paths is rejected" {
 test "file_read absolute path with allowed_paths works" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = "hello.txt", .data = "allowed content" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "hello.txt", .data = "allowed content" });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
-    const abs_file = try std.fs.path.join(std.testing.allocator, &.{ ws_path, "hello.txt" });
+    const abs_file = try std_compat.fs.path.join(std.testing.allocator, &.{ ws_path, "hello.txt" });
     defer std.testing.allocator.free(abs_file);
 
     // JSON-escape backslashes in the path (needed on Windows where paths use \)
@@ -460,9 +461,9 @@ test "file_read reports PNG files as binary" {
     defer tmp_dir.cleanup();
 
     const png_data = [_]u8{ 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
-    try tmp_dir.dir.writeFile(.{ .sub_path = "image.png", .data = &png_data });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "image.png", .data = &png_data });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadTool{ .workspace_dir = ws_path };
@@ -484,9 +485,9 @@ test "file_read reports WAV files as WAV instead of WebP" {
         'R', 'I', 'F', 'F', 0x24, 0x00, 0x00, 0x00,
         'W', 'A', 'V', 'E', 'f',  'm',  't',  ' ',
     };
-    try tmp_dir.dir.writeFile(.{ .sub_path = "sound.wav", .data = &wav_data });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "sound.wav", .data = &wav_data });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadTool{ .workspace_dir = ws_path };
@@ -509,9 +510,9 @@ test "file_read reports WebP files as WebP" {
         'R', 'I', 'F', 'F', 0x1A, 0x00, 0x00, 0x00,
         'W', 'E', 'B', 'P', 'V',  'P',  '8',  ' ',
     };
-    try tmp_dir.dir.writeFile(.{ .sub_path = "image.webp", .data = &webp_data });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "image.webp", .data = &webp_data });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadTool{ .workspace_dir = ws_path };
@@ -533,9 +534,9 @@ test "file_read reports HEIC files as HEIC instead of MP4" {
         0x00, 0x00, 0x00, 0x18, 'f',  't',  'y',  'p',
         'h',  'e',  'i',  'c',  0x00, 0x00, 0x00, 0x00,
     };
-    try tmp_dir.dir.writeFile(.{ .sub_path = "photo.heic", .data = &heic_data });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = "photo.heic", .data = &heic_data });
 
-    const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
     var ft = FileReadTool{ .workspace_dir = ws_path };

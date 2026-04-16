@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 
@@ -14,7 +15,7 @@ const ChatMessage = root.ChatMessage;
 pub const ClaudeCliProvider = struct {
     allocator: std.mem.Allocator,
     model: []const u8,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     sessions: std.StringHashMapUnmanaged(SessionState) = .empty,
 
     const DEFAULT_MODEL = "claude-opus-4-6";
@@ -195,7 +196,7 @@ pub const ClaudeCliProvider = struct {
         const current_hashes = try collectMessageHashes(allocator, messages);
         defer allocator.free(current_hashes);
 
-        const now_ns = std.time.nanoTimestamp();
+        const now_ns = std_compat.time.nanoTimestamp();
         var plan = ClaudeCliProvider.SessionPlan{
             .use_resume = false,
             .delta_start = 0,
@@ -443,7 +444,7 @@ fn runClaudeCommand(allocator: std.mem.Allocator, opts: ClaudeCliProvider.Claude
     argv[argc] = "--verbose";
     argc += 1;
 
-    var child = std.process.Child.init(argv[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -457,7 +458,7 @@ fn runClaudeCommand(allocator: std.mem.Allocator, opts: ClaudeCliProvider.Claude
 
     const term = try child.wait();
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.CliProcessFailed;
         },
         else => return error.CliProcessFailed,
@@ -512,7 +513,7 @@ fn parseStreamJson(allocator: std.mem.Allocator, output: []const u8) !ClaudeCliP
 fn checkCliAvailable(allocator: std.mem.Allocator, cli_name: []const u8) !void {
     const cmd: []const u8 = if (builtin.os.tag == .windows) "where" else "which";
     const argv = [_][]const u8{ cmd, cli_name };
-    var child = std.process.Child.init(&argv, allocator);
+    var child = std_compat.process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
     child.spawn() catch return error.CliNotFound;
@@ -523,7 +524,7 @@ fn checkCliAvailable(allocator: std.mem.Allocator, cli_name: []const u8) !void {
     allocator.free(out);
     const term = child.wait() catch return error.CliNotFound;
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.CliNotFound;
         },
         else => return error.CliNotFound,
@@ -532,7 +533,7 @@ fn checkCliAvailable(allocator: std.mem.Allocator, cli_name: []const u8) !void {
 
 fn checkCliVersion(allocator: std.mem.Allocator, cli_name: []const u8) !void {
     const argv = [_][]const u8{ cli_name, "--version" };
-    var child = std.process.Child.init(&argv, allocator);
+    var child = std_compat.process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
     try child.spawn();
@@ -543,7 +544,7 @@ fn checkCliVersion(allocator: std.mem.Allocator, cli_name: []const u8) !void {
     allocator.free(out);
     const term = try child.wait();
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.CliNotFound;
         },
         else => return error.CliNotFound,
@@ -622,9 +623,9 @@ test "buildSessionPlan resumes only when transcript is still a prefix" {
 
     try state.replaceSessionId(std.testing.allocator, "sess-1");
     try state.transcript_hashes.appendSlice(std.testing.allocator, &.{ 1, 2, 3 });
-    state.last_active_ns = std.time.nanoTimestamp();
+    state.last_active_ns = std_compat.time.nanoTimestamp();
 
-    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3, 4 }, std.time.nanoTimestamp());
+    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3, 4 }, std_compat.time.nanoTimestamp());
     try std.testing.expect(plan.use_resume);
     try std.testing.expectEqual(@as(usize, 3), plan.delta_start);
     try std.testing.expect(!plan.reset_state);
@@ -641,9 +642,9 @@ test "buildSessionPlan resets on diverged history" {
 
     try state.replaceSessionId(std.testing.allocator, "sess-1");
     try state.transcript_hashes.appendSlice(std.testing.allocator, &.{ 9, 2 });
-    state.last_active_ns = std.time.nanoTimestamp();
+    state.last_active_ns = std_compat.time.nanoTimestamp();
 
-    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3 }, std.time.nanoTimestamp());
+    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3 }, std_compat.time.nanoTimestamp());
     try std.testing.expect(!plan.use_resume);
     try std.testing.expect(plan.reset_state);
 }
@@ -658,9 +659,9 @@ test "buildSessionPlan resets on idle timeout" {
 
     try state.replaceSessionId(std.testing.allocator, "sess-1");
     try state.transcript_hashes.appendSlice(std.testing.allocator, &.{1});
-    state.last_active_ns = std.time.nanoTimestamp() - ClaudeCliProvider.IDLE_TIMEOUT_NS - std.time.ns_per_s;
+    state.last_active_ns = std_compat.time.nanoTimestamp() - ClaudeCliProvider.IDLE_TIMEOUT_NS - std.time.ns_per_s;
 
-    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2 }, std.time.nanoTimestamp());
+    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2 }, std_compat.time.nanoTimestamp());
     try std.testing.expect(!plan.use_resume);
     try std.testing.expect(plan.reset_state);
 }
@@ -676,9 +677,9 @@ test "buildSessionPlan tolerates normalized assistant history mismatch" {
 
     try state.replaceSessionId(std.testing.allocator, "sess-1");
     try state.transcript_hashes.appendSlice(std.testing.allocator, &.{ 1, 99 });
-    state.last_active_ns = std.time.nanoTimestamp();
+    state.last_active_ns = std_compat.time.nanoTimestamp();
 
-    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3 }, std.time.nanoTimestamp());
+    const plan = buildSessionPlan(&state, &msgs, &.{ 1, 2, 3 }, std_compat.time.nanoTimestamp());
     try std.testing.expect(plan.use_resume);
     try std.testing.expectEqual(@as(usize, 2), plan.delta_start);
     try std.testing.expect(!plan.reset_state);

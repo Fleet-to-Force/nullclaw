@@ -100,7 +100,7 @@ pub const WebSearchTool = struct {
                 if (failures.items.len > 0) {
                     try failures.appendSlice(allocator, " | ");
                 }
-                try std.fmt.format(failures.writer(allocator), "{s}:{s}", .{ providerName(provider), @errorName(err) });
+                try failures.print(allocator, "{s}:{s}", .{ providerName(provider), @errorName(err) });
                 continue;
             };
             return result;

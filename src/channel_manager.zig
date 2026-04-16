@@ -4,6 +4,7 @@
 //! generic system that handles all configured channels.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const Config = @import("config.zig").Config;
@@ -380,7 +381,7 @@ pub const ChannelManager = struct {
         const WATCH_INTERVAL_SECS: u64 = 10;
 
         while (!daemon.isShutdownRequested()) {
-            std.Thread.sleep(WATCH_INTERVAL_SECS * std.time.ns_per_s);
+            std_compat.thread.sleep(WATCH_INTERVAL_SECS * std.time.ns_per_s);
             if (daemon.isShutdownRequested()) break;
 
             for (self.entries.items) |*entry| {
@@ -399,7 +400,7 @@ pub const ChannelManager = struct {
                             log.info("Restarting {s} gateway (attempt {d})", .{ entry.name, entry.supervised.restart_count });
                             state.markError("channels", "gateway health check failed");
                             entry.channel.stop();
-                            std.Thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
+                            std_compat.thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
                             entry.channel.start() catch |err| {
                                 log.err("Failed to restart {s} gateway: {}", .{ entry.name, err });
                                 continue;
@@ -418,7 +419,7 @@ pub const ChannelManager = struct {
                 if (entry.listener_type != .polling) continue;
 
                 const polling_state = entry.polling_state orelse continue;
-                const now = std.time.timestamp();
+                const now = std_compat.time.timestamp();
                 const last = pollingLastActivity(polling_state);
                 const stale = (now - last) > STALE_THRESHOLD_SECS;
 
@@ -443,7 +444,7 @@ pub const ChannelManager = struct {
                         self.stopPollingThread(entry);
 
                         // Backoff
-                        std.Thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
+                        std_compat.thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
 
                         // Respawn
                         if (self.runtime) |rt| {

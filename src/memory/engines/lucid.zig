@@ -10,6 +10,7 @@
 //! Mirrors ZeroClaw's `LucidMemory` (src/memory/lucid.rs).
 
 const std = @import("std");
+const std_compat = @import("compat");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -85,7 +86,7 @@ pub const LucidMemory = struct {
     // ── Cooldown ─────────────────────────────────────────────────
 
     fn nowMs() i64 {
-        return std.time.milliTimestamp();
+        return std_compat.time.milliTimestamp();
     }
 
     fn inFailureCooldown(self: *const Self) bool {
@@ -147,7 +148,7 @@ pub const LucidMemory = struct {
             argv_buf[i + 1] = arg;
         }
 
-        var child = std.process.Child.init(argv_buf, self.allocator);
+        var child = std_compat.process.Child.init(argv_buf, self.allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
 
@@ -164,7 +165,7 @@ pub const LucidMemory = struct {
         };
 
         switch (term) {
-            .Exited => |code| if (code != 0) {
+            .exited => |code| if (code != 0) {
                 self.allocator.free(stdout_raw);
                 return null;
             },

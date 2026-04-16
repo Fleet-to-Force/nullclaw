@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const fs_compat = @import("../fs_compat.zig");
@@ -12,7 +13,7 @@ const log = std.log.scoped(.provider_sse);
 // argument can hit execve limits long before the total ARG_MAX budget.
 const MAX_INLINE_CURL_BODY_BYTES: usize = 64 * 1024;
 
-var curl_fail_fast_arg_mutex: std.Thread.Mutex = .{};
+var curl_fail_fast_arg_mutex: std_compat.sync.Mutex = .{};
 var curl_fail_with_body_supported_cache: ?bool = null;
 const stream_stall_detection_args = [_][]const u8{
     "--speed-limit",
@@ -77,7 +78,7 @@ fn curlVersionSupportsFailWithBody(version_line: []const u8) bool {
 }
 
 fn detectCurlFailWithBodySupport(allocator: std.mem.Allocator) bool {
-    const result = std.process.Child.run(.{
+    const result = std_compat.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "curl", "--version" },
         .max_output_bytes = 1024,
@@ -86,7 +87,7 @@ fn detectCurlFailWithBodySupport(allocator: std.mem.Allocator) bool {
     defer allocator.free(result.stderr);
 
     switch (result.term) {
-        .Exited => |code| if (code != 0) return false,
+        .exited => |code| if (code != 0) return false,
         else => return false,
     }
 
@@ -117,13 +118,13 @@ pub fn appendCurlStallDetectionArgs(argv_buf: [][]const u8, argc: *usize) void {
 
 const CurlBodyArg = struct {
     arg: []const u8,
-    temp_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    temp_path_buf: [std_compat.fs.max_path_bytes]u8 = undefined,
     temp_path_len: usize = 0,
     uses_temp_file: bool = false,
 
     fn deinit(self: *const CurlBodyArg, allocator: std.mem.Allocator) void {
         if (!self.uses_temp_file) return;
-        std.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
+        std_compat.fs.deleteFileAbsolute(self.temp_path_buf[0..self.temp_path_len]) catch {};
         allocator.free(self.arg);
     }
 };
@@ -145,17 +146,17 @@ fn prepareCurlBodyArg(
         return error.TempDirNotFound;
     defer allocator.free(tmp_dir_path);
 
-    var tmp_dir = std.fs.openDirAbsolute(tmp_dir_path, .{}) catch
+    var tmp_dir = std_compat.fs.openDirAbsolute(tmp_dir_path, .{}) catch
         return error.TempDirNotFound;
     defer tmp_dir.close();
 
     const body_path = std.fmt.bufPrint(
         &prepared.temp_path_buf,
         "{s}{s}sse_body_{d}.tmp",
-        .{ tmp_dir_path, std.fs.path.sep_str, std.time.timestamp() },
+        .{ tmp_dir_path, std_compat.fs.path.sep_str, std_compat.time.timestamp() },
     ) catch return error.PathTooLong;
     prepared.temp_path_len = body_path.len;
-    errdefer std.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
+    errdefer std_compat.fs.deleteFileAbsolute(prepared.temp_path_buf[0..prepared.temp_path_len]) catch {};
 
     var tmp_file = tmp_dir.createFile(
         body_path[tmp_dir_path.len + 1 ..],
@@ -172,7 +173,7 @@ fn prepareCurlBodyArg(
         debug_log.info("Using temp file for curl body: {s}, body_len={d}", .{ body_path, body.len });
     }
 
-    const verify_file = std.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
+    const verify_file = std_compat.fs.openFileAbsolute(body_path, .{}) catch return error.TempFileCreateFailed;
     defer verify_file.close();
     const verify_stat = fs_compat.stat(verify_file) catch return error.TempFileCreateFailed;
     if (log_enabled) {
@@ -208,7 +209,7 @@ pub const SseLineResult = union(enum) {
 /// - `data: {JSON}` → extracts `choices[0].delta.content` → `.delta`
 /// - Empty lines, comments (`:`) → `.skip`
 pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
@@ -432,7 +433,7 @@ pub fn curlStream(
         debug_log.info("curl command: {s}", .{cmd_buf.items});
     }
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -581,7 +582,7 @@ pub fn curlStream(
         debug_log.info("curl process terminated: {}", .{term});
     }
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
@@ -633,7 +634,7 @@ pub const AnthropicSseResult = union(enum) {
 /// - `data: {JSON}` + current_event=="message_stop" → `.done`
 /// - Everything else → `.skip`
 pub fn parseAnthropicSseLine(allocator: std.mem.Allocator, line: []const u8, current_event: []const u8) !AnthropicSseResult {
-    const trimmed = std.mem.trimRight(u8, line, "\r");
+    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
 
     if (trimmed.len == 0) return .skip;
     if (trimmed[0] == ':') return .skip;
@@ -772,7 +773,7 @@ pub fn curlStreamAnthropic(
     argv_buf[argc] = url;
     argc += 1;
 
-    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
@@ -847,7 +848,7 @@ pub fn curlStreamAnthropic(
         return error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) {
+        .exited => |code| if (code != 0) {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());

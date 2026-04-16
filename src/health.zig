@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const util = @import("util.zig");
 
@@ -21,7 +22,7 @@ pub const HealthSnapshot = struct {
 };
 
 /// Global health registry — thread-safe singleton.
-var registry_mutex: std.Thread.Mutex = .{};
+var registry_mutex: std_compat.sync.Mutex = .{};
 var registry_components: std.StringHashMapUnmanaged(ComponentHealth) = .empty;
 var registry_started: bool = false;
 var registry_start_time: i64 = 0;
@@ -29,7 +30,7 @@ var pending_error_msg: ?[]const u8 = null;
 
 fn ensureInit() void {
     if (!registry_started) {
-        registry_start_time = std.time.timestamp();
+        registry_start_time = std_compat.time.timestamp();
         registry_started = true;
     }
 }
@@ -114,7 +115,7 @@ pub fn snapshot() HealthSnapshot {
     defer registry_mutex.unlock();
     ensureInit();
 
-    const now = std.time.timestamp();
+    const now = std_compat.time.timestamp();
     const uptime: u64 = if (now > registry_start_time) @intCast(now - registry_start_time) else 0;
 
     return .{
@@ -176,7 +177,8 @@ pub const ReadinessResult = struct {
     pub fn formatJson(self: ReadinessResult, allocator: std.mem.Allocator) ![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
-        const w = buf.writer(allocator);
+        var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+        const w = &buf_writer.writer;
 
         const status_str = if (self.status == .ready) "ready" else "not_ready";
         try w.print("{{\"status\":\"{s}\",\"checks\":[", .{status_str});
@@ -192,6 +194,7 @@ pub const ReadinessResult = struct {
         }
 
         try w.writeAll("]}");
+        buf = buf_writer.toArrayList();
         return try allocator.dupe(u8, buf.items);
     }
 };

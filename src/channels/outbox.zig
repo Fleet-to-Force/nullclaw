@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const bus = @import("../bus.zig");
 const outbound = @import("../outbound.zig");
@@ -14,7 +15,7 @@ else
 pub const DeliveryOutbox = struct {
     allocator: Allocator,
     path: []u8,
-    mutex: std.Thread.Mutex = .{},
+    mutex: std_compat.sync.Mutex = .{},
     jobs: std.ArrayListUnmanaged(Job) = .empty,
     next_id: u64 = 1,
     closed: bool = false,
@@ -373,20 +374,20 @@ pub const DeliveryOutbox = struct {
         const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{self.path});
         defer self.allocator.free(tmp_path);
 
-        const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{});
+        const tmp_file = try std_compat.fs.createFileAbsolute(tmp_path, .{});
         defer tmp_file.close();
         try tmp_file.writeAll(buf.items);
 
-        std.fs.renameAbsolute(tmp_path, self.path) catch {
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
-            const file = try std.fs.createFileAbsolute(self.path, .{});
+        std_compat.fs.renameAbsolute(tmp_path, self.path) catch {
+            std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
+            const file = try std_compat.fs.createFileAbsolute(self.path, .{});
             defer file.close();
             try file.writeAll(buf.items);
         };
     }
 
     fn load(self: *Self) !void {
-        const file = std.fs.openFileAbsolute(self.path, .{}) catch |err| switch (err) {
+        const file = std_compat.fs.openFileAbsolute(self.path, .{}) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
@@ -564,9 +565,9 @@ test "delivery outbox persists and reloads final message" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_root);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "outbox.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_root, "outbox.json" });
     defer std.testing.allocator.free(path);
 
     var outbox = try DeliveryOutbox.init(std.testing.allocator, path);
@@ -600,11 +601,11 @@ test "delivery outbox rolls back failed enqueue persistence" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_root);
-    const state_dir = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "missing" });
+    const state_dir = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_root, "missing" });
     defer std.testing.allocator.free(state_dir);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ state_dir, "outbox.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ state_dir, "outbox.json" });
     defer std.testing.allocator.free(path);
 
     var outbox = try DeliveryOutbox.init(std.testing.allocator, path);
@@ -617,7 +618,7 @@ test "delivery outbox rolls back failed enqueue persistence" {
     try std.testing.expectEqual(@as(usize, 0), outbox.pendingCount());
     try std.testing.expect((try outbox.claimNextReady(std.testing.allocator, 0)) == null);
 
-    try std.fs.makeDirAbsolute(state_dir);
+    try std_compat.fs.makeDirAbsolute(state_dir);
     try std.testing.expectEqual(@as(u64, 1), try outbox.enqueueFinal(msg));
     try std.testing.expectEqual(@as(usize, 1), outbox.pendingCount());
 }
@@ -626,9 +627,9 @@ test "delivery outbox failure keeps job durable for retry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_root);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "outbox.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_root, "outbox.json" });
     defer std.testing.allocator.free(path);
 
     var outbox = try DeliveryOutbox.init(std.testing.allocator, path);
@@ -654,9 +655,9 @@ test "delivery outbox persists delivered acknowledgement across restart" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const tmp_root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    const tmp_root = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_root);
-    const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_root, "outbox.json" });
+    const path = try std_compat.fs.path.join(std.testing.allocator, &.{ tmp_root, "outbox.json" });
     defer std.testing.allocator.free(path);
 
     var outbox = try DeliveryOutbox.init(std.testing.allocator, path);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const providers = @import("../providers/root.zig");
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -340,7 +341,7 @@ pub fn formatToolResults(allocator: std.mem.Allocator, results: []const ToolExec
     try buf.appendSlice(allocator, "[Tool results]\n");
     for (results) |result| {
         const status_str = if (result.success) "ok" else "error";
-        try std.fmt.format(buf.writer(allocator), "<tool_result name=\"{s}\" status=\"{s}\">\n{s}\n</tool_result>\n", .{
+        try buf.print(allocator, "<tool_result name=\"{s}\" status=\"{s}\">\n{s}\n</tool_result>\n", .{
             result.name,
             status_str,
             result.output,
@@ -402,7 +403,7 @@ pub const DispatcherKind = enum {
 /// Returns true if the text starts with `{` (after trimming whitespace) and contains `"tool_calls"`.
 /// This is a lightweight heuristic — full JSON parsing happens in parseNativeToolCalls.
 pub fn isNativeJsonFormat(text: []const u8) bool {
-    const trimmed = std.mem.trimLeft(u8, text, " \n\r\t");
+    const trimmed = std.mem.trimStart(u8, text, " \n\r\t");
     if (trimmed.len == 0 or trimmed[0] != '{') return false;
     return std.mem.indexOf(u8, trimmed, "\"tool_calls\"") != null;
 }
@@ -553,7 +554,8 @@ pub fn parseNativeToolCalls(
 pub fn formatNativeToolResults(allocator: std.mem.Allocator, results: []const ToolExecutionResult) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     try w.writeAll("[");
     for (results, 0..) |result, i| {
@@ -561,13 +563,14 @@ pub fn formatNativeToolResults(allocator: std.mem.Allocator, results: []const To
         const tc_id = result.tool_call_id orelse "unknown";
 
         // Serialize content as a JSON string value
-        try std.fmt.format(w, "{{\"role\":\"tool\",\"tool_call_id\":{f},\"content\":{f}}}", .{
+        try w.print("{{\"role\":\"tool\",\"tool_call_id\":{f},\"content\":{f}}}", .{
             std.json.fmt(tc_id, .{}),
             std.json.fmt(result.output, .{}),
         });
     }
     try w.writeAll("]");
 
+    buf = buf_writer.toArrayList();
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -589,7 +592,8 @@ pub fn buildAssistantHistoryWithToolCalls(
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
-    const w = buf.writer(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    const w = &buf_writer.writer;
 
     if (response_text.len > 0) {
         try w.writeAll(response_text);
@@ -608,6 +612,7 @@ pub fn buildAssistantHistoryWithToolCalls(
         try w.writeAll("\n</tool_call>\n");
     }
 
+    buf = buf_writer.toArrayList();
     return buf.toOwnedSlice(allocator);
 }
 
@@ -615,7 +620,7 @@ pub fn buildAssistantHistoryWithToolCalls(
 
 /// Strip trailing XML tags (e.g. </arg_value>, </tool_call>) from a string.
 fn stripTrailingXml(input: []const u8) []const u8 {
-    const trimmed_right = std.mem.trimRight(u8, input, " \t\r\n");
+    const trimmed_right = std_compat.mem.trimRight(u8, input, " \t\r\n");
     if (trimmed_right.len == 0 or trimmed_right[trimmed_right.len - 1] != '>') return input;
 
     const end_tag = trimmed_right.len - 1;
@@ -634,7 +639,7 @@ fn stripTrailingXml(input: []const u8) []const u8 {
     }
 
     // Found what looks like a trailing tag <...> at end-of-string.
-    return std.mem.trimRight(u8, trimmed_right[0..start_tag], " \t\r\n");
+    return std_compat.mem.trimRight(u8, trimmed_right[0..start_tag], " \t\r\n");
 }
 
 fn isToolNameChar(c: u8) bool {
@@ -656,16 +661,16 @@ fn hasMalformedQuotedColonToolName(raw_json: []const u8) bool {
     const name_key = "\"name\"";
     const name_idx = std.mem.indexOf(u8, raw_json, name_key) orelse return false;
 
-    var remaining = std.mem.trimLeft(u8, raw_json[name_idx + name_key.len ..], " \t\r\n");
+    var remaining = std.mem.trimStart(u8, raw_json[name_idx + name_key.len ..], " \t\r\n");
     if (remaining.len == 0 or remaining[0] != ':') return false;
 
-    remaining = std.mem.trimLeft(u8, remaining[1..], " \t\r\n");
+    remaining = std.mem.trimStart(u8, remaining[1..], " \t\r\n");
     if (remaining.len < 2 or remaining[0] != '"') return false;
 
     remaining = remaining[1..];
     if (remaining.len == 0 or remaining[0] != ':') return false;
 
-    remaining = std.mem.trimLeft(u8, remaining[1..], " \t\r\n");
+    remaining = std.mem.trimStart(u8, remaining[1..], " \t\r\n");
     return remaining.len > 0 and remaining[0] == '"';
 }
 
@@ -1094,7 +1099,8 @@ fn parseFunctionTagCall(allocator: std.mem.Allocator, inner: []const u8) !Parsed
 
     var args_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer args_buf.deinit(allocator);
-    const w = args_buf.writer(allocator);
+    var args_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &args_buf);
+    const w = &args_writer.writer;
     try w.writeByte('{');
 
     var remaining = body;
@@ -1129,6 +1135,7 @@ fn parseFunctionTagCall(allocator: std.mem.Allocator, inner: []const u8) !Parsed
 
     try w.writeByte('}');
 
+    args_buf = args_writer.toArrayList();
     const args_json = try args_buf.toOwnedSlice(allocator);
     errdefer allocator.free(args_json);
     return .{
@@ -1179,7 +1186,8 @@ fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
 
     var args_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer args_buf.deinit(allocator);
-    const w = args_buf.writer(allocator);
+    var args_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &args_buf);
+    const w = &args_writer.writer;
     try w.writeByte('{');
 
     var remaining = invoke_body;
@@ -1225,6 +1233,7 @@ fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
 
     try w.writeByte('}');
 
+    args_buf = args_writer.toArrayList();
     const args_json = try args_buf.toOwnedSlice(allocator);
     errdefer allocator.free(args_json);
     return .{
@@ -1287,7 +1296,8 @@ fn parseHybridTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
     // 2. Greedy Parameter Collection
     var args_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer args_buf.deinit(allocator);
-    const w = args_buf.writer(allocator);
+    var args_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &args_buf);
+    const w = &args_writer.writer;
     try w.writeByte('{');
 
     var first = true;
@@ -1386,6 +1396,7 @@ fn parseHybridTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
 
     try w.writeByte('}');
 
+    args_buf = args_writer.toArrayList();
     const args_json = try args_buf.toOwnedSlice(allocator);
     errdefer allocator.free(args_json);
     return .{

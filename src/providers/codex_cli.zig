@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const platform = @import("../platform.zig");
 const codex_support = @import("../codex_support.zig");
 const root = @import("root.zig");
@@ -97,7 +98,7 @@ pub const CodexCliProvider = struct {
 
         const output_path = try makeOutputPath(allocator);
         defer {
-            std.fs.deleteFileAbsolute(output_path) catch {};
+            std_compat.fs.deleteFileAbsolute(output_path) catch {};
             allocator.free(output_path);
         }
 
@@ -114,7 +115,7 @@ pub const CodexCliProvider = struct {
             prompt,
         };
 
-        var child = std.process.Child.init(&argv, allocator);
+        var child = std_compat.process.Child.init(&argv, allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
@@ -123,7 +124,7 @@ pub const CodexCliProvider = struct {
 
         const term = try child.wait();
         switch (term) {
-            .Exited => |code| {
+            .exited => |code| {
                 if (code != 0) {
                     return error.CliProcessFailed;
                 }
@@ -133,14 +134,14 @@ pub const CodexCliProvider = struct {
             },
         }
 
-        const file = try std.fs.openFileAbsolute(output_path, .{});
+        const file = try std_compat.fs.openFileAbsolute(output_path, .{});
         defer file.close();
 
         const max_output: usize = 4 * 1024 * 1024;
         const stdout_result = try file.readToEndAlloc(allocator, max_output);
 
         // Trim trailing whitespace
-        const trimmed = std.mem.trimRight(u8, stdout_result, " \t\r\n");
+        const trimmed = std_compat.mem.trimRight(u8, stdout_result, " \t\r\n");
         if (trimmed.len == stdout_result.len) {
             return stdout_result;
         }
@@ -171,7 +172,7 @@ fn checkCliVersion(allocator: std.mem.Allocator) !void {
     defer allocator.free(cli_path);
 
     const argv = [_][]const u8{ cli_path, "--version" };
-    var child = std.process.Child.init(&argv, allocator);
+    var child = std_compat.process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     try child.spawn();
@@ -182,7 +183,7 @@ fn checkCliVersion(allocator: std.mem.Allocator) !void {
     allocator.free(out);
     const term = try child.wait();
     switch (term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) return error.CliNotFound;
         },
         else => return error.CliNotFound,
@@ -204,12 +205,12 @@ fn makeOutputPath(allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(tmp_dir);
 
     const filename = try std.fmt.allocPrint(allocator, "nullclaw_codex_{d}_{x}.txt", .{
-        std.time.milliTimestamp(),
-        std.crypto.random.int(u64),
+        std_compat.time.milliTimestamp(),
+        std_compat.crypto.random.int(u64),
     });
     defer allocator.free(filename);
 
-    return std.fs.path.join(allocator, &.{ tmp_dir, filename });
+    return std_compat.fs.path.join(allocator, &.{ tmp_dir, filename });
 }
 
 /// Extract the content of the last user message from a message slice.

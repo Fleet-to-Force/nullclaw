@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const Tool = root.Tool;
@@ -146,7 +147,7 @@ pub const PushoverTool = struct {
             const env_path = try std.fmt.allocPrint(allocator, "{s}/.env", .{self.workspace_dir});
             defer allocator.free(env_path);
 
-            if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, env_path, 1_048_576)) |content| {
+            if (fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, env_path, 1_048_576)) |content| {
                 defer allocator.free(content);
 
                 var lines = std.mem.splitScalar(u8, content, '\n');
@@ -317,8 +318,8 @@ test "pushover priority 2 accepted (credential error expected)" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const t = pt.tool();
@@ -338,8 +339,8 @@ test "pushover priority -2 accepted (credential error expected)" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const t = pt.tool();
@@ -386,13 +387,13 @@ test "getCredentials reads token and user_key from .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=test-token-abc
         \\PUSHOVER_USER_KEY=test-user-key-xyz
     });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const creds = try pt.getCredentials(std.testing.allocator);
@@ -410,13 +411,13 @@ test "getCredentials reads exported and quoted values" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".env", .data =
         \\export PUSHOVER_TOKEN="quoted-token"
         \\export PUSHOVER_USER_KEY='single-quoted-key'
     });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const creds = try pt.getCredentials(std.testing.allocator);
@@ -434,10 +435,10 @@ test "getCredentials missing token returns error" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = "PUSHOVER_USER_KEY=only-user-key\n" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".env", .data = "PUSHOVER_USER_KEY=only-user-key\n" });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const result = pt.getCredentials(std.testing.allocator);
@@ -451,10 +452,10 @@ test "getCredentials missing user_key returns error" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data = "PUSHOVER_TOKEN=only-token\n" });
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".env", .data = "PUSHOVER_TOKEN=only-token\n" });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const result = pt.getCredentials(std.testing.allocator);
@@ -468,8 +469,8 @@ test "getCredentials missing .env returns error" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const result = pt.getCredentials(std.testing.allocator);
@@ -486,13 +487,13 @@ test "getCredentials prefers process environment over .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=file-token
         \\PUSHOVER_USER_KEY=file-user-key
     });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const creds = try pt.getCredentials(std.testing.allocator);
@@ -512,13 +513,13 @@ test "getCredentials fills missing environment value from .env file" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=file-token
         \\PUSHOVER_USER_KEY=file-user-key
     });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const creds = try pt.getCredentials(std.testing.allocator);
@@ -536,15 +537,15 @@ test "getCredentials later .env entries override earlier ones" {
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    try tmp_dir.dir.writeFile(.{ .sub_path = ".env", .data =
+    try @import("compat").fs.Dir.wrap(tmp_dir.dir).writeFile(.{ .sub_path = ".env", .data =
         \\PUSHOVER_TOKEN=first-token
         \\PUSHOVER_TOKEN=second-token
         \\PUSHOVER_USER_KEY=first-user-key
         \\PUSHOVER_USER_KEY=second-user-key
     });
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs_path = try tmp_dir.dir.realpath(".", &path_buf);
+    var path_buf: [std_compat.fs.max_path_bytes]u8 = undefined;
+    const abs_path = try @import("compat").fs.Dir.wrap(tmp_dir.dir).realpath(".", &path_buf);
 
     var pt = PushoverTool{ .workspace_dir = abs_path };
     const creds = try pt.getCredentials(std.testing.allocator);

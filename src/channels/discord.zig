@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
@@ -51,9 +52,9 @@ pub const DiscordChannel = struct {
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
 
-    typing_mu: std.Thread.Mutex = .{},
+    typing_mu: std_compat.sync.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
-    interaction_mu: std.Thread.Mutex = .{},
+    interaction_mu: std_compat.sync.Mutex = .{},
     pending_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty,
     interaction_seq: Atomic(u64) = Atomic(u64).init(1),
 
@@ -68,9 +69,9 @@ pub const DiscordChannel = struct {
     gateway_thread: ?std.Thread = null,
     ws_fd: Atomic(SocketFd) = Atomic(SocketFd).init(invalid_socket),
 
-    const SocketFd = std.net.Stream.Handle;
+    const SocketFd = std_compat.net.Stream.Handle;
     const invalid_socket: SocketFd = switch (builtin.os.tag) {
-        .windows => std.os.windows.ws2_32.INVALID_SOCKET,
+        .windows => std_compat.net.invalidHandle(SocketFd),
         else => -1,
     };
 
@@ -124,32 +125,28 @@ pub const DiscordChannel = struct {
 
     /// Build a Discord REST API URL for sending to a channel.
     pub fn sendUrl(buf: []u8, channel_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.print("https://discord.com/api/v10/channels/{s}/messages", .{channel_id});
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Build a Discord REST API URL for triggering typing in a channel.
     pub fn typingUrl(buf: []u8, channel_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.print("https://discord.com/api/v10/channels/{s}/typing", .{channel_id});
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     pub fn editMessageUrl(buf: []u8, channel_id: []const u8, message_id: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.print("https://discord.com/api/v10/channels/{s}/messages/{s}", .{ channel_id, message_id });
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     fn interactionCallbackUrl(buf: []u8, interaction_id: []const u8, interaction_token: []const u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.print("https://discord.com/api/v10/interactions/{s}/{s}/callback", .{ interaction_id, interaction_token });
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Extract bot user ID from a bot token.
@@ -173,38 +170,35 @@ pub const DiscordChannel = struct {
     /// Build IDENTIFY JSON payload (op=2).
     /// Example: {"op":2,"d":{"token":"Bot TOKEN","intents":37377,"properties":{"os":"linux","browser":"nullclaw","device":"nullclaw"}}}
     pub fn buildIdentifyJson(buf: []u8, token: []const u8, intents: u32) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.print(
             "{{\"op\":2,\"d\":{{\"token\":\"Bot {s}\",\"intents\":{d},\"properties\":{{\"os\":\"linux\",\"browser\":\"nullclaw\",\"device\":\"nullclaw\"}}}}}}",
             .{ token, intents },
         );
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Build HEARTBEAT JSON payload (op=1).
     /// seq==0 → {"op":1,"d":null}, else {"op":1,"d":42}
     pub fn buildHeartbeatJson(buf: []u8, seq: i64) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         if (seq == 0) {
             try w.writeAll("{\"op\":1,\"d\":null}");
         } else {
             try w.print("{{\"op\":1,\"d\":{d}}}", .{seq});
         }
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Build RESUME JSON payload (op=6).
     /// {"op":6,"d":{"token":"Bot TOKEN","session_id":"SESSION","seq":42}}
     pub fn buildResumeJson(buf: []u8, token: []const u8, session_id: []const u8, seq: i64) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w: std.Io.Writer = .fixed(buf);
         try w.print(
             "{{\"op\":6,\"d\":{{\"token\":\"Bot {s}\",\"session_id\":\"{s}\",\"seq\":{d}}}}}",
             .{ token, session_id, seq },
         );
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Parse gateway host from wss:// URL.
@@ -300,9 +294,9 @@ pub const DiscordChannel = struct {
         const url = typingUrl(&url_buf, channel_id) catch return;
 
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        auth_fbs.writer().print("Authorization: Bot {s}", .{self.token}) catch return;
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        auth_writer.print("Authorization: Bot {s}", .{self.token}) catch return;
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, url, "{}", &.{auth_header}) catch return;
         self.allocator.free(resp);
@@ -378,7 +372,7 @@ pub const DiscordChannel = struct {
             task.channel.sendTypingIndicator(task.channel_id);
             var elapsed: u64 = 0;
             while (elapsed < TYPING_INTERVAL_NS and !task.stop_requested.load(.acquire)) {
-                std.Thread.sleep(TYPING_SLEEP_STEP_NS);
+                std_compat.thread.sleep(TYPING_SLEEP_STEP_NS);
                 elapsed += TYPING_SLEEP_STEP_NS;
             }
         }
@@ -398,9 +392,9 @@ pub const DiscordChannel = struct {
 
         // Build auth header value: "Authorization: Bot <token>"
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
             log.err("Discord API POST failed: {}", .{err});
@@ -426,11 +420,11 @@ pub const DiscordChannel = struct {
         argc += 1;
 
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bot {s}", .{self.token});
         argv_buf[argc] = "-H";
         argc += 1;
-        argv_buf[argc] = auth_fbs.getWritten();
+        argv_buf[argc] = auth_writer.buffered();
         argc += 1;
         argv_buf[argc] = "--data-binary";
         argc += 1;
@@ -439,7 +433,7 @@ pub const DiscordChannel = struct {
         argv_buf[argc] = url;
         argc += 1;
 
-        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        var child = std_compat.process.Child.init(argv_buf[0..argc], self.allocator);
         child.stdin_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Ignore;
@@ -470,7 +464,7 @@ pub const DiscordChannel = struct {
 
         const term = child.wait() catch return error.CurlWaitError;
         switch (term) {
-            .Exited => |code| if (code != 0) return error.DiscordApiError,
+            .exited => |code| if (code != 0) return error.DiscordApiError,
             else => return error.DiscordApiError,
         }
     }
@@ -571,7 +565,7 @@ pub const DiscordChannel = struct {
         const chat_copy = try self.allocator.dupe(u8, chat_id);
         errdefer self.allocator.free(chat_copy);
 
-        const now_ms = std.time.milliTimestamp();
+        const now_ms = std_compat.time.milliTimestamp();
         if (now_ms < 0) return error.InvalidTimestamp;
         self.pruneExpiredInteractions();
         self.interaction_mu.lock();
@@ -584,7 +578,7 @@ pub const DiscordChannel = struct {
     }
 
     fn pruneExpiredInteractions(self: *DiscordChannel) void {
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = std_compat.time.milliTimestamp();
         self.interaction_mu.lock();
         defer self.interaction_mu.unlock();
 
@@ -620,7 +614,7 @@ pub const DiscordChannel = struct {
         defer self.interaction_mu.unlock();
 
         const pending_ptr = self.pending_interactions.getPtr(token) orelse return .not_found;
-        if (pending_ptr.expires_at_ms <= @as(u64, @intCast(std.time.milliTimestamp()))) {
+        if (pending_ptr.expires_at_ms <= @as(u64, @intCast(std_compat.time.milliTimestamp()))) {
             if (self.pending_interactions.fetchRemove(token)) |kv| {
                 self.allocator.free(@constCast(kv.key));
                 kv.value.deinit(self.allocator);
@@ -679,9 +673,9 @@ pub const DiscordChannel = struct {
         try body.appendSlice(self.allocator, "}");
 
         var auth_buf: [512]u8 = undefined;
-        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
-        const auth_header = auth_fbs.getWritten();
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_writer.buffered();
 
         const resp = root.http_util.curlPost(self.allocator, url, body.items, &.{auth_header}) catch |err| {
             log.err("Discord API rich POST failed: {}", .{err});
@@ -759,11 +753,7 @@ pub const DiscordChannel = struct {
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
-            if (comptime builtin.os.tag == .windows) {
-                _ = std.os.windows.ws2_32.closesocket(fd);
-            } else {
-                std.posix.close(fd);
-            }
+            (std_compat.net.Stream{ .handle = fd }).close();
         }
         if (self.gateway_thread) |t| {
             t.join();
@@ -855,7 +845,7 @@ pub const DiscordChannel = struct {
             // Backoff between reconnects (interruptible).
             var slept: u64 = 0;
             while (slept < backoff_ms and self.running.load(.acquire)) {
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
                 slept += 100;
             }
         }
@@ -925,14 +915,14 @@ pub const DiscordChannel = struct {
     fn heartbeatLoop(self: *DiscordChannel, ws: *websocket.WsClient) void {
         // Wait for interval to be set
         while (!self.heartbeat_stop.load(.acquire) and self.heartbeat_interval_ms.load(.acquire) == 0) {
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            std_compat.thread.sleep(10 * std.time.ns_per_ms);
         }
         while (!self.heartbeat_stop.load(.acquire)) {
             const interval_ms = self.heartbeat_interval_ms.load(.acquire);
             var elapsed: u64 = 0;
             while (elapsed < interval_ms) {
                 if (self.heartbeat_stop.load(.acquire)) return;
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                std_compat.thread.sleep(100 * std.time.ns_per_ms);
                 elapsed += 100;
             }
             if (self.heartbeat_stop.load(.acquire)) return;
@@ -1278,7 +1268,7 @@ pub const DiscordChannel = struct {
 
         if (d_obj.get("attachments")) |att_val| {
             if (att_val == .array) {
-                var rand = std.crypto.random;
+                const rand = std_compat.crypto.random;
                 for (att_val.array.items) |att_item| {
                     if (att_item == .object) {
                         if (att_item.object.get("url")) |url_val| {
@@ -1294,7 +1284,7 @@ pub const DiscordChannel = struct {
                                     var path_buf: [1024]u8 = undefined;
                                     const local_path = std.fmt.bufPrint(&path_buf, "/tmp/discord_{x}.dat", .{rand_id}) catch continue;
 
-                                    if (std.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
+                                    if (std_compat.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
                                         file.writeAll(img_data) catch {
                                             file.close();
                                             continue;
@@ -1331,7 +1321,8 @@ pub const DiscordChannel = struct {
 
         var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer metadata_buf.deinit(self.allocator);
-        const mw = metadata_buf.writer(self.allocator);
+        var metadata_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &metadata_buf);
+        const mw = &metadata_writer.writer;
         try mw.print("{{\"is_dm\":{s}", .{if (guild_id == null) "true" else "false"});
         try mw.writeAll(",\"account_id\":");
         try root.appendJsonStringW(mw, self.account_id);
@@ -1348,6 +1339,7 @@ pub const DiscordChannel = struct {
             try root.appendJsonStringW(mw, dname);
         }
         try mw.writeByte('}');
+        metadata_buf = metadata_writer.toArrayList();
 
         const msg = try bus_mod.makeInboundFull(
             self.allocator,
@@ -1477,7 +1469,8 @@ pub const DiscordChannel = struct {
 
                 var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
                 defer metadata_buf.deinit(self.allocator);
-                const mw = metadata_buf.writer(self.allocator);
+                var metadata_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &metadata_buf);
+                const mw = &metadata_writer.writer;
                 try mw.print("{{\"is_dm\":{s}", .{if (guild_id == null) "true" else "false"});
                 try mw.writeAll(",\"account_id\":");
                 try root.appendJsonStringW(mw, self.account_id);
@@ -1502,6 +1495,7 @@ pub const DiscordChannel = struct {
                     try root.appendJsonStringW(mw, dname);
                 }
                 try mw.writeByte('}');
+                metadata_buf = metadata_writer.toArrayList();
 
                 const msg = try bus_mod.makeInboundFull(
                     self.allocator,
@@ -1578,7 +1572,7 @@ test "discord startTyping stores handle and stopTyping clears it" {
 
     try ch.startTyping("123456");
     try std.testing.expect(ch.typing_handles.get("123456") != null);
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    std_compat.thread.sleep(50 * std.time.ns_per_ms);
     try ch.stopTyping("123456");
     try std.testing.expect(ch.typing_handles.get("123456") == null);
 }
