@@ -178,7 +178,7 @@ fn parseChannelsOption(raw: []const u8) !ChannelSelection {
             selection.enable_channel_lark = true;
         } else if (std.mem.eql(u8, token, "dingtalk")) {
             selection.enable_channel_dingtalk = true;
-        } else if (std.mem.eql(u8, token, "wechat")) {
+        } else if (std.mem.eql(u8, token, "wechat") or std.mem.eql(u8, token, "weixin")) {
             selection.enable_channel_wechat = true;
         } else if (std.mem.eql(u8, token, "wecom")) {
             selection.enable_channel_wecom = true;
@@ -380,7 +380,7 @@ pub fn build(b: *std.Build) void {
     const channels_raw = b.option(
         []const u8,
         "channels",
-        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|wechat|wecom|line|onebot|qq|maixcam|signal|nostr|web|max (default: all)",
+        "Channels list. Tokens: all|none|cli|telegram|discord|slack|whatsapp|matrix|mattermost|irc|imessage|email|lark|dingtalk|wechat|weixin|wecom|line|onebot|qq|maixcam|signal|nostr|web|max (default: all)",
     );
     const channels = if (channels_raw) |raw| blk: {
         const parsed = parseChannelsOption(raw) catch {
@@ -615,4 +615,12 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(lib_tests).step);
         test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     }
+}
+
+test "parse channels option accepts weixin alias" {
+    // Regression: `-Dchannels=weixin` must enable the shared WeChat build flag.
+    const parsed = try parseChannelsOption("weixin");
+
+    try std.testing.expect(parsed.enable_channel_wechat);
+    try std.testing.expect(!parsed.enable_channel_wecom);
 }
