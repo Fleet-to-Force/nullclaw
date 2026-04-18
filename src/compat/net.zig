@@ -72,9 +72,11 @@ pub const Stream = struct {
     }
 
     pub fn read(self: Stream, buffer: []u8) ReadError!usize {
-        var stream_reader = self.toInner().reader(shared.io(), &[_]u8{});
-        return stream_reader.interface.readSliceShort(buffer) catch |err| switch (err) {
-            error.ReadFailed => return stream_reader.err orelse error.Unexpected,
+        const io = shared.io();
+        var data = [1][]u8{buffer};
+        return io.vtable.netRead(io.userdata, self.handle, &data) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return err,
         };
     }
 
@@ -442,6 +444,32 @@ test "compat net normalizes listener and stream blocking mode" {
     defer conn.stream.close();
 
     try std.testing.expect(!socketIsNonblocking(conn.stream.handle));
+}
+
+test "compat net stream read receives small socket payload" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    try conn.stream.writeAll("$-1\r\n");
+
+    var buf: [8]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < 5) {
+        const n = try client.read(buf[filled..5]);
+        if (n == 0) return error.TestUnexpectedResult;
+        filled += n;
+    }
+
+    try std.testing.expectEqualStrings("$-1\r\n", buf[0..5]);
 }
 
 fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {

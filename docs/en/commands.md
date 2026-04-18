@@ -119,7 +119,7 @@ Notes:
 | Command | Purpose |
 |---|---|
 | `nullclaw skills list` | List installed skills |
-| `nullclaw skills install <source>` | Install from a GitHub URL or local path |
+| `nullclaw skills install <source>` | Install from a Git URL, local path, or HTTPS well-known skill endpoint |
 | `nullclaw skills install --name <query>` | Search the skill registry and install the best matching skill |
 | `nullclaw skills remove <name>` | Remove a skill |
 | `nullclaw skills info <name>` | Show skill metadata |

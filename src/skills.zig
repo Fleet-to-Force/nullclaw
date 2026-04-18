@@ -848,6 +848,12 @@ fn isGitScpSource(source: []const u8) bool {
 const WEB_SKILL_MANIFEST_PATH = "/.well-known/nullclaw-skill.json";
 const WEB_SKILL_DEFAULT_PATH = "/.well-known/skills/default/skill.md";
 const WEB_SKILL_FALLBACK_PATH = "/skill.md";
+const WEB_SKILL_INDEX_PATH = "/.well-known/agent-skills/index.json";
+const WEB_SKILL_COLLECTION_PATH = "/.well-known/agent-skills";
+const WEB_SKILL_COLLECTION_PREFIX = "/.well-known/agent-skills/";
+const WEB_SKILL_INDEX_SCHEMA_V2 = "https://schemas.agentskills.io/discovery/0.2.0/schema.json";
+const WEB_SKILL_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const WEB_SKILL_ARCHIVE_MAX_UNPACKED_BYTES: u64 = 32 * 1024 * 1024;
 
 fn isHttpSource(source: []const u8) bool {
     return std.mem.startsWith(u8, source, "http://");
@@ -920,6 +926,30 @@ const WebSkillManifest = struct {
     skill_url: ?[]const u8 = null,
 };
 
+const WebSkillIndexEntry = struct {
+    name: []const u8,
+    type: []const u8,
+    description: ?[]const u8 = null,
+    url: []const u8,
+    digest: []const u8,
+};
+
+const WebSkillIndexDocument = struct {
+    @"$schema": ?[]const u8 = null,
+    skills: []WebSkillIndexEntry,
+};
+
+const WebSkillSelection = union(enum) {
+    all,
+    by_name: []const u8,
+    by_url: []const u8,
+};
+
+const WebSkillArchiveKind = enum {
+    tar_gz,
+    zip,
+};
+
 fn buildWellKnownSkillManifestUrl(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     const normalized = normalizeWebSkillSource(source);
     if (std.mem.endsWith(u8, normalized, WEB_SKILL_MANIFEST_PATH)) {
@@ -934,6 +964,444 @@ fn parseWebSkillManifest(json_bytes: []const u8) WebSkillManifest {
         .name = json_miniparse.parseStringField(json_bytes, "name"),
         .skill_url = json_miniparse.parseStringField(json_bytes, "skill_url"),
     };
+}
+
+fn buildWebSkillOriginUrl(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const uri = std.Uri.parse(normalizeWebSkillSource(source)) catch return error.InvalidUrl;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.SkillSecurityAuditFailed;
+
+    var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const host = (try uri.getHost(&host_buf)).bytes;
+    const host_fmt = if (std.mem.indexOfScalar(u8, host, ':') != null)
+        try std.fmt.allocPrint(allocator, "[{s}]", .{host})
+    else
+        try allocator.dupe(u8, host);
+    defer allocator.free(host_fmt);
+
+    if (uri.port) |port| {
+        return std.fmt.allocPrint(allocator, "https://{s}:{d}", .{ host_fmt, port });
+    }
+    return std.fmt.allocPrint(allocator, "https://{s}", .{host_fmt});
+}
+
+fn buildWebSkillIndexUrl(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const normalized = normalizeWebSkillSource(source);
+    if (std.mem.endsWith(u8, normalized, WEB_SKILL_INDEX_PATH)) {
+        return allocator.dupe(u8, normalized);
+    }
+
+    const origin = try buildWebSkillOriginUrl(allocator, normalized);
+    defer allocator.free(origin);
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ origin, WEB_SKILL_INDEX_PATH });
+}
+
+fn isWebSkillArtifactSource(source: []const u8) bool {
+    const normalized = stripQueryAndFragment(normalizeWebSkillSource(source));
+    return (isHttpsSource(normalized) and isMarkdownFile(normalized)) or
+        endsWithAsciiIgnoreCase(normalized, ".tar.gz") or
+        endsWithAsciiIgnoreCase(normalized, ".zip");
+}
+
+fn detectWebSkillSelection(source: []const u8) WebSkillSelection {
+    const normalized = stripQueryAndFragment(normalizeWebSkillSource(source));
+    if (std.mem.endsWith(u8, normalized, WEB_SKILL_INDEX_PATH) or
+        std.mem.eql(u8, normalized, WEB_SKILL_COLLECTION_PATH) or
+        std.mem.endsWith(u8, normalized, WEB_SKILL_COLLECTION_PATH))
+    {
+        return .all;
+    }
+
+    if (std.mem.indexOf(u8, normalized, WEB_SKILL_COLLECTION_PREFIX)) |idx| {
+        const suffix = normalized[idx + WEB_SKILL_COLLECTION_PREFIX.len ..];
+        if (suffix.len == 0) return .all;
+        if (!isWebSkillArtifactSource(normalized) and std.mem.indexOfScalar(u8, suffix, '/') == null) {
+            return .{ .by_name = suffix };
+        }
+        return .{ .by_url = normalized };
+    }
+
+    return .all;
+}
+
+fn shouldAttemptWellKnownIndex(source: []const u8) bool {
+    const normalized = normalizeWebSkillSource(source);
+    if (std.mem.endsWith(u8, normalized, WEB_SKILL_INDEX_PATH)) return true;
+    if (std.mem.indexOf(u8, normalized, WEB_SKILL_COLLECTION_PREFIX) != null) return true;
+    if (std.mem.endsWith(u8, normalized, WEB_SKILL_COLLECTION_PATH)) return true;
+    return !isWebSkillArtifactSource(normalized);
+}
+
+fn validatePublishedWebSkillName(name: []const u8) !void {
+    if (name.len == 0 or name.len > 64) return error.UnsafeName;
+    if (name[0] == '-' or name[name.len - 1] == '-') return error.UnsafeName;
+
+    var prev_hyphen = false;
+    for (name) |c| {
+        const is_hyphen = c == '-';
+        if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or is_hyphen)) return error.UnsafeName;
+        if (is_hyphen and prev_hyphen) return error.UnsafeName;
+        prev_hyphen = is_hyphen;
+    }
+}
+
+fn parseWebSkillIndexDocument(allocator: std.mem.Allocator, json_bytes: []const u8) !std.json.Parsed(WebSkillIndexDocument) {
+    return std.json.parseFromSlice(WebSkillIndexDocument, allocator, json_bytes, .{
+        .ignore_unknown_fields = true,
+    });
+}
+
+fn isKnownWebSkillSchema(schema: []const u8) bool {
+    return std.mem.eql(u8, schema, WEB_SKILL_INDEX_SCHEMA_V2);
+}
+
+fn resolveWebSkillUrl(allocator: std.mem.Allocator, base_url: []const u8, raw_url: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw_url, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidUrl;
+
+    var aux_buf = try allocator.alloc(u8, trimmed.len + base_url.len + 32);
+    defer allocator.free(aux_buf);
+    @memcpy(aux_buf[0..trimmed.len], trimmed);
+
+    var aux_slice = aux_buf[0..];
+    const resolved = try (try std.Uri.parse(base_url)).resolveInPlace(trimmed.len, &aux_slice);
+    const resolved_url = try std.fmt.allocPrint(allocator, "{f}", .{std.Uri.fmt(&resolved, .{
+        .scheme = true,
+        .authentication = true,
+        .authority = true,
+        .path = true,
+        .query = true,
+        .fragment = true,
+        .port = true,
+    })});
+    errdefer allocator.free(resolved_url);
+
+    if (!isHttpsSource(resolved_url)) return error.SkillSecurityAuditFailed;
+    return resolved_url;
+}
+
+fn isValidWebSkillDigestFormat(digest: []const u8) bool {
+    if (!std.mem.startsWith(u8, digest, "sha256:")) return false;
+    const hex = digest["sha256:".len..];
+    if (hex.len != 64) return false;
+    for (hex) |c| {
+        if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    }
+    return true;
+}
+
+fn verifyWebSkillDigest(bytes: []const u8, expected_digest: []const u8) !void {
+    if (!isValidWebSkillDigestFormat(expected_digest)) return error.SkillSecurityAuditFailed;
+
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    if (!std.mem.eql(u8, hex[0..], expected_digest["sha256:".len..])) {
+        return error.SkillSecurityAuditFailed;
+    }
+}
+
+fn detectWebSkillArchiveKind(url: []const u8) ?WebSkillArchiveKind {
+    const normalized = stripQueryAndFragment(url);
+    if (endsWithAsciiIgnoreCase(normalized, ".tar.gz")) return .tar_gz;
+    if (endsWithAsciiIgnoreCase(normalized, ".zip")) return .zip;
+    return null;
+}
+
+fn isSafeArchiveRelativePath(path: []const u8) bool {
+    if (path.len == 0 or path[0] == '/' or path[0] == '\\') return false;
+    if (std.mem.indexOfScalar(u8, path, '\\') != null) return false;
+
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |part| {
+        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
+}
+
+fn validateTarGzArchiveFile(path: []const u8) !void {
+    var file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    var file_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(&file_buf);
+
+    var flate_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress = std.compress.flate.Decompress.init(&file_reader.interface, .gzip, &flate_buf);
+
+    var name_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var link_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var it = std.tar.Iterator.init(&decompress.reader, .{
+        .file_name_buffer = &name_buf,
+        .link_name_buffer = &link_buf,
+    });
+
+    var total_unpacked: u64 = 0;
+    var saw_skill_md = false;
+    while (try it.next()) |entry| {
+        if (!isSafeArchiveRelativePath(entry.name)) return error.SkillSecurityAuditFailed;
+        switch (entry.kind) {
+            .directory => {},
+            .file => {
+                total_unpacked = std.math.add(u64, total_unpacked, entry.size) catch return error.SkillSecurityAuditFailed;
+                if (total_unpacked > WEB_SKILL_ARCHIVE_MAX_UNPACKED_BYTES) return error.SkillSecurityAuditFailed;
+                if (std.mem.eql(u8, entry.name, "SKILL.md")) saw_skill_md = true;
+            },
+            .sym_link => return error.SkillSecurityAuditFailed,
+        }
+    }
+
+    if (!saw_skill_md) return error.ManifestNotFound;
+}
+
+fn extractTarGzArchiveFile(path: []const u8, dest_dir_path: []const u8) !void {
+    var file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    var file_buf: [4096]u8 = undefined;
+    var file_reader = file.reader(&file_buf);
+
+    var flate_buf: [std.compress.flate.max_window_len]u8 = undefined;
+    var decompress = std.compress.flate.Decompress.init(&file_reader.interface, .gzip, &flate_buf);
+
+    const io = std_compat.io();
+    var dest_dir = try std.Io.Dir.openDirAbsolute(io, dest_dir_path, .{});
+    defer dest_dir.close(io);
+
+    try std.tar.pipeToFileSystem(io, dest_dir, &decompress.reader, .{});
+}
+
+fn validateZipArchiveFile(path: []const u8) !void {
+    var file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    var buf: [4096]u8 = undefined;
+    var reader = file.reader(&buf);
+    var iter = try std.zip.Iterator.init(&reader);
+
+    var total_unpacked: u64 = 0;
+    var saw_skill_md = false;
+    var filename_buf: [std.fs.max_path_bytes]u8 = undefined;
+    while (try iter.next()) |entry| {
+        if (filename_buf.len < entry.filename_len) return error.ZipInsufficientBuffer;
+        try reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
+        try reader.interface.readSliceAll(filename_buf[0..entry.filename_len]);
+        const entry_name = filename_buf[0..entry.filename_len];
+        if (!isSafeArchiveRelativePath(entry_name)) return error.SkillSecurityAuditFailed;
+
+        if (entry_name[entry_name.len - 1] != '/') {
+            total_unpacked = std.math.add(u64, total_unpacked, entry.uncompressed_size) catch return error.SkillSecurityAuditFailed;
+            if (total_unpacked > WEB_SKILL_ARCHIVE_MAX_UNPACKED_BYTES) return error.SkillSecurityAuditFailed;
+            if (std.mem.eql(u8, entry_name, "SKILL.md")) saw_skill_md = true;
+        }
+    }
+
+    if (!saw_skill_md) return error.ManifestNotFound;
+}
+
+fn extractZipArchiveFile(path: []const u8, dest_dir_path: []const u8) !void {
+    var file = try std_compat.fs.openFileAbsolute(path, .{});
+    defer file.close();
+
+    var buf: [4096]u8 = undefined;
+    var reader = file.reader(&buf);
+    const io = std_compat.io();
+    var dest_dir = try std.Io.Dir.openDirAbsolute(io, dest_dir_path, .{});
+    defer dest_dir.close(io);
+
+    try std.zip.extract(dest_dir, &reader, .{});
+}
+
+fn installDownloadedWebSkillArtifact(
+    allocator: std.mem.Allocator,
+    artifact_bytes: []const u8,
+    artifact_url: []const u8,
+    skill_name: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !void {
+    const tmp_root = try platform.getTempDir(allocator);
+    defer allocator.free(tmp_root);
+
+    const temp_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}/nullclaw-web-skill-{x}",
+        .{ tmp_root, std.hash.Wyhash.hash(0, artifact_url) },
+    );
+    defer allocator.free(temp_dir);
+    std_compat.fs.deleteTreeAbsolute(temp_dir) catch {};
+    try fs_compat.makePath(temp_dir);
+    defer std_compat.fs.deleteTreeAbsolute(temp_dir) catch {};
+
+    if (isMarkdownFile(artifact_url)) {
+        const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{temp_dir});
+        defer allocator.free(skill_md_path);
+        const file = try std_compat.fs.createFileAbsolute(skill_md_path, .{});
+        defer file.close();
+        try file.writeAll(artifact_bytes);
+    } else {
+        const archive_kind = detectWebSkillArchiveKind(artifact_url) orelse {
+            setInstallErrorDetail(allocator, detail_out, "web skill archive format is not supported");
+            return error.NotSupported;
+        };
+
+        const archive_basename = switch (archive_kind) {
+            .tar_gz => "skill.tar.gz",
+            .zip => "skill.zip",
+        };
+        const archive_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ temp_dir, archive_basename });
+        defer allocator.free(archive_path);
+
+        const archive_file = try std_compat.fs.createFileAbsolute(archive_path, .{});
+        defer archive_file.close();
+        try archive_file.writeAll(artifact_bytes);
+
+        switch (archive_kind) {
+            .tar_gz => {
+                try validateTarGzArchiveFile(archive_path);
+                try extractTarGzArchiveFile(archive_path, temp_dir);
+            },
+            .zip => {
+                try validateZipArchiveFile(archive_path);
+                try extractZipArchiveFile(archive_path, temp_dir);
+            },
+        }
+
+        std_compat.fs.deleteFileAbsolute(archive_path) catch {};
+    }
+
+    installSkillDirectoryToWorkspace(allocator, temp_dir, workspace_dir, skill_name) catch |err| {
+        if (err == error.SkillAlreadyExists) {
+            const msg = try std.fmt.allocPrint(allocator, "skill '{s}' already exists", .{skill_name});
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+        } else {
+            const msg = try std.fmt.allocPrint(allocator, "failed to install web skill '{s}': {s}", .{ skill_name, @errorName(err) });
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+        }
+        return err;
+    };
+}
+
+fn selectionMatchesWebSkillEntry(
+    selection: WebSkillSelection,
+    entry_name: []const u8,
+    resolved_url: []const u8,
+) bool {
+    return switch (selection) {
+        .all => true,
+        .by_name => |name| std.mem.eql(u8, name, entry_name),
+        .by_url => |target_url| std.mem.eql(u8, normalizeWebSkillSource(target_url), normalizeWebSkillSource(resolved_url)),
+    };
+}
+
+fn installSkillsFromWellKnownIndex(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !void {
+    const index_url = try buildWebSkillIndexUrl(allocator, source);
+    defer allocator.free(index_url);
+
+    const index_resp = http_util.curlGetWithStatusAndTimeout(allocator, index_url, &.{}, "20") catch |err| switch (err) {
+        error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.CurlFailed, error.CurlReadError, error.CurlWaitError => return err,
+        else => return err,
+    };
+    defer allocator.free(index_resp.body);
+
+    if (index_resp.status_code == 404) return error.ManifestNotFound;
+    if (index_resp.status_code < 200 or index_resp.status_code >= 300) {
+        const msg = try std.fmt.allocPrint(allocator, "web skill discovery failed: GET {s} returned HTTP {d}", .{ index_url, index_resp.status_code });
+        defer allocator.free(msg);
+        setInstallErrorDetail(allocator, detail_out, msg);
+        return error.ManifestNotFound;
+    }
+
+    var parsed = try parseWebSkillIndexDocument(allocator, index_resp.body);
+    defer parsed.deinit();
+
+    const schema = parsed.value.@"$schema" orelse {
+        setInstallErrorDetail(allocator, detail_out, "web skill index is missing $schema");
+        return error.UnsupportedWebSkillSchema;
+    };
+    if (!isKnownWebSkillSchema(schema)) {
+        const msg = try std.fmt.allocPrint(allocator, "web skill index uses unsupported schema '{s}'", .{schema});
+        defer allocator.free(msg);
+        setInstallErrorDetail(allocator, detail_out, msg);
+        return error.UnsupportedWebSkillSchema;
+    }
+
+    const selection = detectWebSkillSelection(source);
+    var matched_entries: usize = 0;
+    var installed_entries: usize = 0;
+    var skipped_unknown_types: usize = 0;
+    for (parsed.value.skills) |entry| {
+        try validatePublishedWebSkillName(entry.name);
+        try validateSkillName(entry.name);
+        if (!isValidWebSkillDigestFormat(entry.digest)) {
+            const msg = try std.fmt.allocPrint(allocator, "web skill '{s}' returned an invalid digest", .{entry.name});
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+            return error.SkillSecurityAuditFailed;
+        }
+
+        const resolved_url = try resolveWebSkillUrl(allocator, index_url, entry.url);
+        defer allocator.free(resolved_url);
+        if (!selectionMatchesWebSkillEntry(selection, entry.name, resolved_url)) continue;
+        matched_entries += 1;
+
+        if (!(std.mem.eql(u8, entry.type, "skill-md") or std.mem.eql(u8, entry.type, "archive"))) {
+            skipped_unknown_types += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, entry.type, "skill-md")) {
+            if (!isSafeHttpsSkillUrl(resolved_url)) {
+                const msg = try std.fmt.allocPrint(allocator, "web skill '{s}' returned an unsafe markdown URL", .{entry.name});
+                defer allocator.free(msg);
+                setInstallErrorDetail(allocator, detail_out, msg);
+                return error.SkillSecurityAuditFailed;
+            }
+        } else if (detectWebSkillArchiveKind(resolved_url) == null) {
+            const msg = try std.fmt.allocPrint(allocator, "web skill '{s}' uses unsupported archive format", .{entry.name});
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+            return error.NotSupported;
+        }
+
+        const artifact_bytes = http_util.curlGetMaxBytes(allocator, resolved_url, &.{}, "20", WEB_SKILL_ARTIFACT_MAX_BYTES) catch |err| switch (err) {
+            error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.CurlFailed, error.CurlReadError, error.CurlWaitError => {
+                const msg = try std.fmt.allocPrint(allocator, "failed to fetch web skill artifact for '{s}'", .{entry.name});
+                defer allocator.free(msg);
+                setInstallErrorDetail(allocator, detail_out, msg);
+                return err;
+            },
+            else => return err,
+        };
+        defer allocator.free(artifact_bytes);
+
+        verifyWebSkillDigest(artifact_bytes, entry.digest) catch {
+            const msg = try std.fmt.allocPrint(allocator, "web skill '{s}' failed digest verification", .{entry.name});
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+            return error.SkillSecurityAuditFailed;
+        };
+
+        try installDownloadedWebSkillArtifact(allocator, artifact_bytes, resolved_url, entry.name, workspace_dir, detail_out);
+        installed_entries += 1;
+    }
+
+    if (matched_entries == 0) {
+        setInstallErrorDetail(allocator, detail_out, "web skill source did not match any published skill entry");
+        return error.ManifestNotFound;
+    }
+    if (installed_entries == 0 and skipped_unknown_types > 0) {
+        setInstallErrorDetail(allocator, detail_out, "web skill source only published unsupported skill artifact types");
+        return error.NotSupported;
+    }
+    if (installed_entries == 0) {
+        return error.ManifestNotFound;
+    }
 }
 
 fn clearInstallErrorDetail(allocator: std.mem.Allocator, detail_out: ?*?[]u8) void {
@@ -1972,6 +2440,12 @@ pub fn installSkillWithDetail(
         return error.SkillSecurityAuditFailed;
     }
     if (isHttpsSource(source)) {
+        if (shouldAttemptWellKnownIndex(source)) {
+            installSkillsFromWellKnownIndex(allocator, source, workspace_dir, detail_out) catch |err| switch (err) {
+                error.ManifestNotFound => {},
+                else => return err,
+            };
+        }
         installSkillFromWellKnownUrl(allocator, source, workspace_dir, detail_out) catch |err| switch (err) {
             error.ManifestNotFound => {},
             else => return err,
@@ -2966,6 +3440,69 @@ test "buildWellKnownSkillManifestUrl strips direct skill path and query" {
     try std.testing.expectEqualStrings("https://example.com/docs/.well-known/nullclaw-skill.json", url);
 }
 
+test "buildWebSkillIndexUrl targets the origin root" {
+    const url = try buildWebSkillIndexUrl(std.testing.allocator, "https://example.com/docs/getting-started");
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectEqualStrings("https://example.com/.well-known/agent-skills/index.json", url);
+}
+
+test "detectWebSkillSelection installs all for endpoint roots and narrows direct skill targets" {
+    try std.testing.expect(detectWebSkillSelection("https://example.com") == .all);
+    try std.testing.expect(detectWebSkillSelection("https://example.com/.well-known/agent-skills/index.json") == .all);
+
+    const by_name = detectWebSkillSelection("https://example.com/.well-known/agent-skills/code-review");
+    try std.testing.expect(by_name == .by_name);
+    try std.testing.expectEqualStrings("code-review", by_name.by_name);
+
+    const by_url = detectWebSkillSelection("https://example.com/.well-known/agent-skills/code-review/SKILL.md");
+    try std.testing.expect(by_url == .by_url);
+    try std.testing.expectEqualStrings("https://example.com/.well-known/agent-skills/code-review/SKILL.md", by_url.by_url);
+}
+
+test "resolveWebSkillUrl handles relative and absolute index entries" {
+    const relative = try resolveWebSkillUrl(
+        std.testing.allocator,
+        "https://example.com/.well-known/agent-skills/index.json",
+        "code-review/SKILL.md",
+    );
+    defer std.testing.allocator.free(relative);
+    try std.testing.expectEqualStrings("https://example.com/.well-known/agent-skills/code-review/SKILL.md", relative);
+
+    const absolute = try resolveWebSkillUrl(
+        std.testing.allocator,
+        "https://example.com/.well-known/agent-skills/index.json",
+        "/cdn/code-review/SKILL.md",
+    );
+    defer std.testing.allocator.free(absolute);
+    try std.testing.expectEqualStrings("https://example.com/cdn/code-review/SKILL.md", absolute);
+}
+
+test "parseWebSkillIndexDocument reads v0.2 discovery entries" {
+    const raw =
+        \\{
+        \\  "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+        \\  "skills": [
+        \\    {
+        \\      "name": "code-review",
+        \\      "type": "skill-md",
+        \\      "description": "Review code",
+        \\      "url": "/.well-known/agent-skills/code-review/SKILL.md",
+        \\      "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var parsed = try parseWebSkillIndexDocument(std.testing.allocator, raw);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings(WEB_SKILL_INDEX_SCHEMA_V2, parsed.value.@"$schema".?);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.skills.len);
+    try std.testing.expectEqualStrings("code-review", parsed.value.skills[0].name);
+    try std.testing.expectEqualStrings("skill-md", parsed.value.skills[0].type);
+}
+
 test "parseWebSkillManifest reads name and skill_url" {
     const manifest = parseWebSkillManifest(
         \\{"name":"demo-skill","skill_url":"https://example.com/skill.md"}
@@ -2974,11 +3511,121 @@ test "parseWebSkillManifest reads name and skill_url" {
     try std.testing.expectEqualStrings("https://example.com/skill.md", manifest.skill_url.?);
 }
 
+test "validatePublishedWebSkillName enforces agent skills naming rules" {
+    try validatePublishedWebSkillName("code-review");
+    try std.testing.expectError(error.UnsafeName, validatePublishedWebSkillName("CodeReview"));
+    try std.testing.expectError(error.UnsafeName, validatePublishedWebSkillName("bad__name"));
+    try std.testing.expectError(error.UnsafeName, validatePublishedWebSkillName("-bad"));
+    try std.testing.expectError(error.UnsafeName, validatePublishedWebSkillName("bad-"));
+    try std.testing.expectError(error.UnsafeName, validatePublishedWebSkillName("double--dash"));
+}
+
 test "isSafeHttpsSkillUrl requires https markdown URL" {
     try std.testing.expect(isSafeHttpsSkillUrl("https://example.com/skill.md"));
     try std.testing.expect(isSafeHttpsSkillUrl("https://example.com/skill.markdown?download=1"));
     try std.testing.expect(!isSafeHttpsSkillUrl("http://example.com/skill.md"));
     try std.testing.expect(!isSafeHttpsSkillUrl("https://example.com/skill.json"));
+}
+
+test "verifyWebSkillDigest accepts matching bytes and rejects mismatches" {
+    try verifyWebSkillDigest(
+        "hello",
+        "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+    );
+    try std.testing.expectError(
+        error.SkillSecurityAuditFailed,
+        verifyWebSkillDigest(
+            "hello",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        ),
+    );
+}
+
+const test_zip_skill_archive = [_]u8{
+    0x50, 0x4b, 0x03, 0x04, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0xcc, 0xa4,
+    0x91, 0x5c, 0x31, 0xc7, 0x3d, 0x1f, 0x36, 0x00, 0x00, 0x00, 0x3d, 0x00,
+    0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x53, 0x4b, 0x49, 0x4c, 0x4c, 0x2e,
+    0x6d, 0x64, 0xd3, 0xd5, 0xd5, 0xe5, 0xca, 0x4b, 0xcc, 0x4d, 0xb5, 0x52,
+    0xa8, 0xca, 0x2c, 0xd0, 0x2d, 0xce, 0xce, 0xcc, 0xc9, 0xe1, 0x4a, 0x49,
+    0x2d, 0x4e, 0x2e, 0xca, 0x2c, 0x28, 0xc9, 0xcc, 0xcf, 0x03, 0x0b, 0x2b,
+    0xa4, 0x65, 0x56, 0x94, 0x94, 0x16, 0xa5, 0x72, 0xe9, 0x02, 0x15, 0x2b,
+    0x2b, 0x44, 0x01, 0x45, 0x82, 0xc1, 0x0a, 0x01, 0x50, 0x4b, 0x01, 0x02,
+    0x1e, 0x03, 0x14, 0x00, 0x00, 0x00, 0x08, 0x00, 0xcc, 0xa4, 0x91, 0x5c,
+    0x31, 0xc7, 0x3d, 0x1f, 0x36, 0x00, 0x00, 0x00, 0x3d, 0x00, 0x00, 0x00,
+    0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0xb4, 0x81, 0x00, 0x00, 0x00, 0x00, 0x53, 0x4b, 0x49, 0x4c, 0x4c, 0x2e,
+    0x6d, 0x64, 0x50, 0x4b, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x01, 0x00, 0x36, 0x00, 0x00, 0x00, 0x5c, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+const test_tar_gz_skill_archive = [_]u8{
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xed, 0xd0,
+    0x4d, 0x0a, 0xc2, 0x30, 0x10, 0x86, 0xe1, 0xac, 0x7b, 0x8a, 0x80, 0xeb,
+    0x48, 0x52, 0x9a, 0x06, 0xbc, 0x81, 0xd8, 0x5d, 0xbd, 0x40, 0x69, 0x2b,
+    0x04, 0xdb, 0x2a, 0xfd, 0x01, 0x8f, 0x6f, 0x5a, 0x11, 0xdc, 0x88, 0xab,
+    0x22, 0xe2, 0xfb, 0xcc, 0x62, 0x60, 0xe6, 0x5b, 0x0c, 0x93, 0x1f, 0xf6,
+    0x59, 0xb6, 0x6d, 0x2b, 0xb1, 0x22, 0x1d, 0xa4, 0x69, 0x32, 0x77, 0xe3,
+    0xac, 0x7e, 0xed, 0x0f, 0xce, 0x0a, 0x63, 0x8d, 0xd3, 0x36, 0x89, 0x9d,
+    0xb5, 0x42, 0x9b, 0x38, 0x94, 0x90, 0x7a, 0xcd, 0xa3, 0x9e, 0xa6, 0x61,
+    0x2c, 0x7a, 0x29, 0x45, 0xeb, 0xcb, 0xba, 0xf1, 0x97, 0xb7, 0xb9, 0x4f,
+    0xfb, 0x1f, 0xa5, 0x94, 0x8a, 0xba, 0xa2, 0xad, 0x77, 0x32, 0xbc, 0x41,
+    0x0d, 0x67, 0xdf, 0x34, 0x51, 0x55, 0x0f, 0x65, 0xef, 0xaf, 0xa3, 0xbf,
+    0x74, 0xcb, 0x58, 0x9e, 0xfc, 0x6d, 0x9c, 0xfa, 0x3a, 0x9a, 0xc3, 0x1b,
+    0x79, 0x0c, 0x93, 0x7c, 0x09, 0x7e, 0xfb, 0x78, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x63, 0x77,
+    0x10, 0x1b, 0x01, 0x5f, 0x00, 0x28, 0x00, 0x00,
+};
+
+test "installDownloadedWebSkillArtifact installs zip archives into workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("workspace");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "workspace");
+    defer std.testing.allocator.free(workspace_dir);
+
+    try installDownloadedWebSkillArtifact(
+        std.testing.allocator,
+        test_zip_skill_archive[0..],
+        "https://example.com/.well-known/agent-skills/zip-skill.zip",
+        "zip-skill",
+        workspace_dir,
+        null,
+    );
+
+    const skill_md_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/skills/zip-skill/SKILL.md", .{workspace_dir});
+    defer std.testing.allocator.free(skill_md_path);
+    const content = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, skill_md_path, 1024);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "name: zip-skill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "# Zip Skill") != null);
+}
+
+test "installDownloadedWebSkillArtifact installs tar.gz archives into workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try @import("compat").fs.Dir.wrap(tmp.dir).makePath("workspace");
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, "workspace");
+    defer std.testing.allocator.free(workspace_dir);
+
+    try installDownloadedWebSkillArtifact(
+        std.testing.allocator,
+        test_tar_gz_skill_archive[0..],
+        "https://example.com/.well-known/agent-skills/tar-skill.tar.gz",
+        "tar-skill",
+        workspace_dir,
+        null,
+    );
+
+    const skill_md_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/skills/tar-skill/SKILL.md", .{workspace_dir});
+    defer std.testing.allocator.free(skill_md_path);
+    const content = try fs_compat.readFileAlloc(std_compat.fs.cwd(), std.testing.allocator, skill_md_path, 1024);
+    defer std.testing.allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "name: tar-skill") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "# Tar Skill") != null);
 }
 
 test "installSkillWithDetail rejects insecure http source before any network I/O" {

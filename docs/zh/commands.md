@@ -105,7 +105,7 @@
 | 命令 | 说明 |
 |---|---|
 | `nullclaw skills list` | 列出已安装 skill |
-| `nullclaw skills install <source>` | 从 GitHub URL 或本地路径安装 skill |
+| `nullclaw skills install <source>` | 从 Git URL、本地路径或 HTTPS well-known skill 端点安装 skill |
 | `nullclaw skills install --name <query>` | 在 skill registry 中搜索并安装最匹配的 skill |
 | `nullclaw skills remove <name>` | 移除 skill |
 | `nullclaw skills info <name>` | 查看 skill 元信息 |
