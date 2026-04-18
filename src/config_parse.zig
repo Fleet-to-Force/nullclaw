@@ -67,6 +67,76 @@ fn parseToolCustomizationArray(allocator: std.mem.Allocator, arr: std.json.Array
     return try list.toOwnedSlice(allocator);
 }
 
+pub fn mergeToolCustomizations(self: *Config, content: []const u8) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+    defer parsed.deinit();
+
+    var external_customs: []const types.ToolCustomization = &.{};
+    if (parsed.value == .array) {
+        external_customs = try parseToolCustomizationArray(self.allocator, parsed.value.array);
+    } else if (parsed.value == .object) {
+        var list: std.ArrayListUnmanaged(types.ToolCustomization) = .empty;
+        errdefer {
+            for (list.items) |item| {
+                self.allocator.free(item.name);
+                if (item.system_prompt) |p| self.allocator.free(p);
+                for (item.triggers) |t| self.allocator.free(t);
+                self.allocator.free(item.triggers);
+            }
+            list.deinit(self.allocator);
+        }
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .object) continue;
+            const obj = entry.value_ptr.object;
+            var cust = types.ToolCustomization{ .name = try self.allocator.dupe(u8, entry.key_ptr.*) };
+            if (obj.get("system_prompt")) |v| {
+                if (v == .string) cust.system_prompt = try self.allocator.dupe(u8, v.string);
+            }
+            if (obj.get("triggers")) |v| {
+                if (v == .array) cust.triggers = try parseStringArray(self.allocator, v.array);
+            }
+            if (obj.get("priority")) |v| {
+                if (v == .integer) cust.priority = @intCast(std.math.clamp(v.integer, 0, 255));
+            }
+            if (obj.get("enabled")) |v| {
+                if (v == .bool) cust.enabled = v.bool;
+            }
+            try list.append(self.allocator, cust);
+        }
+        external_customs = try list.toOwnedSlice(self.allocator);
+    } else {
+        return error.InvalidJsonFormat;
+    }
+
+    if (external_customs.len == 0) return;
+
+    var combined: std.ArrayListUnmanaged(types.ToolCustomization) = .empty;
+    try combined.ensureTotalCapacity(self.allocator, self.tools.tool_customizations.len + external_customs.len);
+
+    for (self.tools.tool_customizations) |c| try combined.append(self.allocator, c);
+
+    for (external_customs) |ext| {
+        var found = false;
+        for (combined.items) |*c| {
+            if (std.mem.eql(u8, c.name, ext.name)) {
+                // Free previous allocations from config.json before overwriting
+                self.allocator.free(c.name);
+                if (c.system_prompt) |sp| self.allocator.free(sp);
+                if (c.triggers.len > 0) {
+                    for (c.triggers) |t| self.allocator.free(t);
+                    self.allocator.free(c.triggers);
+                }
+                c.* = ext;
+                found = true;
+                break;
+            }
+        }
+        if (!found) try combined.append(self.allocator, ext);
+    }
+    self.tools.tool_customizations = try combined.toOwnedSlice(self.allocator);
+}
+
 fn decryptSecretField(allocator: std.mem.Allocator, config_path: []const u8, value: []const u8) ![]u8 {
     const config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
     const store = secrets.SecretStore.init(config_dir, true);

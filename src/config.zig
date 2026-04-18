@@ -469,6 +469,25 @@ pub const Config = struct {
             // Config file doesn't exist yet — use defaults
         }
 
+        // Load external tool customizations if specified
+        if (cfg.tools.tool_customizations_file) |custom_file| {
+            const full_path = if (std_compat.fs.path.isAbsolute(custom_file))
+                try allocator.dupe(u8, custom_file)
+            else
+                try std_compat.fs.path.join(allocator, &.{ config_dir, custom_file });
+            defer allocator.free(full_path);
+
+            if (std_compat.fs.openFileAbsolute(full_path, .{})) |ext_file| {
+                defer ext_file.close();
+                if (ext_file.readToEndAlloc(allocator, 1024 * 128)) |ext_content| {
+                    defer allocator.free(ext_content);
+                    config_parse.mergeToolCustomizations(&cfg, ext_content) catch |err| {
+                        std.debug.print("Warning: failed to parse tool_customizations_file: {s}\n", .{@errorName(err)});
+                    };
+                } else |_| {}
+            } else |_| {}
+        }
+
         // Use workspace_dir_override if set, otherwise use default
         if (cfg.workspace_dir_override != null) {
             cfg.workspace_dir = cfg.workspace_dir_override.?;
