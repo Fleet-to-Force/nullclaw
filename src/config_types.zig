@@ -360,6 +360,23 @@ pub const AgentConfig = struct {
     }
 };
 
+pub const ToolCustomization = struct {
+    /// Tool name (e.g., "screenshot", "file_read", "shell")
+    name: []const u8,
+    /// Custom system prompt for this tool.
+    /// If provided, this will override the default tool description.
+    system_prompt: ?[]const u8 = null,
+    /// Trigger keywords for this tool.
+    /// When user message contains any of these keywords,
+    /// the tool will be prioritized.
+    triggers: []const []const u8 = &.{},
+    /// Priority level (higher = more important).
+    /// Default is 0.
+    priority: u8 = 0,
+    /// Whether this tool is enabled.
+    enabled: bool = true,
+};
+
 pub const ToolsConfig = struct {
     shell_timeout_secs: u64 = 60,
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
@@ -373,6 +390,15 @@ pub const ToolsConfig = struct {
     ///
     /// Example: ["LD_LIBRARY_PATH", "PYTHONHOME", "NODE_PATH"]
     path_env_vars: []const []const u8 = &.{},
+    /// Tool customization configuration.
+    /// Allows customizing system prompts, trigger keywords, and priorities for individual tools.
+    tool_customizations: []const ToolCustomization = &.{},
+    /// Optional path to external JSON file containing tool customizations.
+    tool_customizations_file: ?[]const u8 = null,
+    /// Custom modifiers to remove from user input when checking for exact trigger matches.
+    trigger_modifiers: []const []const u8 = &.{},
+    /// Custom punctuation characters to remove when checking for exact trigger matches.
+    trigger_punctuation: []const u8 = "",
 };
 
 pub const ModelRouteCostClass = enum {

@@ -18,11 +18,66 @@ const splitPrimaryModelRef = config_mod.splitPrimaryModelRef;
 /// Parse a JSON array of strings into an allocated slice.
 pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]const []const u8 {
     var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+
     try list.ensureTotalCapacity(allocator, @intCast(arr.items.len));
     for (arr.items) |item| {
         if (item == .string) {
-            try list.append(allocator, try allocator.dupe(u8, item.string));
+            const owned = try allocator.dupe(u8, item.string);
+            var item_owned = true;
+            errdefer if (item_owned) allocator.free(owned);
+
+            try list.append(allocator, owned);
+            item_owned = false;
         }
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn freeToolCustomization(allocator: std.mem.Allocator, item: types.ToolCustomization) void {
+    allocator.free(item.name);
+    if (item.system_prompt) |p| allocator.free(p);
+    for (item.triggers) |t| allocator.free(t);
+    allocator.free(item.triggers);
+}
+
+fn parseToolCustomizationArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]const types.ToolCustomization {
+    var list: std.ArrayListUnmanaged(types.ToolCustomization) = .empty;
+    errdefer {
+        for (list.items) |item| freeToolCustomization(allocator, item);
+        list.deinit(allocator);
+    }
+
+    try list.ensureTotalCapacity(allocator, @intCast(arr.items.len));
+    for (arr.items) |item| {
+        if (item != .object) continue;
+        const name_val = item.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+
+        var cust = types.ToolCustomization{
+            .name = try allocator.dupe(u8, name_val.string),
+        };
+        var cust_owned = true;
+        errdefer if (cust_owned) freeToolCustomization(allocator, cust);
+
+        if (item.object.get("system_prompt")) |v| {
+            if (v == .string) cust.system_prompt = try allocator.dupe(u8, v.string);
+        }
+        if (item.object.get("triggers")) |v| {
+            if (v == .array) cust.triggers = try parseStringArray(allocator, v.array);
+        }
+        if (item.object.get("priority")) |v| {
+            if (v == .integer) cust.priority = @intCast(std.math.clamp(v.integer, 0, 255));
+        }
+        if (item.object.get("enabled")) |v| {
+            if (v == .bool) cust.enabled = v.bool;
+        }
+
+        try list.append(allocator, cust);
+        cust_owned = false;
     }
     return try list.toOwnedSlice(allocator);
 }
@@ -1424,6 +1479,18 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("path_env_vars")) |v| {
                 if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
+            }
+            if (tl.object.get("tool_customizations")) |v| {
+                if (v == .array) self.tools.tool_customizations = try parseToolCustomizationArray(self.allocator, v.array);
+            }
+            if (tl.object.get("tool_customizations_file")) |v| {
+                if (v == .string) self.tools.tool_customizations_file = try self.allocator.dupe(u8, v.string);
+            }
+            if (tl.object.get("trigger_modifiers")) |v| {
+                if (v == .array) self.tools.trigger_modifiers = try parseStringArray(self.allocator, v.array);
+            }
+            if (tl.object.get("trigger_punctuation")) |v| {
+                if (v == .string) self.tools.trigger_punctuation = try self.allocator.dupe(u8, v.string);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
