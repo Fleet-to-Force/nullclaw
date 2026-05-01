@@ -1618,10 +1618,10 @@ pub const Agent = struct {
         return best_score;
     }
 
-    fn priorityToolForMessage(self: *const Agent, user_message: []const u8) ?[]const u8 {
+    fn priorityToolForSpecsMessage(self: *const Agent, specs: []const ToolSpec, user_message: []const u8) ?[]const u8 {
         var best_score: u16 = 0;
         var best_name: ?[]const u8 = null;
-        for (self.tool_specs) |spec| {
+        for (specs) |spec| {
             const score = self.toolPriorityScoreForMessage(spec.name, user_message);
             if (score > best_score) {
                 best_score = score;
@@ -1753,7 +1753,6 @@ pub const Agent = struct {
             }
             break :blk turn_input.llm_user_message orelse user_message;
         };
-        const priority_tool = self.priorityToolForMessage(effective_user_message);
 
         const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
         if (turn_route_selection) |selection| {
@@ -1948,9 +1947,6 @@ pub const Agent = struct {
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
 
-            // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
-
             const timer_start = std_compat.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
@@ -1958,6 +1954,10 @@ pub const Agent = struct {
 
             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
             const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
+            const priority_tool = self.priorityToolForSpecsMessage(turn_tool_specs, effective_user_message);
+
+            // Build messages slice for provider (arena-owned; freed at end of iteration).
+            const messages = try self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool);
             const request_max_tokens = self.effectiveMaxTokensForTurn(
                 messages,
                 if (native_tools_enabled) turn_tool_specs else null,
@@ -10017,6 +10017,39 @@ test "filterToolSpecsForTurn applies trigger modifiers and punctuation" {
     try std.testing.expectEqual(@as(usize, 2), result.len);
     try std.testing.expectEqualStrings("file_read", result[0].name);
     try std.testing.expectEqualStrings("shell", result[1].name);
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "priorityToolForSpecsMessage ignores tools excluded from turn specs" {
+    // Regression: priority hints must not ask for a tool that filterToolSpecsForTurn
+    // excluded from the current turn's advertised schema.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_private_lookup", .description = "private lookup", .parameters_json = "{}" },
+    };
+    const patterns: []const []const u8 = &.{"mcp_private_*"};
+    const keywords: []const []const u8 = &.{"lookup"};
+    agent.tool_filter_groups = &.{
+        .{ .mode = .dynamic, .tools = patterns, .keywords = keywords },
+    };
+    agent.tools_config = .{
+        .tool_customizations = &.{
+            .{ .name = "mcp_private_lookup", .triggers = &.{"private"}, .priority = 10 },
+        },
+    };
+
+    const turn_specs = try agent.filterToolSpecsForTurn(arena, "private");
+    try std.testing.expectEqual(@as(usize, 1), turn_specs.len);
+    try std.testing.expectEqualStrings("shell", turn_specs[0].name);
+    try std.testing.expect(agent.priorityToolForSpecsMessage(turn_specs, "private") == null);
     agent.tool_specs = try allocator.alloc(ToolSpec, 0);
 }
 
