@@ -87,8 +87,8 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\
     \\OPTIONS:
     \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
-    \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP] [--skill SKILL]
-    \\  gateway [--port PORT] [--host HOST]
+    \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP] [--workspace PATH] [--skill SKILL]
+    \\  gateway [--port PORT] [--host HOST] [--workspace PATH]
     \\  status [--json]
     \\  version | --version | -V
     \\  service <{s}>
@@ -293,6 +293,8 @@ fn agentHelpRequested(args: []const []const u8) bool {
             std.mem.eql(u8, arg, "--provider") or
             std.mem.eql(u8, arg, "--model") or
             std.mem.eql(u8, arg, "--temperature") or
+            std.mem.eql(u8, arg, "--agent") or
+            std.mem.eql(u8, arg, "--workspace") or
             std.mem.eql(u8, arg, "--skill"))
         {
             if (i + 1 < args.len) i += 1;
@@ -315,7 +317,8 @@ fn gatewayHelpRequested(args: []const []const u8) bool {
         }
         if (std.mem.eql(u8, arg, "--port") or
             std.mem.eql(u8, arg, "-p") or
-            std.mem.eql(u8, arg, "--host"))
+            std.mem.eql(u8, arg, "--host") or
+            std.mem.eql(u8, arg, "--workspace"))
         {
             if (i + 1 < args.len) i += 1;
         }
@@ -335,6 +338,9 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
         } else if (std.mem.eql(u8, sub_args[i], "--host") and i + 1 < sub_args.len) {
             i += 1;
             host = sub_args[i];
+        } else if (std.mem.eql(u8, sub_args[i], "--workspace") and i + 1 < sub_args.len) {
+            i += 1;
+            cfg.workspace_dir = sub_args[i];
         }
     }
 
@@ -353,6 +359,7 @@ fn printGatewayUsage() void {
         \\OPTIONS:
         \\  --port PORT, -p PORT   Override gateway listen port
         \\  --host HOST            Override gateway listen host
+        \\  --workspace PATH       Override workspace directory
         \\  --verbose, -v          Enable verbose logging
         \\  --help, -h             Show this help
         \\
@@ -380,6 +387,7 @@ fn printAgentUsage() void {
         \\  --provider PROVIDER           Override default provider
         \\  --model MODEL                 Override default model
         \\  --temperature TEMP            Override sampling temperature
+        \\  --workspace PATH              Override workspace directory
         \\  --skill SKILL                 Activate a named skill at startup
         \\  --verbose, -v                 Enable verbose logging
         \\  --help, -h                    Show this help
@@ -5206,6 +5214,16 @@ test "agentHelpRequested ignores session value that matches short help flag" {
     try std.testing.expect(!agentHelpRequested(&args));
 }
 
+test "agentHelpRequested ignores workspace value that matches help flag" {
+    const args = [_][]const u8{ "--workspace", "--help" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
+test "agentHelpRequested ignores agent value that matches help flag" {
+    const args = [_][]const u8{ "--agent", "--help" };
+    try std.testing.expect(!agentHelpRequested(&args));
+}
+
 test "agentHelpRequested ignores skill value that matches help flag" {
     const args = [_][]const u8{ "--skill", "-h" };
     try std.testing.expect(!agentHelpRequested(&args));
@@ -5361,6 +5379,24 @@ test "applyGatewayDaemonOverrides rejects invalid port" {
     };
     const args = [_][]const u8{ "--port", "bad" };
     try std.testing.expectError(error.InvalidPort, applyGatewayDaemonOverrides(&cfg, &args));
+}
+
+test "applyGatewayDaemonOverrides applies workspace override" {
+    var cfg = yc.config.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_model = "openrouter/auto",
+        .allocator = std.testing.allocator,
+    };
+    const args = [_][]const u8{ "--workspace", "/custom/workspace" };
+    try applyGatewayDaemonOverrides(&cfg, &args);
+    try std.testing.expectEqualStrings("/custom/workspace", cfg.workspace_dir);
+}
+
+test "gatewayHelpRequested skips workspace value" {
+    // --help here is the value of --workspace, not a real flag — should not trigger help
+    const args = [_][]const u8{ "--workspace", "--help" };
+    try std.testing.expect(!gatewayHelpRequested(&args));
 }
 
 test "hasConfiguredStartableChannels ignores cli and webhook-only defaults" {

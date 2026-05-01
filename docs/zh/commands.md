@@ -29,6 +29,7 @@
 | `nullclaw onboard --api-key ... --provider ... --model ... --memory ...` | 一次性指定 provider、model、memory backend |
 | `nullclaw onboard --channels-only` | 只重配 channel / allowlist |
 | `nullclaw agent -m "..."` | 单条消息模式 |
+| `nullclaw agent --workspace /path/to/workspace -m "..."` | 本次进程使用指定 workspace 运行 agent |
 | `nullclaw agent --skill news-digest -m "..."` | 在指定 skill 激活的状态下执行单条消息 |
 | `nullclaw agent` | 交互会话模式 |
 
@@ -52,6 +53,7 @@
 | `nullclaw gateway` | 启动长期运行 runtime，默认读取配置中的 host/port |
 | `nullclaw gateway --port 8080` | 用 CLI 覆盖网关端口 |
 | `nullclaw gateway --host 0.0.0.0 --port 8080` | 用 CLI 覆盖监听地址与端口 |
+| `nullclaw gateway --workspace /path/to/workspace` | 本次 gateway 进程使用指定 workspace |
 | `nullclaw service install` | 安装后台服务 |
 | `nullclaw service start` | 启动后台服务 |
 | `nullclaw service stop` | 停止后台服务 |
@@ -71,6 +73,7 @@
 
 - `auth` 目前只支持 `openai-codex`。
 - `gateway` 只是覆盖 host/port，其他安全策略仍以配置文件为准。
+- `agent --workspace` 和 `gateway --workspace` 只覆盖当前进程解析到的 workspace，效果等同于设置 `NULLCLAW_WORKSPACE`。
 
 ## 渠道、任务与扩展
 

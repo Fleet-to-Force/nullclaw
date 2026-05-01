@@ -166,6 +166,7 @@ const ParsedAgentArgs = struct {
     model_override: ?[]const u8 = null,
     temperature_override: ?f64 = null,
     agent_name: ?[]const u8 = null,
+    workspace_override: ?[]const u8 = null,
     skill_name: ?[]const u8 = null,
     verbose: bool = false,
 };
@@ -206,6 +207,10 @@ fn parseAgentArgs(args: []const []const u8) AgentArgParseResult {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
             parsed.agent_name = args[i];
+        } else if (std.mem.eql(u8, arg, "--workspace")) {
+            if (i + 1 >= args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.workspace_override = args[i];
         } else if (std.mem.eql(u8, arg, "--skill")) {
             if (i + 1 >= args.len) return .{ .missing_value = arg };
             i += 1;
@@ -340,6 +345,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             selected_workspace_dir = try cfg.resolveAgentWorkspacePath(allocator, workspace_path);
             cfg.workspace_dir = selected_workspace_dir.?;
         }
+    }
+    if (parsed_args.workspace_override) |workspace| {
+        cfg.workspace_dir = workspace;
     }
 
     var agent_memory_session_id: ?[]u8 = null;
@@ -1057,6 +1065,24 @@ test "parseAgentArgs returns missing value for --agent" {
     const args = [_][]const u8{"--agent"};
     switch (parseAgentArgs(&args)) {
         .missing_value => |value| try std.testing.expectEqualStrings("--agent", value),
+        else => unreachable,
+    }
+}
+
+test "parseAgentArgs parses --workspace" {
+    const args = [_][]const u8{ "--workspace", "/custom/ws", "-m", "hi" };
+    const parsed = switch (parseAgentArgs(&args)) {
+        .ok => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expectEqualStrings("/custom/ws", parsed.workspace_override.?);
+    try std.testing.expectEqualStrings("hi", parsed.message_arg.?);
+}
+
+test "parseAgentArgs returns missing value for --workspace" {
+    const args = [_][]const u8{"--workspace"};
+    switch (parseAgentArgs(&args)) {
+        .missing_value => |value| try std.testing.expectEqualStrings("--workspace", value),
         else => unreachable,
     }
 }

@@ -43,6 +43,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw onboard --api-key ... --provider ... --model ... --memory ...` | Set provider, model, and memory backend in one command |
 | `nullclaw onboard --channels-only` | Reconfigure channels and allowlists only |
 | `nullclaw agent -m "..."` | Run a single prompt |
+| `nullclaw agent --workspace /path/to/workspace -m "..."` | Run the agent against a specific workspace for this process |
 | `nullclaw agent --skill news-digest -m "..."` | Run a single prompt with a named skill active |
 | `nullclaw agent` | Start interactive chat mode |
 
@@ -66,6 +67,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw gateway` | Start the long-running runtime using configured host and port |
 | `nullclaw gateway --port 8080` | Override the gateway port from the CLI |
 | `nullclaw gateway --host 0.0.0.0 --port 8080` | Override host and port from the CLI |
+| `nullclaw gateway --workspace /path/to/workspace` | Override the workspace directory for this gateway process |
 | `nullclaw service install` | Install the background service |
 | `nullclaw service start` | Start the background service |
 | `nullclaw service stop` | Stop the background service |
@@ -85,6 +87,7 @@ Notes:
 
 - `auth` currently supports only `openai-codex`.
 - `gateway --host/--port` overrides only the bind settings; the rest of gateway security still comes from config.
+- `agent --workspace` and `gateway --workspace` override the resolved workspace for the current process, equivalent to setting `NULLCLAW_WORKSPACE`.
 
 ## Channels, scheduling, and extensions
 
